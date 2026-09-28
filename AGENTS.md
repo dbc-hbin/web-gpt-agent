@@ -1809,7 +1809,13 @@ without the classic thought-parent/timestamp tuple. The native terminal item and
 conversation must agree; streaming and cancelled items never gain that proof.
 The bounded query-cache read supplies the exact local/server conversation pair and request metadata
 only for message ids explicitly named by the mounted exchange in its exact conversation cache.
-It never follows child links or imports cached prose/completion. Duplicate/conflicting caches
+It never imports unmounted messages or cached assistant prose/completion. The exact mounted
+user message may supply its bounded original text from this same proved graph: node id, message
+id and user role must agree. This uses the existing public user-text allowlist: plain text or
+the string parts of `multimodal_text`, never image pointers, object parts or attachment metadata.
+The assistant reader is unchanged. Shell `item.message` can contain Markdown presentation escapes;
+Send receipts and hidden context frames use the original text without unescaping authored bytes.
+Missing source retains the existing receipt wait, not authority to resend. Duplicate/conflicting caches
 abstain, and an unavailable optional cache leaves mounted messages readable. That cache is only
 the page-load snapshot (live 2026-09-27): streamed calls exist first in the graph the conversation
 view reads through `useSyncExternalStore`. The same exact-id read uses that one hook snapshot on the

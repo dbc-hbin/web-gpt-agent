@@ -327,6 +327,51 @@ it('attributes a request streamed after load from the live shell conversation st
     conversationId: THREAD, calls: expect.arrayContaining([expect.objectContaining({ requestId: OTHER, questionId: USER })]) })));
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 });
+it('reads the original shell user text from its exact mounted provider message, not Markdown presentation', async () => {
+  const f = fixture(), graph = liveGraph();
+  const original = '[[CONTEXT:13]]\nPrivate setup\n[[/CONTEXT]]\n\n# Keep **literal** text and C:\\work\\*.ts.';
+  f.entry.turn.items[0].message = original.replace(/[\\*_#]/g, '\\$&').replace(/\n/g, '\\\n');
+  graph[USER].message.content.parts = [original];
+  // Only the mounted exact user id may supply source. Cached answers stay outside this read.
+  graph[ANSWER].message.content.parts = ['UNMOUNTED_SOURCE_ANSWER'];
+  mountStore(f, graph);
+  const turn = (await f.ask()).turns[0];
+  expect(turn.messages).toContainEqual(expect.objectContaining({ role: 'user', messageId: USER, rawText: original }));
+  expect(JSON.stringify(turn)).not.toContain('UNMOUNTED_SOURCE_ANSWER');
+});
+it.each(['cache', 'live'])('reads only authored string parts of a mounted multimodal shell user from the %s graph', async source => {
+  const f = fixture(), graph = liveGraph();
+  const original = '[[COS_CONTEXT:13]]\nPrivate setup\n[[/COS_CONTEXT]]\n\n# Keep **literal** C:\\work\\*.ts.';
+  f.entry.turn.items[0].message = original.replace(/[\\*_#]/g, '\\$&').replace(/\n/g, '\\\n');
+  const split = original.lastIndexOf('\n');
+  graph[USER].message.content = { content_type: 'multimodal_text', parts: [
+    original.slice(0, split), { content_type: 'image_asset_pointer', asset_pointer: 'sediment://NEVER_COPY_POINTER' },
+    original.slice(split + 1), { content_type: 'text', text: 'NEVER_COPY_OBJECT_TEXT' }
+  ] };
+  if (source === 'live') mountStore(f, graph);
+  else f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { mapping: graph } } });
+  const turn = (await f.ask()).turns[0];
+  expect(turn.messages).toContainEqual(expect.objectContaining({ role: 'user', messageId: USER, rawText: original }));
+  expect(JSON.stringify(turn)).not.toContain('NEVER_COPY_POINTER');
+  expect(JSON.stringify(turn)).not.toContain('NEVER_COPY_OBJECT_TEXT');
+});
+it.each(['foreign-conversation', 'wrong-node', 'wrong-message', 'wrong-role', 'unmounted-id', 'wrong-type', 'object-only'])('does not borrow original shell user text from unproved graph identity/content (%s)', async kind => {
+  const f = fixture(), graph = liveGraph();
+  const presentation = '# Literal presentation';
+  f.entry.turn.items[0].message = presentation;
+  graph[USER].message.content.parts = ['FOREIGN_SOURCE_TEXT'];
+  if (kind === 'wrong-node') graph[USER].id = OTHER;
+  if (kind === 'wrong-message') graph[USER].message.id = OTHER;
+  if (kind === 'wrong-role') graph[USER].message.author.role = 'assistant';
+  if (kind === 'unmounted-id') f.entry.turn.messageIds = [CALL, ANSWER];
+  if (kind === 'wrong-type') graph[USER].message.content.content_type = 'code';
+  if (kind === 'object-only') graph[USER].message.content = { content_type: 'multimodal_text', parts: [{ content_type: 'text', text: 'FOREIGN_SOURCE_TEXT' }] };
+  f.queries.push({ queryKey: ['chatgpt-conversation', kind === 'foreign-conversation' ? OTHER : THREAD],
+    state: { data: { mapping: graph } } });
+  const turn = (await f.ask()).turns[0];
+  expect(turn.messages).toContainEqual(expect.objectContaining({ role: 'user', messageId: USER, rawText: presentation }));
+  expect(JSON.stringify(turn)).not.toContain('FOREIGN_SOURCE_TEXT');
+});
 it('abstains when the live store disagrees with the load-time cache or another mounted graph', async () => {
   const f = fixture(), graph = liveGraph();
   mountStore(f, graph);
@@ -585,12 +630,15 @@ it('hides only a verified shell prompt frame and restores a recycled user bubble
 });
 it('delivers three successive shell inputs with exact receipts and completed answers', async () => {
   const f = fixture(), edit = editing(f);
+  const graph = liveGraph();
+  f.queries.push({ queryKey: ['chatgpt-conversation', THREAD], state: { data: { mapping: graph } } });
   f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
   let offered: any, latest: ReturnType<typeof addExchange>, count = 0;
   const submitted: string[] = [];
   f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
     event.preventDefault(); const text = edit.serialize(); submitted.push(text);
     latest = addExchange(f, ++count, text); edit.box.replaceChildren();
+    latest.entry.turn.items[0]!.message = text.replace(/[\\*_#]/g, '\\$&').replace(/\n/g, '\\\n');
   });
   const r = await recorder(f, { desktop_input: m => ({ ok: true, data: m.authorize || m.ack || m.fail ? { ok: true } : { input: offered } }) });
   for (let at = 1; at <= 3; at++) {
@@ -600,9 +648,23 @@ it('delivers three successive shell inputs with exact receipts and completed ans
     const pending = r.runtime({ type: 'clf-desktop-input', id: offered.id, conversationId: THREAD });
     await vi.waitFor(() => expect(submitted).toHaveLength(at), { timeout: 5000 });
     await r.hook.refreshFiber(); r.hook.observe();
+    // The opening frame requires canonical source, not its displayed Markdown
+    // copy. Late evidence settles the same click without authorizing another one.
+    if (at === 1) expect(r.sent.filter(m => m.type === 'desktop_input' && m.ack && m.id === offered.id)).toEqual([]);
+    graph[latest!.userId] = graphNode(latest!.userId, null, { author: { role: 'user' }, content: at === 1
+      ? { content_type: 'multimodal_text', parts: [text, { content_type: 'image_asset_pointer', asset_pointer: 'sediment://NEVER_COPY_OPENING_IMAGE' }] }
+      : { content_type: 'text', parts: [text] } });
+    if (at === 1) {
+      const source = (await f.ask()).turns.find((turn: { turnId: string }) => turn.turnId === latest!.entry.id);
+      expect(source?.messages).toContainEqual(expect.objectContaining({ role: 'user', messageId: latest!.userId, rawText: text }));
+      expect(JSON.stringify(source)).not.toContain('NEVER_COPY_OPENING_IMAGE');
+    }
+    await r.hook.refreshFiber(); r.hook.observe();
     expect(await pending).toEqual({ ok: true });
+    expect(submitted).toHaveLength(at); // Late canonical evidence settles the one native click.
     expect(submitted.at(-1)).toBe(text);
     expect(r.sent.filter(m => m.type === 'desktop_input' && m.ack && m.id === offered.id)).toHaveLength(1);
+    expect(JSON.stringify(r.events())).not.toContain('NEVER_COPY_OPENING_IMAGE');
     latest!.finish(); await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
     await vi.waitFor(() => expect(r.events()).toContainEqual(expect.objectContaining({ kind: 'assistant_message', providerMessageId: latest!.answerId, final: true })), { timeout: 3000 });
     expect(f.api.generating()).toBe(false); expect(edit.box.textContent).toBe('');

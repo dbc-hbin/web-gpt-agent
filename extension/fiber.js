@@ -451,6 +451,22 @@
       : null;
   }
 
+  /** Only authored string parts of a public user message; never image pointers or object metadata. */
+  function authoredUserText(message) {
+    const content = message && typeof message === 'object' ? message.content : null;
+    if (!content || typeof content !== 'object' || content.content_type !== 'multimodal_text' || !Array.isArray(content.parts)) {
+      return authoredText(message);
+    }
+    let value = '', strings = 0;
+    for (let at = 0; at < content.parts.length && at < MAX_RENDERED_TEXT && value.length < MAX_RENDERED_TEXT; at++) {
+      const part = content.parts[at];
+      if (typeof part !== 'string') continue;
+      if (strings++) value += '\n';
+      value += part.slice(0, MAX_RENDERED_TEXT - value.length);
+    }
+    return value || null;
+  }
+
   /** ChatGPT's own message creation time, normalized to epoch milliseconds when present. */
   function authoredTime(message) {
     const raw = message && typeof message === 'object' ? Number(message.create_time) : NaN;
@@ -609,8 +625,7 @@
           typeof file.name === 'string' && file.name.length > 0 && file.name.length <= 200 &&
           /^image\/[a-z0-9.+-]{1,80}$/i.test(file.mime_type) && Number.isSafeInteger(file.size) && file.size >= 0 && file.size <= 512 * 1024 * 1024)
           .slice(0, Math.min(4, imageCount)).map(file => ({ id: file.id, name: file.name, size: file.size, mimeType: file.mime_type })) : [];
-      const authored = multimodal ? content.parts.filter(part => typeof part === 'string').join('\n') : authoredText(message);
-      const rawText = budgetedText(authored, budget, MAX_RENDERED_TEXT) || '';
+      const rawText = budgetedText(authoredUserText(message), budget, MAX_RENDERED_TEXT) || '';
       if (!id || (!rawText && !attachments.length)) continue;
       if (seen.has(id)) continue;
       seen.add(id);
@@ -1710,6 +1725,17 @@
         const queries = shellQueries(fiber);
         const conversation = shell ? shellConversation(queries, shell.entry.conversationId, conversationEvidenceOf(fiber)) : conversationEvidenceOf(fiber);
         const mapping = shell ? shellGraphOf(fiber, queries, shell.entry, conversation) : conversationMappingOf(queries, conversation);
+        // Shell user items are a Markdown presentation of the submitted text. Their
+        // escaping is not authored data: use the already-proved graph for this exact
+        // mounted user message, never a decoder that could erase literal backslashes.
+        // Assistant content/completion still belongs to the mounted exchange.
+        if (shell && mapping) for (const message of messages) {
+          if (message.author.role !== 'user' || !shell.entry.turn.messageIds.includes(message.id) || !own.call(mapping, message.id)) continue;
+          const node = mapping[message.id], source = node?.message;
+          if (node?.id !== message.id || source?.id !== message.id || source.author?.role !== 'user') continue;
+          const text = authoredUserText(source);
+          if (text !== null) message.content.parts = [text];
+        }
         const codeReceipts = codeModeReceipts(messages || []);
         const codeModeCalls = (messages || []).filter(message => message && message.author &&
           message.author.role === 'assistant' && message.recipient === 'functions.exec').slice(0, MAX_CALLS)
