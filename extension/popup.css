@@ -1,0 +1,639 @@
+/*
+ * ChatGPT's surface, rounded the way theirs is: near-black ground, raised cards at a
+ * generous radius, one line icon per row, and green reserved for "this worked".
+ */
+:root {
+  color-scheme: dark light;
+  --bg: #0e0e0e;
+  --card: #1a1a1a;
+  --edge: rgba(255, 255, 255, 0.07);
+  --hover: rgba(255, 255, 255, 0.045);
+  --text: #f2f2f2;
+  --muted: #9d9d9d;
+  --faint: #6f6f6f;
+  --hollow: rgba(255, 255, 255, 0.16);
+  --scroll: rgba(255, 255, 255, 0.22);
+  --scroll-strong: rgba(255, 255, 255, 0.34);
+  --green: #1fbf75;
+  --green-soft: rgba(31, 191, 117, 0.12);
+  --red: #ef6b62;
+  --red-soft: rgba(239, 107, 98, 0.12);
+  --ink: #0b0b0b;
+  --sans: 'OpenAI Sans', 'Söhne', ui-sans-serif, -apple-system, 'Segoe UI Variable Text',
+    'Segoe UI', system-ui, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, 'SF Mono', 'Cascadia Mono', 'Segoe UI Mono', Consolas, monospace;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #ffffff;
+    --card: #f6f6f7;
+    --edge: rgba(0, 0, 0, 0.07);
+    --hover: rgba(0, 0, 0, 0.035);
+    --text: #0d0d0d;
+    --muted: #5c5c5c;
+    --faint: #8b8b8b;
+    --hollow: rgba(0, 0, 0, 0.18);
+    --scroll: rgba(0, 0, 0, 0.22);
+    --scroll-strong: rgba(0, 0, 0, 0.34);
+    --green: #12a06a;
+    --green-soft: rgba(18, 160, 106, 0.1);
+    --ink: #ffffff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/*
+ * One surface, painted edge to edge, at one width.
+ *
+ * The previous version left `html` transparent so that a rounded wrapper inside it would
+ * show the corners. It does not work: a background on `html` is propagated to the viewport
+ * canvas and painted across the whole window, so leaving it unpainted does not reveal a
+ * rounded shell — it reveals Chrome's own popup canvas, which this page cannot colour and
+ * which renders as a pale hairline down the edges and at every corner. Chrome and Windows
+ * already round the popup window itself, so the fix is the opposite of the old one: paint
+ * the canvas with the app's own ground and let the window's own rounding do the corners.
+ * `.shell` keeps its radius so that if the canvas ever does show, it matches rather than
+ * outlines.
+ */
+html {
+  background: var(--bg);
+  /*
+   * The popup is as wide as the document, and until now the document grew by the width of a
+   * scrollbar the moment the Advanced drawer made the content taller than the window. Chrome
+   * anchors a popup by its right edge, so that widening read as the whole panel jumping
+   * sideways. Reserving the gutter permanently keeps one width whether the bar is there or
+   * not; 348 = the 340 the layout is drawn for, plus the 8 the bar occupies.
+   */
+  width: 348px;
+  scrollbar-gutter: stable;
+}
+
+body {
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 400 14px/1.45 var(--sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/*
+ * A plain grey bar. The stock Windows scrollbar is a wide light-grey trough with arrow
+ * buttons, drawn from the OS theme rather than this palette, and in a 340px dark panel it
+ * is the loudest thing on screen.
+ */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track,
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  border: 2px solid transparent;
+  border-radius: 999px;
+  background: var(--scroll);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-strong);
+  background-clip: padding-box;
+}
+
+::-webkit-scrollbar-button {
+  display: none;
+}
+
+.shell {
+  padding: 14px 12px 12px;
+  border-radius: 14px;
+  background: var(--bg);
+}
+
+.defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+
+/* ---------------------------------------------------------------- header */
+
+header {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 2px 4px 12px;
+}
+
+.glyph {
+  flex: none;
+  border-radius: 10px;
+}
+
+h1 {
+  margin: 0;
+  font-size: 15.5px;
+  font-weight: 400;
+  letter-spacing: -0.008em;
+  color: var(--muted);
+}
+
+h1 b {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px 4px;
+  padding: 6px 13px 6px 11px;
+  border-radius: 999px;
+  background: var(--green-soft);
+  color: var(--green);
+  font-size: 12.5px;
+  font-weight: 500;
+}
+
+.pill.off {
+  background: var(--hover);
+  color: var(--faint);
+}
+
+.pill.bad {
+  background: var(--red-soft);
+  color: var(--red);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 999px;
+  background: currentColor;
+}
+
+.caption {
+  margin: 0 0 7px 6px;
+  color: var(--faint);
+  font-size: 10.5px;
+  font-weight: 500;
+  letter-spacing: 0.09em;
+  text-transform: uppercase;
+}
+
+/* ----------------------------------------------------------------- cards */
+
+.card {
+  margin: 0 0 16px;
+  padding: 0 13px;
+  border-radius: 16px;
+  background: var(--card);
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-height: 44px;
+  list-style: none;
+}
+
+.row + .row,
+details + .row,
+#stream > summary {
+  box-shadow: inset 0 1px 0 var(--edge);
+}
+
+.ico {
+  width: 20px;
+  height: 20px;
+  flex: none;
+  fill: none;
+  stroke: var(--muted);
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+}
+
+.meta {
+  flex: none;
+  max-width: 132px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--faint);
+  font-size: 11.5px;
+}
+
+button.meta {
+  padding: 3px 7px;
+  margin: 0 -5px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--faint);
+  font: 400 11px/1.3 var(--mono);
+  cursor: pointer;
+  transition: background 120ms ease, color 120ms ease;
+}
+
+button.meta:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text);
+}
+
+button.meta:disabled {
+  cursor: default;
+  font: 400 11.5px/1.3 var(--sans);
+}
+
+/* The badge at the end of a capture row: green tick, hollow ring, or red cross. */
+.badge {
+  position: relative;
+  width: 19px;
+  height: 19px;
+  flex: none;
+  border: 1.5px solid var(--hollow);
+  border-radius: 999px;
+  transition: background 150ms ease, border-color 150ms ease;
+}
+
+.badge::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  opacity: 0;
+  background: var(--ink);
+  -webkit-mask: center / 12px 12px no-repeat var(--m);
+  mask: center / 12px 12px no-repeat var(--m);
+  --m: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' stroke-linejoin='round' d='M3.8 8.2l2.9 2.9 5.5-5.6'/%3E%3C/svg%3E");
+  transition: opacity 150ms ease;
+}
+
+.ok .badge {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.ok .badge::after {
+  opacity: 1;
+}
+
+.no .badge {
+  background: var(--red);
+  border-color: var(--red);
+  --m: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23000' stroke-width='2.4' stroke-linecap='round' d='M5 5l6 6M11 5l-6 6'/%3E%3C/svg%3E");
+}
+
+.no .badge::after {
+  opacity: 1;
+}
+
+.no .ico {
+  stroke: var(--red);
+}
+
+.wait .badge {
+  animation: breathe 1.5s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  0%,
+  100% {
+    border-color: var(--hollow);
+  }
+  50% {
+    border-color: var(--muted);
+  }
+}
+
+.off .name,
+.off .meta {
+  color: var(--faint);
+}
+
+/* ------------------------------------------------- the three-stage detail */
+
+#stream > summary {
+  cursor: pointer;
+}
+
+#stream > summary::-webkit-details-marker {
+  display: none;
+}
+
+.chevron {
+  width: 13px;
+  height: 13px;
+  flex: none;
+  margin-left: -2px;
+  background: var(--faint);
+  -webkit-mask: center / 13px 13px no-repeat var(--a);
+  mask: center / 13px 13px no-repeat var(--a);
+  --a: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23000' stroke-width='1.9' stroke-linecap='round' stroke-linejoin='round' d='M4.5 6.5l3.5 3.5 3.5-3.5'/%3E%3C/svg%3E");
+  transition: transform 150ms ease;
+}
+
+details[open] > summary .chevron {
+  transform: rotate(-180deg);
+}
+
+.stages {
+  padding: 4px 0 12px 31px;
+  box-shadow: inset 0 1px 0 var(--edge);
+}
+
+.stage {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 27px;
+  font-size: 12.5px;
+}
+
+.stage .name {
+  color: var(--faint);
+  font-size: 12.5px;
+}
+
+.stage .meta {
+  font-size: 10.5px;
+}
+
+.tick {
+  position: relative;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  border: 1.5px solid var(--hollow);
+  border-radius: 999px;
+}
+
+.tick::after {
+  content: '';
+  position: absolute;
+  inset: -1.5px;
+  opacity: 0;
+  background: var(--ink);
+  -webkit-mask: center / 10px 10px no-repeat var(--m);
+  mask: center / 10px 10px no-repeat var(--m);
+  --m: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23000' stroke-width='2.8' stroke-linecap='round' stroke-linejoin='round' d='M3.8 8.2l2.9 2.9 5.5-5.6'/%3E%3C/svg%3E");
+}
+
+.done .tick {
+  background: var(--green);
+  border-color: var(--green);
+}
+
+.done .name {
+  color: var(--text);
+}
+
+.done .tick::after {
+  opacity: 1;
+}
+
+.failed .tick {
+  background: var(--red);
+  border-color: var(--red);
+  --m: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath fill='none' stroke='%23000' stroke-width='2.8' stroke-linecap='round' d='M5 5l6 6M11 5l-6 6'/%3E%3C/svg%3E");
+}
+
+.failed .tick::after {
+  opacity: 1;
+}
+
+.failed .name {
+  color: var(--red);
+}
+
+.running .tick {
+  animation: breathe 1.5s ease-in-out infinite;
+}
+
+.why {
+  margin: 7px 0 0;
+  color: var(--faint);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.why.bad {
+  color: var(--red);
+}
+
+/* One line per request id: three dots for the three stages. */
+.calls {
+  margin-top: 9px;
+}
+
+.calls:empty {
+  display: none;
+}
+
+.call {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+  font-size: 10.5px;
+}
+
+.pips {
+  display: flex;
+  gap: 3px;
+  flex: none;
+}
+
+.pip {
+  width: 5px;
+  height: 5px;
+  border-radius: 999px;
+  background: var(--hollow);
+}
+
+.pip.on {
+  background: var(--green);
+}
+
+.pip.bad {
+  background: var(--red);
+}
+
+.call .tool {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+}
+
+.call .id {
+  flex: none;
+  color: var(--faint);
+  font-family: var(--mono);
+}
+
+/* --------------------------------------------------------------- switches */
+
+.row input[type='checkbox'] {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+label.row {
+  cursor: pointer;
+}
+
+.track {
+  flex: none;
+  display: block;
+  width: 38px;
+  height: 22px;
+  padding: 2.5px;
+  border-radius: 999px;
+  background: var(--hollow);
+  transition: background 150ms ease;
+}
+
+.thumb {
+  display: block;
+  width: 17px;
+  height: 17px;
+  border-radius: 999px;
+  background: #ffffff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.25);
+  transition: transform 150ms ease;
+}
+
+input:checked + .track {
+  background: var(--green);
+}
+
+input:checked + .track .thumb {
+  transform: translateX(16px);
+}
+
+input:focus-visible + .track {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- details */
+
+#more > summary {
+  cursor: pointer;
+  min-height: 46px;
+  list-style: none;
+}
+
+#more > summary::-webkit-details-marker {
+  display: none;
+}
+
+#more > summary:hover {
+  background: var(--hover);
+}
+
+#more[open] > summary {
+  margin-bottom: 10px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 6px 12px;
+  margin: 0 0 12px;
+  padding: 0 8px;
+  font-size: 11.5px;
+}
+
+.grid dt {
+  color: var(--faint);
+}
+
+.grid dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+  text-align: right;
+}
+
+.grid dd.bad {
+  color: var(--red);
+}
+
+.actions {
+  display: flex;
+  gap: 8px;
+}
+
+.actions button {
+  flex: 1 1 0;
+  min-height: 36px;
+  padding: 0 12px;
+  border: 0;
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--text);
+  font: 500 12.5px/1 var(--sans);
+  cursor: pointer;
+  transition: background 150ms ease;
+}
+
+.actions button:hover:not(:disabled) {
+  background: var(--hover);
+}
+
+.actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+button:focus-visible {
+  outline: 2px solid var(--muted);
+  outline-offset: 2px;
+}
+
+.alert {
+  margin: -6px 0 16px;
+  padding: 11px 14px;
+  border-radius: 14px;
+  background: var(--red-soft);
+  color: var(--red);
+  font-size: 12px;
+  line-height: 1.4;
+}

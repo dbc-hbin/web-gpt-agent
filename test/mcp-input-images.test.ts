@@ -1,0 +1,109 @@
+import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import sharp from 'sharp';
+import { expect, it } from 'vitest';
+import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
+import { initSessionStore, createSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
+import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
+import { validateInputImages } from '../src/main/session/input-images.js';
+import { stageInputAttachment } from '../src/main/session/input-attachments.js';
+import { startMcpServer } from '../src/main/mcp/server.js';
+import { setFinishNotifier, releaseSessionFinish } from '../src/main/session/finish.js';
+import { makeTempDir, removeTempDir } from './helpers.js';
+
+it.each([1, 7])('carries %s validated images through an exact-session MCP result and acknowledges the next same-turn call', async count => {
+  const directory = await makeTempDir('clf-mcp-input-image-');
+  initDurableStore(directory); initSessionStore(directory); resetInputForTests();
+  initConfigPath(directory);
+  const config = defaultConfig();
+  await saveConfig({ ...config, ui: { ...config.ui, finishTool: true } });
+  await fs.writeFile(path.join(directory, 'example.txt'), 'Image test');
+  const endpoint = await startMcpServer(() => ({ roots: [{ name: 'workspace', path: directory }], caps: config.capabilities, readOnly: true, sessionTools: false, agentTools: false }));
+  try {
+    const conversationId = randomUUID(), requestId = `wfr_input_image_test_${randomUUID()}`;
+    const session = await createSession({ conversationId, title: 'Image injection test' });
+    await observeSessionModel(session.id, conversationId, 'gpt-6-astra', Date.now());
+    await appendEvent(session.id, { kind: 'turn_start', source: 'extension', turnId: 'held-image-turn', time: Date.now() });
+    expect(observeRequestCorrelation({ requestId, conversationId, sessionId: session.id, messageId: 'image-message', tool: 'read', observedAt: Date.now() })).toBe('stored');
+    const bytes = await sharp({ create: { width: 12, height: 12, channels: 3, background: '#437b79' } }).webp().toBuffer();
+    const images = [{ name: 'reference.webp', dataUrl: `data:image/webp;base64,${bytes.toString('base64')}` }];
+    await validateInputImages(images);
+    const attachments = [];
+    for (let index = 0; index < count; index++) attachments.push(await stageInputAttachment({ name: `reference-${index}.webp`, bytes }, new Set()));
+    const authored = { id: randomUUID(), sessionId: session.id, text: 'Use these images', attachments, delivery: 'tool' as const, mode: 'auto' as const, dueAt: 0, model: null, reasoningEffort: null };
+    const input = await enqueueInput(authored);
+    expect((await enqueueInput(authored)).id).toBe(input.id);
+    const injectedBytes = input.toolImages![0]!.dataUrl.split(',')[1]!;
+    const additional = [];
+    for (const text of ['Use the connected plugin', 'Include the requested movements']) {
+      additional.push(await enqueueInput({ id: randomUUID(), sessionId: session.id, text, ...(text === 'Include the requested movements' ? { images } : {}), mode: 'auto', dueAt: 0, model: null, reasoningEffort: null }));
+    }
+    const call = async (name = 'read', args: Record<string, unknown> = { paths: ['/workspace/example.txt'] }) => {
+      const params = name === 'read' ? { name: 'exec', arguments: { code: `text(await tools.read(${JSON.stringify(args)}));` } } : { name, arguments: args };
+      const response = await fetch(endpoint.urls.core, { method: 'POST', headers: { 'content-type': 'application/json', accept: 'application/json, text/event-stream', 'x-request-id': `${requestId}/att1` }, body: JSON.stringify({ jsonrpc: '2.0', id: randomUUID(), method: 'tools/call', params }) });
+      const raw = await response.text();
+      return JSON.parse(raw.startsWith('event:') || raw.startsWith('data:') ? raw.split('\n').find(line => line.startsWith('data:'))!.slice(5) : raw);
+    };
+    const stageOne = await enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'First scheduled stage', mode: 'finish', dueAt: 0, model: null, reasoningEffort: null });
+    const stageTwo = await enqueueInput({ id: randomUUID(), sessionId: session.id, text: 'Second scheduled stage', mode: 'finish', dueAt: 0, model: null, reasoningEffort: null });
+    const first = await call();
+    expect(first.result.isError).not.toBe(true);
+    expect(first.result.content).toContainEqual({ type: 'image', mimeType: 'image/webp', data: bytes.toString('base64') });
+    expect(first.result.content).toContainEqual({ type: 'image', mimeType: 'image/webp', data: injectedBytes });
+    const texts = first.result.content.filter((row: { type: string }) => row.type === 'text').map((row: { text: string }) => row.text).join('\n');
+    expect(texts.match(/--- New instructions from the user ---/g)).toHaveLength(1);
+    expect(texts.match(/session_finish/g)).toHaveLength(1);
+    const start = first.result.content.findIndex((row: { text?: string }) => row.text?.includes('--- New instructions from the user ---'));
+    const injected = first.result.content.slice(start);
+    expect(injected.map((row: { type: string }) => row.type)).toEqual(['text', ...Array(count).fill('image'), 'text', 'text', 'image', 'text']);
+    for (const [index, entry] of [input, ...additional].entries()) {
+      expect(injected[[0, count + 1, count + 2][index]!].text).toBe((index === 0 ? '\n--- New instructions from the user ---\n' : '\n\n') + entry.text);
+      expect(texts).not.toContain(entry.id);
+    }
+    expect(injected.at(-1).text).toContain('about 5 minutes of final verification remain');
+    const second = await call();
+    expect(second.result.content.some((row: { type: string }) => row.type === 'image')).toBe(false);
+    expect((await listInputs()).find(row => row.id === input.id)?.state).toBe('sent');
+    for (const entry of additional) {
+      expect(second.result.content.some((row: { text?: string }) => row.text?.includes(entry.id))).toBe(false);
+      expect((await listInputs()).find(row => row.id === entry.id)?.state).toBe('sent');
+    }
+    expect(second.result.content.some((row: { text?: string }) => row.text?.includes(stageOne.text))).toBe(false);
+    expect(second.result.content.some((row: { text?: string }) => row.text?.includes(stageTwo.text))).toBe(false);
+    expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('queued');
+    const refusedFinish = await call('session_finish', { summary: '' });
+    expect(refusedFinish.result.isError).toBe(true);
+    expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('queued');
+    const finish = await call('session_finish', { summary: 'The current stage is complete' });
+    expect(finish.result.isError).not.toBe(true);
+    expect(finish.result.content.some((row: { text?: string }) => row.text?.includes(stageOne.text))).toBe(true);
+    expect(finish.result.content.some((row: { text?: string }) => row.text?.includes(stageTwo.text))).toBe(false);
+    const ordinary = await call();
+    expect(ordinary.result.content.some((row: { text?: string }) => row.text?.includes(stageTwo.text))).toBe(false);
+    expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('sent');
+    const third = await call('session_finish', { summary: 'The next stage is complete' });
+    expect(third.result.content.some((row: { text?: string }) => row.text?.includes(stageTwo.text))).toBe(true);
+    expect((await listInputs()).find(row => row.id === stageOne.id)?.state).toBe('sent');
+    // The last injected stage is still a tool claim until the next invocation
+    // proves receipt. Finish must acknowledge it before checking for pending work.
+    expect((await listInputs()).find(row => row.id === stageTwo.id)?.state).toBe('tool');
+    await saveConfig({ ...config, ui: { ...config.ui, finishTool: true, finishAction: 'notify' } });
+    let notifications = 0;
+    setFinishNotifier((_title, _body, id, turnId) => {
+      notifications += 1;
+      void releaseSessionFinish(id, turnId);
+      return true;
+    });
+    const exhausted = await call('session_finish', { summary: 'All received stages are complete' });
+    expect(notifications).toBe(1);
+    expect(exhausted.result.content.some((row: { text?: string }) => row.text?.includes('Queued user instructions are ready'))).toBe(false);
+    expect(exhausted.result.content.some((row: { text?: string }) => row.text?.includes('The user has been notified'))).toBe(true);
+    expect((await listInputs()).find(row => row.id === stageTwo.id)?.state).toBe('sent');
+  } finally {
+    setFinishNotifier(null);
+    await endpoint.stop(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
+  }
+});

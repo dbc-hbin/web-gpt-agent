@@ -1,0 +1,565 @@
+/**
+ * Owns the lifecycle: local MCP server up, then tunnel(s) up, then connected.
+ * Everything the UI shows about connection state comes from here.
+ *
+ * One local server publishes Core plus optional Desktop and Plugins connectors.
+ * Optional tunnel failures stay on their own Settings cards and cannot fail Core.
+ */
+
+import type { ConnectionStatus, SurfaceStatus, TunnelSettings } from '../shared/types.js';
+import { effectiveCapabilities, getConfig } from './config.js';
+import { logError, logInfo, logWarn } from './logger.js';
+import { lastRequestAt, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from './mcp/server.js';
+import { lastToolCallAt } from './mcp/tools.js';
+import { lastDiscoveryAt, lastExecutionAt, lastWorkControlAt } from './mcp/connector-evidence.js';
+import { setManagedToolGate } from './mcp/kernel.js';
+import { managedToolGate } from './work/runtime.js';
+import { getWorkServiceOrNull } from './work/service.js';
+import { SURFACE_LIST, surfaceDefinition, surfaceIsUseful, type SurfaceId } from './mcp/surfaces.js';
+import { getSecret } from './secrets.js';
+import { setupApiKeySlot } from '../shared/setup-profile.js';
+import { startTunnel, TunnelError, type TunnelHandle } from './tunnel/index.js';
+import { desktopAutomationSupported } from './platform.js';
+import { publishPluginSurface, unpublishPluginSurface, pluginRefreshPublications } from './plugin-refresh.js';
+import { pluginManager } from './plugins/manager.js';
+
+let endpoint: McpEndpoint | null = null;
+/** Retain custody while draining so final shutdown can bound that same stop. */
+let drainingEndpoint: McpEndpoint | null = null;
+let pendingDisconnect: Promise<void> | null = null;
+/** The Core tunnel. Also the only tunnel on the cloudflared and manual paths. */
+let tunnel: TunnelHandle | null = null;
+/** Independent optional tunnel lifetimes on the OpenAI path. */
+type OptionalSurface = 'desktop' | 'plugins';
+const optionalTunnels = new Map<OptionalSurface, { handle: TunnelHandle | null; tunnelId: string }>();
+const optionalSurfaces: OptionalSurface[] = ['desktop', 'plugins'];
+const optionalTunnelId = (settings: TunnelSettings, id: OptionalSurface): string =>
+  (id === 'desktop' ? settings.desktopTunnelId : settings.pluginsTunnelId) ?? '';
+/** Core-affecting transport settings the current run actually started with. */
+let activeCoreTransport: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath' | 'profileEpoch'> | null = null;
+let status: ConnectionStatus = {
+  state: 'disconnected',
+  detail: '',
+  publicUrl: null,
+  localUrl: null,
+  handshakeAt: null,
+  lastRequestAt: null,
+  lastToolCallAt: null,
+  lastWorkControlAt: null,
+  health: null,
+  surfaces: []
+};
+
+const listeners = new Set<(status: ConnectionStatus) => void>();
+// Connect/disconnect can be triggered by the renderer, tray, auto-connect and app
+// shutdown. Serialize those lifecycle transitions so a fast double click or a
+// connect racing shutdown cannot stop resources another connect just created.
+let lifecycleQueue: Promise<void> = Promise.resolve();
+/** Invalidates late async reports from a tunnel that has already been replaced/stopped. */
+let connectionGeneration = 0;
+/**
+ * Final app shutdown is a terminal lifecycle boundary, unlike an ordinary Disconnect.
+ *
+ * Merely enqueueing shutdown behind an in-flight connect let that connect finish publishing an
+ * MCP endpoint/tunnel first. Cmd+Q can arrive while startMcpServer/startTunnel/Keychain awaits;
+ * mark shutdown synchronously so each resumed await tears down what it just created instead of
+ * briefly bringing a connector online while the app is already leaving.
+ */
+let shutdownRequested = false;
+
+function enqueueLifecycle(operation: () => Promise<void>): Promise<void> {
+  const run = lifecycleQueue.then(operation, operation);
+  lifecycleQueue = run.catch(() => {});
+  return run;
+}
+
+export function getStatus(): ConnectionStatus {
+  // Read live rather than trusting the last stored copy: both clocks are set by
+  // incoming requests, which do not go past setStatus, so a stored value would lag
+  // behind reality by up to one tunnel report. The surface cards are rebuilt for the
+  // same reason — what each connector would advertise follows the permission
+  // checkboxes, which change without any connection event to recompute them.
+  return {
+    ...status,
+    lastRequestAt: lastRequestAt(),
+    lastToolCallAt: lastToolCallAt(),
+    lastWorkControlAt: lastWorkControlAt(),
+    surfaces: describeSurfaces()
+  };
+}
+
+export function onStatusChange(listener: (status: ConnectionStatus) => void): () => void {
+  listeners.add(listener);
+  return () => listeners.delete(listener);
+}
+
+function setStatus(next: Partial<ConnectionStatus>): void {
+  status = { ...status, ...next };
+  for (const listener of listeners) listener(status);
+}
+
+/**
+ * The setup-facing description of every connector, whether or not it is running.
+ *
+ * Built even while disconnected, because this is what the setup screen reads: the user
+ * needs the exact name and description to paste into ChatGPT *before* anything is live,
+ * and asking them to invent either is how a connector ends up named "my pc" — a name the
+ * model cannot address and a description it cannot route on.
+ */
+function describeSurfaces(): SurfaceStatus[] {
+  const config = getConfig();
+  const caps = effectiveCapabilities(config);
+  // A remembered surface report belongs to the currently running local endpoint. Once that
+  // endpoint is gone, carrying its state/public URL forward makes a completed disconnect
+  // internally contradictory: the headline says disconnected while a connector card can
+  // still say live and expose the dead tunnel URL. Preserve reports only while there is an
+  // endpoint for them to describe; a fresh connect will populate its own generation again.
+  const running = endpoint !== null;
+  return SURFACE_LIST.map((surface) => {
+    const available = surfaceIsUseful(surface.id, caps);
+    const previous = status.surfaces.find((entry) => entry.id === surface.id);
+    return {
+      id: surface.id,
+      connectorName: surface.connectorName,
+      description: surface.description,
+      cardSummary: surface.cardSummary,
+      optional: !surface.required,
+      available,
+      localUrl: endpoint?.urls[surface.id] ?? null,
+      publicUrl: running ? (previous?.publicUrl ?? null) : null,
+      tools: toolsFor(surface.id),
+      state: available && running ? (previous?.state ?? 'off') : 'off',
+      detail: available ? (running ? (previous?.detail ?? '') : '') : desktopUnavailableDetail(surface.id),
+      // Per connector, because a Core call proves nothing about whether the user ever
+      // created the Desktop connector in ChatGPT. Publication is our side of the wire;
+      // these four are the only evidence of the other side, and they are kept apart
+      // because a reachable URL, a pulled snapshot and a tool that ran are three
+      // different facts a user has to be able to tell apart.
+      lastRequestAt: lastRequestAt(surface.id),
+      lastToolCallAt: lastToolCallAt(surface.id),
+      lastDiscoveryAt: lastDiscoveryAt(surface.id),
+      lastExecutionAt: lastExecutionAt(surface.id)
+    };
+  });
+}
+
+function desktopUnavailableDetail(id: SurfaceId): string {
+  if (id === 'desktop' && !desktopAutomationSupported()) {
+    return 'Enable screen or input access for browser control through the companion extension. Native desktop control requires a supported host and the bundled CUA Driver.';
+  }
+  return id === 'desktop'
+    ? 'Turn on "See the screen", "Control mouse and keyboard" or a clipboard permission to use this connector.'
+    : '';
+}
+
+/**
+ * The tools this surface would advertise right now, for the "what you get" list.
+ *
+ * This is the public `tools/list` and nothing else. Each connector's real vocabulary is
+ * reached through `exec` after `tools_search`, so listing it here would describe a connector
+ * larger than the one ChatGPT actually discovers — and a card that overstated the wire is
+ * exactly the drift this split exists to prevent. The two conditional Core tools are shown
+ * only when they are really registered, matching the published declaration.
+ */
+function toolsFor(id: SurfaceId): string[] {
+  const definition = surfaceDefinition(id);
+  if (id === 'core') {
+    const config = getConfig();
+    return definition.tools.filter(name =>
+      name === 'agents' ? config.multiAgent.enabled
+        : name === 'session_finish' ? config.ui.finishTool
+        : true
+    );
+  }
+  return [...definition.tools];
+}
+
+function updateSurface(id: SurfaceId, next: Partial<SurfaceStatus>): void {
+  const before = status.surfaces.find(entry => entry.id === id)?.state;
+  setStatus({
+    surfaces: status.surfaces.map((entry) => (entry.id === id ? { ...entry, ...next } : entry))
+  });
+  if (next.state !== undefined && next.state !== before) refreshPluginPublication(id);
+}
+
+export function refreshPluginPublication(id: SurfaceId): void {
+  // Installing no external plugins must not create browser maintenance work for existing users.
+  // Once enrolled, an empty declaration still matters: it withdraws previously enabled tools.
+  if (id === 'plugins' && !pluginManager.tools().length && !pluginRefreshPublications().some(row => row.surface === id)) return;
+  const surface = describeSurfaces().find(entry => entry.id === id);
+  if (!endpoint || surface?.state !== 'live' || !surface.available) { unpublishPluginSurface(id); return; }
+  endpoint.publication?.(id, (name, version, instructions, tools) => publishPluginSurface(id, name, version, instructions, tools));
+}
+
+/** Projects a whole-connection tunnel report onto one connector card. */
+function surfaceStateForConnection(state: ConnectionStatus['state']): SurfaceStatus['state'] {
+  if (state === 'connected') return 'live';
+  if (state === 'starting-server' || state === 'connecting-tunnel') return 'starting';
+  return 'error';
+}
+
+/**
+ * Settings whose change means the existing Core tunnel can no longer represent the config.
+ *
+ * `desktopTunnelId` is intentionally absent: that second OpenAI tunnel is hot-swappable.
+ * Irrelevant fields are normalised out too, so editing a hidden OpenAI id while Cloudflare is
+ * active does not bounce a perfectly good connection.
+ */
+function coreTransport(settings: TunnelSettings): Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath' | 'profileEpoch'> {
+  return {
+    kind: settings.kind,
+    profileEpoch: settings.kind === 'openai' ? settings.profileEpoch ?? 0 : 0,
+    tunnelId: settings.kind === 'openai' ? settings.tunnelId : '',
+    binaryPath: settings.kind === 'manual' ? '' : settings.binaryPath
+  };
+}
+
+function sameCoreTransport(
+  left: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath' | 'profileEpoch'>,
+  right: Pick<TunnelSettings, 'kind' | 'tunnelId' | 'binaryPath' | 'profileEpoch'>
+): boolean {
+  return left.profileEpoch === right.profileEpoch && left.kind === right.kind && left.tunnelId === right.tunnelId && left.binaryPath === right.binaryPath;
+}
+
+/**
+ * Derives a second surface's public URL from the first one's.
+ *
+ * Only correct for a transport that publishes a whole origin — cloudflared and a manual
+ * reverse proxy — where both surfaces are already reachable at their own paths on the URL
+ * the user was given. It is deliberately not used for the OpenAI tunnel, where a tunnel id
+ * maps to one local URL and the second surface genuinely needs its own tunnel.
+ */
+function siblingPublicUrl(publicUrl: string | null, localUrl: string | null): string | null {
+  if (!publicUrl || !localUrl) return null;
+  try {
+    const target = new URL(publicUrl);
+    target.pathname = new URL(localUrl).pathname;
+    return target.toString();
+  } catch {
+    return null;
+  }
+}
+
+async function connectImpl(): Promise<void> {
+  if (shutdownRequested || pendingDisconnect) return;
+  // Offline counts as running: the tunnel is alive and retrying on its own.
+  if (
+    status.state === 'connected' ||
+    status.state === 'offline' ||
+    status.state === 'starting-server' ||
+    status.state === 'connecting-tunnel'
+  ) {
+    return;
+  }
+  await disconnectImpl();
+  // disconnectImpl can itself await a live endpoint/tunnel. Final shutdown may be requested
+  // while that stop is in progress; never mint a fresh generation afterwards and thereby undo
+  // the synchronous invalidation performed by shutdownConnection().
+  if (shutdownRequested || pendingDisconnect) return;
+  const generation = ++connectionGeneration;
+
+  const config = getConfig();
+  // No approved-root admission here. The endpoint and tunnel are the control channel, and a
+  // missing project or folder must not take work status, cancel and the CLI down with it:
+  // every coding handler reports its own unmet prerequisite (TOOL_DISABLED, a sandbox
+  // refusal, PROJECT_NOT_GIT) while the work controls keep answering. Browser readiness is
+  // the same story — the tunnel starts regardless, and a coding call without a connected
+  // page is refused per call.
+
+  try {
+    setStatus({ state: 'starting-server', detail: 'Starting the local server…', publicUrl: null });
+    // The durable admission gate is installed BEFORE the endpoint listens, and never cleared
+    // while it is still accepting, so a window with a live listener and no gate can never admit a
+    // managed mutation. The runtime owns what the gate decides; this file owns when it is in
+    // force. A call that names no work does not pass through this gate as a refusal — it runs as
+    // ordinary coding under the caller's permissions and the approved-root sandbox.
+    setManagedToolGate(managedToolGate);
+    const startedEndpoint = await startMcpServer(() => {
+      const live = getConfig();
+      return {
+        roots: live.roots,
+        caps: effectiveCapabilities(live),
+        readOnly: live.readOnly,
+        privacyScreenshots: live.ui.privacyScreenshots,
+        // Read live on every request, so a host that finishes restoring its ledger after the
+        // endpoint is listening starts serving real work control without a reconnect, and a
+        // shut-down host fails closed through the service's own HOST_UNAVAILABLE.
+        workService: getWorkServiceOrNull() ?? undefined
+      };
+    });
+    endpoint = startedEndpoint;
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await disconnectImpl();
+      return;
+    }
+    setStatus({ localUrl: endpoint.url, surfaces: describeSurfaces() });
+    updateSurface('core', { state: 'starting', detail: 'Connecting…' });
+
+    const apiKey = await getSecret(setupApiKeySlot(config.tunnel.profileId));
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await disconnectImpl();
+      return;
+    }
+    activeCoreTransport = coreTransport(config.tunnel);
+    const startedTunnel = await startTunnel({
+      localUrl: endpoint.url,
+      settings: config.tunnel,
+      apiKey,
+      discoveryHeaders: tunnelProbeHeaders(),
+      label: 'core',
+      report: (report) => {
+        if (generation !== connectionGeneration) return;
+        setStatus({
+          state: report.state,
+          detail: report.detail,
+          lastRequestAt: lastRequestAt(),
+          ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl }),
+          ...(report.handshakeAt === undefined ? {} : { handshakeAt: report.handshakeAt }),
+          ...(report.health === undefined ? {} : { health: report.health })
+        });
+        updateSurface('core', {
+          state: surfaceStateForConnection(report.state),
+          detail: report.detail,
+          ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
+        });
+        // On a whole-origin transport the Desktop surface is already published by this
+        // same tunnel; it just needs its own path on the URL the user was handed.
+        if (config.tunnel.kind !== 'openai' && report.publicUrl !== undefined) {
+          for (const id of optionalSurfaces) {
+            const optional = status.surfaces.find((entry) => entry.id === id);
+            if (!optional?.available) continue;
+            updateSurface(id, {
+              publicUrl: siblingPublicUrl(report.publicUrl, optional.localUrl),
+              state: surfaceStateForConnection(report.state),
+              detail: report.detail
+            });
+          }
+        }
+      }
+    });
+    tunnel = startedTunnel;
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await disconnectImpl();
+      return;
+    }
+
+    for (const id of optionalSurfaces) await startOptionalTunnel(id, generation, config.tunnel, apiKey);
+  } catch (err) {
+    if (shutdownRequested || generation !== connectionGeneration) {
+      await disconnectImpl();
+      return;
+    }
+    const message = err instanceof TunnelError ? err.message : (err as Error).message;
+    logError(`connect failed: ${message}`);
+    await disconnectImpl();
+    setStatus({
+      state: err instanceof TunnelError ? 'tunnel-unavailable' : 'disconnected',
+      detail: message
+    });
+  }
+}
+
+/**
+ * Publishes one optional connector with its own report lifetime and failure state.
+ */
+async function startOptionalTunnel(
+  id: OptionalSurface,
+  generation: number,
+  settings: TunnelSettings,
+  apiKey: string | null
+): Promise<void> {
+  if (shutdownRequested || pendingDisconnect || generation !== connectionGeneration) return;
+  if (settings.kind !== 'openai') return;
+  const surface = status.surfaces.find((entry) => entry.id === id);
+  if (!surface?.available || !endpoint) return;
+  const tunnelId = optionalTunnelId(settings, id);
+  if (!tunnelId) {
+    updateSurface(id, {
+      state: 'off',
+      detail: 'Not published yet. Create a separate Secure Tunnel for it and paste its tunnel id in Settings.'
+    });
+    return;
+  }
+
+  updateSurface(id, { state: 'starting', detail: 'Connecting…' });
+  const lifetime = { handle: null as TunnelHandle | null, tunnelId };
+  optionalTunnels.set(id, lifetime);
+  try {
+    const started = await startTunnel({
+      localUrl: endpoint.urls[id],
+      settings: { ...settings, tunnelId },
+      apiKey,
+      discoveryHeaders: tunnelProbeHeaders(),
+      label: id,
+      report: (report) => {
+        if (generation !== connectionGeneration || optionalTunnels.get(id) !== lifetime) return;
+        updateSurface(id, {
+          state: surfaceStateForConnection(report.state),
+          detail: report.detail,
+          ...(report.publicUrl === undefined ? {} : { publicUrl: report.publicUrl })
+        });
+      }
+    });
+    // The serialized teardown owns retirement, including when Disconnect arrived
+    // during startup. Keep the transport until its accepted responses drain.
+    lifetime.handle = started;
+  } catch (err) {
+    if (optionalTunnels.get(id) === lifetime) optionalTunnels.delete(id);
+    if (shutdownRequested || generation !== connectionGeneration) {
+      return;
+    }
+    const message = err instanceof TunnelError ? err.message : (err as Error).message;
+    logWarn(`${id} connector not published: ${message}`);
+    updateSurface(id, { state: 'error', detail: message });
+  }
+}
+
+/** Retires report authority before stopping the optional tunnel. */
+async function stopOptionalTunnel(id: OptionalSurface, detail: string): Promise<void> {
+  const current = optionalTunnels.get(id);
+  if (!current) return;
+  optionalTunnels.delete(id);
+  await current.handle?.stop().catch(() => {});
+  logInfo(`${id} connector unpublished`);
+  updateSurface(id, { state: 'off', detail, publicUrl: null });
+}
+
+/**
+ * Re-applies connector settings to a connection that is already up.
+ *
+ * Desktop-only settings are applied without disturbing Core. A setting that actually changes
+ * Core's transport is different: leaving the old tunnel running made saved config, setup cards
+ * and the transport doing the work disagree, and could even start a new-method Desktop tunnel
+ * beside an old-method Core tunnel. Those deliberate connection-setting changes reconnect the
+ * serialized lifecycle here; unrelated settings saves do not.
+ */
+async function applySettingsImpl(): Promise<void> {
+  if (shutdownRequested || pendingDisconnect) return;
+  if (!endpoint) return;
+  const config = getConfig();
+  const desiredCoreTransport = coreTransport(config.tunnel);
+  if (activeCoreTransport && !sameCoreTransport(activeCoreTransport, desiredCoreTransport)) {
+    logInfo('core connection settings changed; reconnecting');
+    await disconnectImpl();
+    await connectImpl();
+    return;
+  }
+  const caps = effectiveCapabilities(config);
+  // Rebuild the cards first: permissions may have changed which tools each surface would
+  // advertise, and on a whole-origin transport that is all there is to do.
+  setStatus({ surfaces: describeSurfaces() });
+
+  if (config.tunnel.kind !== 'openai') {
+    for (const id of optionalSurfaces) {
+      if (!surfaceIsUseful(id, caps)) continue;
+      const surface = status.surfaces.find((entry) => entry.id === id);
+      updateSurface(id, {
+        publicUrl: siblingPublicUrl(status.publicUrl, surface?.localUrl ?? null),
+        state: surfaceStateForConnection(status.state),
+        detail: status.detail
+      });
+    }
+    return;
+  }
+
+  for (const id of optionalSurfaces) {
+    if (!surfaceIsUseful(id, caps)) {
+      await stopOptionalTunnel(id, 'Turn a desktop permission back on to publish this connector.');
+      continue;
+    }
+    if (optionalTunnels.get(id)?.tunnelId === optionalTunnelId(config.tunnel, id)) continue;
+    await stopOptionalTunnel(id, 'Reconnecting with the new tunnel…');
+    await startOptionalTunnel(id, connectionGeneration, config.tunnel, await getSecret(setupApiKeySlot(config.tunnel.profileId)));
+  }
+}
+
+/** Applies a settings change to a live connection. Safe to call while disconnected. */
+export function applySettings(): Promise<void> {
+  return enqueueLifecycle(async () => { await applySettingsImpl(); for (const surface of SURFACE_LIST) refreshPluginPublication(surface.id); });
+}
+
+async function disconnectImpl(endpointForceAfterMs?: number): Promise<void> {
+  for (const surface of SURFACE_LIST) unpublishPluginSurface(surface.id);
+  // Invalidate callbacks first; stopping a child can itself cause exit/health events.
+  connectionGeneration += 1;
+  if (status.state !== 'disconnected') {
+    setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
+  }
+  // Stop local admission first and let accepted MCP calls finish recording before any
+  // command process or durable writer is retired by the app-wide shutdown sequence.
+  // The public tunnel may briefly see the now-closed loopback endpoint, which is preferable
+  // to accepting a mutation after shutdown has already begun.
+  if (endpoint) {
+    const stopping = endpoint;
+    endpoint = null;
+    drainingEndpoint = stopping;
+    try {
+      const forceAfterMs = endpointForceAfterMs ?? (shutdownRequested ? 30_000 : undefined);
+      if (forceAfterMs === undefined) await stopping.stop().catch(() => {});
+      else await stopping.stop({ forceAfterMs }).catch(() => {});
+    } finally {
+      drainingEndpoint = null;
+    }
+  }
+  // The gate is cleared only here, after the listener that consults it has stopped accepting.
+  // Clearing it earlier would leave an endpoint that still answers coding calls with no
+  // admission check at all, which is strictly worse than a stale gate: a stale gate refuses,
+  // an absent one admits. `connectImpl` reinstalls it before the next listen.
+  setManagedToolGate(null);
+  for (const { handle } of optionalTunnels.values()) await handle?.stop().catch(() => {});
+  optionalTunnels.clear();
+  if (tunnel) {
+    await tunnel.stop().catch(() => {});
+    tunnel = null;
+  }
+  activeCoreTransport = null;
+  if (status.state !== 'disconnected') logInfo('disconnected');
+  setStatus({
+    state: 'disconnected',
+    detail: '',
+    publicUrl: null,
+    localUrl: null,
+    handshakeAt: null,
+    health: null,
+    surfaces: describeSurfaces()
+  });
+}
+
+export function connect(): Promise<void> {
+  if (shutdownRequested) return Promise.resolve();
+  return enqueueLifecycle(connectImpl);
+}
+
+export function disconnect(): Promise<void> {
+  if (pendingDisconnect) return pendingDisconnect;
+  connectionGeneration += 1;
+  logInfo('disconnect requested');
+  setStatus({ state: 'disconnecting', detail: 'Disconnecting; waiting for accepted requests to finish…' });
+  pendingDisconnect = enqueueLifecycle(disconnectImpl).finally(() => { pendingDisconnect = null; });
+  return pendingDisconnect;
+}
+
+/**
+ * Final app shutdown may bound the HTTP drain because the process itself is about to exit.
+ * User disconnects and settings reconnects deliberately do not use this path: they keep
+ * running afterward, so dropping a committed response there could make ChatGPT retry it.
+ */
+export function shutdownConnection(): Promise<void> {
+  // Invalidate reports/publication immediately rather than after the lifecycle queue catches up.
+  // Ordinary disconnect does not set this flag, so Settings can still disconnect/reconnect.
+  shutdownRequested = true;
+  connectionGeneration += 1;
+  // Do not enqueue the force deadline behind the ordinary drain it must bound.
+  void drainingEndpoint?.stop({ forceAfterMs: 30_000 }).catch(() => {});
+  return enqueueLifecycle(() => disconnectImpl(30_000));
+}
+
+/** The running tunnel's own local health address, for the self-test. Null if none. */
+export function tunnelHealthBase(): string | null {
+  return tunnel?.healthBase?.() ?? null;
+}
+
+/** True while the local server is listening, regardless of tunnel state. */
+export function isServerRunning(): boolean {
+  return endpoint !== null;
+}

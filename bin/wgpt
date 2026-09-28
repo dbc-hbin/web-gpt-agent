@@ -1,0 +1,126 @@
+#!/bin/sh
+# wgpt — the Web GPT Agent command line.
+#
+# The CLI is plain Node/shared code, so it never needs Electron to *run*. But a packaged copy
+# of this app ships no separate Node binary: the only JavaScript runtime guaranteed to exist
+# on the machine is the app's own Electron binary, and ELECTRON_RUN_AS_NODE turns it into
+# exactly that. Electron 44.3.0 runs Node 24.20.0 and reads files inside app.asar through its
+# patched fs, both verified on this host.
+#
+# That variable is set for *this* process only. `host start` must launch a real app process,
+# and an inherited ELECTRON_RUN_AS_NODE would make it exit the moment the CLI script it was
+# handed finished — so the CLI clears it when spawning the host (see src/cli/index.ts).
+#
+# The standalone daemon is the one command group that must NOT run on this binary. It has to
+# serve the MCP coding tools where the desktop app was never installed, so a real `node` is
+# resolved here and passed down in WGPT_NODE_EXECUTABLE (see src/daemon/lifecycle.ts). When no
+# node is on PATH the daemon commands refuse with that reason; nothing silently substitutes the
+# Electron binary, because that would make "headless" a claim rather than a fact.
+#
+# Everything is quoted because a packaged app can live under a path containing spaces, and
+# "Web GPT Agent.app" itself does.
+set -eu
+
+# Resolve this script through any symlinks so a link on PATH still finds its siblings.
+script="$0"
+while [ -L "$script" ]; do
+  target=$(readlink "$script")
+  case "$target" in
+    /*) script="$target" ;;
+    *) script="$(dirname "$script")/$target" ;;
+  esac
+done
+script_dir=$(CDPATH= cd -- "$(dirname -- "$script")" && pwd -P)
+
+# --- packaged layout ---------------------------------------------------------------
+# electron-builder puts extraResources in the app's resource directory, so this script lands
+# at <App>.app/Contents/Resources/bin/wgpt on macOS and <app>/resources/bin/wgpt elsewhere.
+# The resource directory is therefore always exactly one level up from bin/, and the app
+# executable is its sibling: `MacOS` on macOS, the app root on Windows/Linux.
+#
+# The CLI entry lives *inside* app.asar, which no shell test can look through, so the packaged
+# case is detected by the archive itself being an ordinary file. Electron's patched fs is what
+# reads the entry, and it is also what makes a path containing spaces work.
+resources=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+archive="$resources/app.asar"
+
+# --- the plain Node the standalone daemon runs on -----------------------------------
+# The daemon is deliberately *not* the Electron binary turned into a script runner: it is the
+# one part of this product that has to serve the MCP coding tools on a machine where the desktop
+# app was never installed, so it needs a real `node`. Resolved here (and passed down through the
+# environment) rather than guessed at spawn time, because the packaged CLI is itself running on
+# Electron and cannot tell the two apart from its own execPath. When no node exists the daemon
+# commands refuse with that reason instead of silently starting something else.
+wgpt_node=''
+if [ -n "${WGPT_NODE_EXECUTABLE:-}" ]; then
+  wgpt_node="$WGPT_NODE_EXECUTABLE"
+else
+  for candidate in node nodejs; do
+    resolved=$(command -v "$candidate" 2>/dev/null || true)
+    if [ -n "$resolved" ] && [ -x "$resolved" ]; then wgpt_node="$resolved"; break; fi
+  done
+fi
+
+if [ -f "$archive" ]; then
+  entry="$archive/out/cli/index.js"
+  # The daemon is the one entry that runs on plain Node, which cannot read inside app.asar at all.
+  # `asarUnpack: '**/out/daemon/**'` (electron-builder.yml) puts it under the same
+  # `app.asar.unpacked` tree that already carries the native modules it requires, so its
+  # dependencies resolve by the ordinary node_modules walk. Without it, `wgpt daemon …` says the
+  # entry is missing rather than spawning a process that dies on its first require.
+  if [ -f "$resources/app.asar.unpacked/out/daemon/index.js" ]; then
+    daemon_entry="$resources/app.asar.unpacked/out/daemon/index.js"
+  else
+    daemon_entry=''
+  fi
+  app_root=$(CDPATH= cd -- "$resources/.." && pwd -P)
+  app_exe=''
+  for candidate in \
+    "$app_root/MacOS/${WGPT_APP_NAME:-Web GPT Agent}" \
+    "$app_root/${WGPT_APP_NAME:-Web GPT Agent}.exe" \
+    "$app_root/${WGPT_EXECUTABLE_NAME:-web-gpt-agent}" \
+    "$app_root/${WGPT_EXECUTABLE_NAME:-web-gpt-agent}.exe"; do
+    if [ -f "$candidate" ] && [ -x "$candidate" ]; then app_exe="$candidate"; break; fi
+  done
+  # Last resort: whatever single executable the macOS bundle actually carries.
+  if [ -z "$app_exe" ] && [ -d "$app_root/MacOS" ]; then
+    for candidate in "$app_root/MacOS"/*; do
+      if [ -f "$candidate" ] && [ -x "$candidate" ]; then app_exe="$candidate"; break; fi
+    done
+  fi
+  if [ -z "$app_exe" ]; then
+    echo "wgpt: found $archive but no app executable to run it with" >&2
+    exit 2
+  fi
+  WGPT_APP_EXECUTABLE="$app_exe" \
+  WGPT_CLI_ENTRY="$entry" \
+  WGPT_NODE_EXECUTABLE="$wgpt_node" \
+  WGPT_DAEMON_ENTRY="$daemon_entry" \
+    exec env ELECTRON_RUN_AS_NODE=1 "$app_exe" "$entry" "$@"
+fi
+
+# --- development layout: <repo>/bin/wgpt -------------------------------------------
+repo=$(CDPATH= cd -- "$script_dir/.." && pwd -P)
+dev_entry="$repo/out/cli/index.js"
+if [ ! -f "$dev_entry" ]; then
+  echo "wgpt: no app bundle here and $dev_entry is missing; run 'npm run build' first" >&2
+  exit 2
+fi
+
+dev_electron=''
+for candidate in \
+  "$repo/node_modules/electron/dist/Electron.app/Contents/MacOS/Electron" \
+  "$repo/node_modules/electron/dist/electron" \
+  "$repo/node_modules/electron/dist/electron.exe"; do
+  if [ -f "$candidate" ]; then dev_electron="$candidate"; break; fi
+done
+
+dev_daemon="$repo/out/daemon/index.js"
+if [ ! -f "$dev_daemon" ]; then dev_daemon=''; fi
+
+WGPT_CLI_ENTRY="$dev_entry" \
+WGPT_REPO_ROOT="$repo" \
+WGPT_NODE_EXECUTABLE="$wgpt_node" \
+WGPT_DAEMON_ENTRY="${WGPT_DAEMON_ENTRY:-$dev_daemon}" \
+WGPT_APP_EXECUTABLE="${WGPT_APP_EXECUTABLE:-$dev_electron}" \
+  exec node "$dev_entry" "$@"

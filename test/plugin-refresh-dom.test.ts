@@ -1,0 +1,108 @@
+import { readFileSync } from 'node:fs';
+import { JSDOM } from 'jsdom';
+import { afterEach, expect, it } from 'vitest';
+const source = readFileSync(new URL('../extension/chatgpt-dom.js', import.meta.url), 'utf8');
+const fiber = readFileSync(new URL('../extension/fiber.js', import.meta.url), 'utf8');
+let dom: JSDOM;
+afterEach(() => dom?.window.close());
+const tool = { name: 'read', description: 'Read an exact file.', inputSchema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } };
+function page() {
+  dom = new JSDOM('<section role="tabpanel" aria-labelledby="settings-trigger-Plugins"><h2>Web GPT Agent</h2><button id="schema">Schema kopieren</button><footer><button id="refresh">Aktualisieren</button></footer></section>', { runScripts: 'outside-only', url: 'https://chatgpt.com/#settings/Plugins/plugin_asdk_app_synthetic' });
+  const win = dom.window;
+  Object.defineProperty(win.HTMLElement.prototype, 'getClientRects', { value() { return this.hidden ? [] : [{}]; } });
+  win.postMessage = (data: unknown) => queueMicrotask(() => win.dispatchEvent(new win.MessageEvent('message', { data, source: win as unknown as Window, origin: win.location.origin })));
+  const props = { connector: { id: 'asdk_app_synthetic', name: 'Web GPT Agent', app_metadata: { version_id: 'asdk_app_v_synthetic' }, owners: ['never-copy'] },
+    actions: [{ name: tool.name, description: tool.description, description_model: null, params: tool.inputSchema }], isLoadingActions: false };
+  (win.document.getElementById('schema') as any).__reactFiber$fixture = { memoizedProps: props };
+  (win.document.getElementById('refresh') as any).__reactFiber$fixture = { memoizedProps: { details: [{ title: 'App-Kennung', value: props.connector.id }], reportEntity: { id: props.connector.id, entityType: 'connector' }, headerTrailingContent: {} } };
+  win.eval(fiber); win.eval(source);
+  return { api: (win as any).CLF_DOM, props };
+}
+it('reads localized installed declarations and the unique native refresh action from provider state', async () => {
+  const { api } = page(); const view = await api.pluginRefreshView('Web GPT Agent', [tool]);
+  expect(view).toMatchObject({ appId: 'asdk_app_synthetic', versionId: 'asdk_app_v_synthetic', tools: [tool] });
+  expect(view.refresh.textContent).toBe('Aktualisieren'); expect(view).not.toHaveProperty('success');
+});
+it('does not substitute expected declarations for changed provider descriptions', async () => {
+  const { api, props } = page(); props.actions[0]!.description = 'Changed declaration.';
+  expect((await api.pluginRefreshView('Web GPT Agent', [tool])).tools[0].description).toBe('Changed declaration.');
+  props.actions.push(props.actions[0]!);
+  expect(await api.pluginRefreshView('Web GPT Agent')).toBeNull();
+});
+it('uses an enrolled App ID through renames, but refuses mismatched IDs and loading schemas', async () => {
+  const { api, props } = page(); props.connector.name = 'Renamed';
+  expect(await api.pluginRefreshView('Web GPT Agent')).toBeNull();
+  expect(await api.pluginRefreshView('Web GPT Agent', [], 'asdk_app_synthetic')).not.toBeNull();
+  expect(await api.pluginRefreshView('Web GPT Agent', [], 'asdk_app_other')).toBeNull();
+  props.isLoadingActions = true;
+  expect(await api.pluginRefreshView('Renamed')).toBeNull();
+});
+it('rejects oversized or cyclic schemas before projecting them to the isolated world', async () => {
+  const { api, props } = page();
+  const schema = { type: 'object', description: 'x'.repeat(300000) };
+  props.actions[0]!.params = schema as any;
+  expect(await api.pluginRefreshView('Web GPT Agent')).toBeNull();
+  props.actions[0]!.params = { type: 'object', properties: {} } as any;
+  (props.actions[0]!.params as any).properties.self = props.actions[0]!.params;
+  expect(await api.pluginRefreshView('Web GPT Agent')).toBeNull();
+});
+it.each([118, 257])('accepts %s declarations for the Plugins connector including its optional code-mode tool', async (count) => {
+  const { api, props } = page();
+  props.connector.name = 'Web GPT Agent Plugins';
+  props.actions = Array.from({ length: count }, (_, i) => ({ name: i === 256 ? 'exec' : `plugin_tool_${i}`, description: `Plugin tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  const view = await api.pluginRefreshView('Web GPT Agent Plugins');
+  expect(view?.tools).toHaveLength(count);
+});
+it.each([
+  ['Web GPT Agent', 20, 21],
+  ['Web GPT Agent Desktop', 24, 25],
+  ['Web GPT Agent Plugins', 257, 258]
+] as const)('accepts %s’s full real catalog of %s declarations and refuses one more', async (connector, accepted, refused) => {
+  const { api, props } = page();
+  props.connector.name = connector;
+  const catalog = (count: number) => Array.from({ length: count }, (_, i) => ({ name: `tool_${i}`, description: `Tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  // The real Core catalog is 20 and Windows Desktop is 24; a bound that rejected either
+  // would silently refuse to read a connector this app actually publishes.
+  props.actions = catalog(accepted);
+  expect((await api.pluginRefreshView(connector))?.tools).toHaveLength(accepted);
+  props.actions = catalog(refused);
+  expect(await api.pluginRefreshView(connector)).toBeNull();
+});
+it.each([[16, true], [17, false]] as const)('keeps the small bound for a connector name this app does not publish (%s declarations accepted: %s)', async (count, accepted) => {
+  const { api, props } = page();
+  props.connector.name = 'Some Other Connector';
+  props.actions = Array.from({ length: count }, (_, i) => ({ name: `tool_${i}`, description: `Tool ${i}`, description_model: null,
+    params: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'] } }));
+  expect((await api.pluginRefreshView('Some Other Connector')) !== null).toBe(accepted);
+});
+it('refuses ambiguous native actions and never copies unrelated connector properties', async () => {
+  const { api } = page(); const messages: unknown[] = [];
+  dom.window.addEventListener('message', event => { if (event.data?.source === 'clf-plugin-reply') messages.push(event.data); });
+  await api.pluginRefreshView('Web GPT Agent'); expect(JSON.stringify(messages)).not.toContain('never-copy');
+  const button = dom.window.document.getElementById('refresh')!;
+  const copy = button.cloneNode(true) as any; copy.__reactFiber$fixture = (button as any).__reactFiber$fixture; button.after(copy);
+  expect(await api.pluginRefreshView('Web GPT Agent')).toBeNull();
+});
+it('discovers exact installed rows across languages and preserves ambiguity', () => {
+  const { api } = page(); const panel = dom.window.document.querySelector('section')!;
+  panel.innerHTML = '<a href="/plugins">Plugins durchsuchen</a>';
+  expect(api.pluginInstalledButtons('Web GPT Agent')).toBeNull();
+  panel.insertAdjacentHTML('beforeend', '<button><span data-testid="plugin-icon-wrapper"></span><div>Web GPT Agent</div><span>Alle zulassen</span></button>');
+  expect(api.pluginInstalledButtons('Web GPT Agent')).toHaveLength(1);
+  expect(api.pluginInstalledButtons('Web GPT Agent Desktop')).toEqual([]);
+  panel.insertAdjacentHTML('beforeend', panel.querySelector('button')!.outerHTML);
+  expect(api.pluginInstalledButtons('Web GPT Agent')).toHaveLength(2);
+});
+
+it('observes an exact installed card without a refresh action through the real Fiber bridge', async () => {
+  const { api } = page();
+  const refresh = dom.window.document.getElementById('refresh') as any;
+  const card = { ...refresh.__reactFiber$fixture.memoizedProps, headerTrailingContent: null };
+  (dom.window.document.getElementById('schema') as any).__reactFiber$fixture.return = { memoizedProps: card };
+  refresh.remove();
+  expect(await api.pluginRefreshView('Web GPT Agent', [tool])).toMatchObject({ appId: 'asdk_app_synthetic', tools: [tool], refresh: null });
+  delete (dom.window.document.getElementById('schema') as any).__reactFiber$fixture.return;
+  expect(await api.pluginRefreshView('Web GPT Agent', [tool])).toBeNull();
+});

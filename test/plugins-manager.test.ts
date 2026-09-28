@@ -1,0 +1,946 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { createServer } from 'node:http';
+import { Client } from '@modelcontextprotocol/client';
+import { zipSync, strToU8 } from 'fflate';
+import sharp from 'sharp';
+import { makeTempDir, removeTempDir } from './helpers.js';
+const secrets = vi.hoisted(() => new Map<string, string>());
+vi.mock('../src/main/secrets.js', () => ({
+  getSecret: vi.fn(async (k: string) => secrets.get(k) ?? null),
+  setSecret: vi.fn(async (k: string, v: string) => {
+    secrets.set(k, v);
+  }),
+  clearSecret: vi.fn(async (k: string) => {
+    secrets.delete(k);
+  }),
+}));
+import { initDurableStore } from '../src/main/durable.js';
+import { getSecret } from '../src/main/secrets.js';
+import { ExternalNotDispatched, PluginManager } from '../src/main/plugins/manager.js';
+import { externalSchemaHash } from '../src/main/plugins/external-declaration.js';
+import { PluginOAuth, PluginNeedsAuth } from '../src/main/plugins/oauth.js';
+import * as pluginInstaller from '../src/main/plugins/installer.js';
+import * as exposureModule from '../src/main/plugins/exposure.js';
+import * as durableModule from '../src/main/durable.js';
+
+const fixture = `const readline=require('node:readline');
+const tools=[{name:'Echo.Mixed',description:'Echo fixture',inputSchema:{type:'object',properties:{value:{type:'string'}},required:['value'],additionalProperties:false},annotations:{readOnlyHint:true,destructiveHint:false,openWorldHint:false},outputSchema:{type:'object',properties:{value:{type:'string'}},required:['value']}}];
+readline.createInterface({input:process.stdin}).on('line',line=>{const m=JSON.parse(line);if(m.id===undefined)return;let result;if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'CoS test fixture',version:'1'}};else if(m.method==='tools/list')result={tools};else if(m.method==='tools/call')result={content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}],structuredContent:{value:m.params.arguments.value},isError:m.params.arguments.value==='error'};else result={};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');});`;
+let dir: string, manager: PluginManager, entry: string;
+beforeEach(async () => {
+  dir = await makeTempDir('plugins-test-');
+  initDurableStore(dir);
+  manager = new PluginManager();
+  await manager.initialize(dir);
+  entry = path.join(dir, 'server.cjs');
+  await fs.writeFile(entry, fixture);
+  secrets.clear();
+});
+afterEach(async () => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  await manager.close();
+  await removeTempDir(dir);
+});
+describe('external plugin authority', () => {
+  it.each(['tool', 'installation', 'connection'] as const)(
+    'refuses a %s revoked while Desktop admission is pending, but dispatches after fresh admission', async revoked => {
+      const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+      const tool = manager.retainedTool(row.id, 'Echo.Mixed')!;
+      const expected = { schemaHash: externalSchemaHash(tool), generation: manager.externalInstallations()[0]!.generation };
+      const upstream = vi.spyOn(Client.prototype, 'callTool');
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const call = manager.callExternal(row.id, tool.name, { value: 'revoked' }, expected, async () => {
+        entered.resolve();
+        await release.promise;
+        return true;
+      });
+      try {
+        await entered.promise;
+        if (revoked === 'tool') await manager.setToolEnabled(row.id, tool.name, false);
+        else if (revoked === 'installation') await manager.setEnabled(row.id, false);
+        else await manager.restart(row.id);
+      } finally {
+        release.resolve();
+      }
+      await expect(call).rejects.toBeInstanceOf(ExternalNotDispatched);
+      expect(upstream).not.toHaveBeenCalled();
+      if (revoked === 'tool') await manager.setToolEnabled(row.id, tool.name, true);
+      if (revoked === 'installation') await manager.setEnabled(row.id, true);
+      const fresh = manager.retainedTool(row.id, tool.name)!;
+      const result = await manager.callExternal(row.id, tool.name, { value: 'allowed' }, {
+        schemaHash: externalSchemaHash(fresh), generation: manager.externalInstallations()[0]!.generation,
+      }, async () => true);
+      expect(result.structuredContent).toEqual({ value: 'allowed' });
+      expect(upstream).toHaveBeenCalledTimes(1);
+    },
+  );
+  it('classifies an unknown Plugins name without dispatching or implying a disabled Core permission', async () => {
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const outcome = vi.fn();
+    const result = await manager.call('read', { path: 'example.txt' }, outcome);
+    expect(JSON.stringify(result)).toContain('UNKNOWN_TOOL');
+    expect(JSON.stringify(result)).toContain('current Plugins catalog');
+    expect(JSON.stringify(result)).not.toContain('PLUGIN_DISABLED');
+    expect(JSON.stringify(result)).toContain('This call was not dispatched.');
+    expect(result.isError).toBe(true);
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('uses exposure conflicts for refused calls even while either claimant is disabled', async () => {
+    const first = (await manager.install({ name: 'First integration', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const second = (await manager.install({ name: 'Second integration', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[1]!;
+    expect(manager.tools()).toEqual([]);
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = async () => JSON.stringify(await manager.call('Echo.Mixed', { value: 'must not dispatch' }));
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    expect(await refused()).toContain('conflicting declarations');
+    await manager.setEnabled(first.id, false);
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    await manager.setEnabled(first.id, true);
+    await manager.setToolEnabled(second.id, 'Echo.Mixed', false);
+    expect(await refused()).toContain('PLUGIN_NOT_EXPOSED');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+
+  it('reports the existing schema-limit issue while a published neighbor remains callable', async () => {
+    const tools = Array.from({ length: 3 }, (_, index) => ({
+      name: `large_${index}`, description: 'x'.repeat(100000), inputSchema: { type: 'object' },
+    }));
+    await fs.writeFile(entry, fixture.replace(/const tools=.*?;\n/, `const tools=${JSON.stringify(tools)};\n`));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    expect(manager.tools().map(tool => tool.name)).toEqual(['large_0', 'large_1']);
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = JSON.stringify(await manager.call('large_2'));
+    expect(refused).toContain('PLUGIN_NOT_EXPOSED');
+    expect(refused).toContain('schema size limit');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(upstream).not.toHaveBeenCalled();
+    expect((await manager.call('large_0', { value: 'published neighbor' })).isError).not.toBe(true);
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps a server failure distinct from a disabled tool on subsequent cached calls', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const upstream = vi.spyOn(Client.prototype, 'callTool').mockRejectedValueOnce(new Error('private transport details'));
+    expect(JSON.stringify(await manager.call('Echo.Mixed', { value: 'first' }))).toContain('PLUGIN_CALL_FAILED');
+    expect(manager.snapshot().plugins[0]?.status).toBe('error');
+    const outcome = vi.fn();
+    const next = JSON.stringify(await manager.call('Echo.Mixed', { value: 'second' }, outcome));
+    expect(next).toContain('PLUGIN_UNAVAILABLE');
+    expect(next).toContain('Restart this plugin');
+    expect(next).not.toContain('Refresh the Plugins connector');
+    expect(next).not.toContain('private transport details');
+    expect(upstream).toHaveBeenCalledTimes(1);
+    expect(outcome).toHaveBeenCalledWith('tool_rejected');
+    await manager.setEnabled(row.id, false);
+    const disabled = JSON.stringify(await manager.call('Echo.Mixed', { value: 'third' }));
+    expect(disabled).toContain('PLUGIN_DISABLED');
+    expect(disabled).toContain('Enable');
+    expect(disabled).toContain('This call was not dispatched.');
+    expect(disabled).not.toContain('Restart this plugin');
+    expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves accepted protocol results and treats upstream error text only as execution output', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const exact = { content: [{ type: 'text' as const, text: 'safe result' }], structuredContent: { value: 'safe result' }, _meta: { fixture: 'kept' } };
+    upstream.mockResolvedValueOnce(exact);
+    expect(await manager.call('Echo.Mixed', { value: 'safe result' })).toEqual(exact);
+    const upstreamError = { ...exact, isError: true, content: [{ type: 'text' as const, text: 'PLUGIN_DISABLED is merely upstream text' }] };
+    upstream.mockResolvedValueOnce(upstreamError);
+    const outcome = vi.fn();
+    expect(await manager.call('Echo.Mixed', { value: 'error text' }, outcome)).toEqual(upstreamError);
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    expect(upstream).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps Windows package data below MAX_PATH across installation and replacement', async () => {
+    const directories: string[] = [];
+    vi.spyOn(pluginInstaller, 'installSource').mockImplementation(async (_source, directory) => {
+      directories.push(directory);
+      await fs.mkdir(directory, { recursive: true });
+      return { command: process.execPath, args: [entry], version: 'fixture', license: 'MIT' };
+    });
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    await manager.update(row.id);
+    expect(directories).toHaveLength(2);
+    expect(directories[0]).not.toBe(directories[1]);
+    const packageData = 'venv/Lib/site-packages/jsonschema_specifications/schemas/draft201909/metaschema.json';
+    // Reproduce the report's redirected Windows root: the former two UUID levels
+    // place this actual Fetch dependency's data file at 267 characters.
+    const oldSuffix = path.win32.join('plugins', row.id, row.id, packageData);
+    const redirectedRoot = 'C:\\' + 'r'.repeat(267 - oldSuffix.length - 4);
+    expect(path.win32.join(redirectedRoot, oldSuffix)).toHaveLength(267);
+    for (const directory of directories) {
+      const relative = path.relative(dir, directory);
+      expect(path.win32.join(redirectedRoot, relative, packageData).length).toBeLessThan(260);
+      expect(path.dirname(directory)).toBe(path.join(dir, 'plugins', row.id));
+    }
+    await expect(fs.stat(directories[0]!)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(fs.stat(directories[1]!)).resolves.toBeDefined();
+    await manager.close();
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]?.status).toBe('ready'), { timeout: 10_000 });
+    expect(manager.snapshot().plugins[0]?.id).toBe(row.id);
+  });
+
+  it('reuses publication between lifecycle changes without exposing its cached membership array', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const project = vi.spyOn(exposureModule, 'pluginExposure');
+    manager.tools();
+    const previous = project.mock.calls.length;
+    for (let i = 0; i < 5; i++) {
+      expect(manager.tools().pop()?.name).toBe('Echo.Mixed');
+      expect(manager.snapshot().plugins[0]!.tools[0]!.published).toBe(true);
+    }
+    expect(project.mock.calls.length).toBe(previous);
+    const disabled = manager.setToolEnabled(row.id, 'Echo.Mixed', false);
+    expect(manager.tools()).toEqual([]);
+    await disabled;
+  });
+
+  it('publishes changed discovery and applies revocation while its catalog save is still pending', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    expect(manager.tools()[0]!.name).toBe('Echo.Mixed');
+    await fs.writeFile(entry, fixture.replaceAll('Echo.Mixed', 'Echo.Revised'));
+    let markSaving!: () => void;
+    let releaseSave!: () => void;
+    const saving = new Promise<void>(resolve => { markSaving = resolve; });
+    const released = new Promise<void>(resolve => { releaseSave = resolve; });
+    const write = durableModule.writeDurableNow;
+    vi.spyOn(durableModule, 'writeDurableNow').mockImplementationOnce(async (name, value) => {
+      markSaving();
+      await released;
+      await write(name, value);
+    });
+    // Populate the previous catalog's projection during the connecting notification.
+    const unsubscribe = manager.onChanged(() => { manager.tools(); });
+    const restarted = manager.restart(row.id);
+    let disabled: ReturnType<PluginManager['setToolEnabled']> | undefined;
+    try {
+      await saving;
+      expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Revised']);
+      disabled = manager.setToolEnabled(row.id, 'Echo.Revised', false);
+      expect(manager.tools()).toEqual([]);
+      const upstream = vi.spyOn(Client.prototype, 'callTool');
+      const refused = JSON.stringify(await manager.call('Echo.Mixed', { value: 'never admitted' }));
+      expect(refused).toContain('UNKNOWN_TOOL');
+      expect(refused).toContain('This call was not dispatched.');
+      expect(upstream).not.toHaveBeenCalled();
+    } finally {
+      releaseSave();
+      unsubscribe();
+      await restarted;
+      await disabled;
+    }
+  });
+
+  it('finds standard desktop-installed runtimes without replacing inherited PATH precedence', () => {
+    const inherited = { PATH: '/custom/bin:/usr/bin:/bin', HOME: '/Users/example' };
+    expect(pluginInstaller.pluginEnvironment(inherited, 'darwin').PATH).toBe('/custom/bin:/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin:/Users/example/.local/bin');
+    const linux = pluginInstaller.pluginEnvironment({ PATH: '/usr/local/bin:/usr/bin', HOME: '/home/example' }, 'linux');
+    expect(linux.PATH).toBe('/usr/local/bin:/usr/bin:/home/example/.local/bin');
+    expect(pluginInstaller.pluginEnvironment(linux, 'linux')).toEqual(linux);
+    expect(pluginInstaller.pluginEnvironment({ Path: 'C:\\tools;C:\\Windows' }, 'win32')).toEqual({ Path: 'C:\\tools;C:\\Windows' });
+    expect(inherited.PATH).toBe('/custom/bin:/usr/bin:/bin');
+  });
+
+  it('projects reviewed license terms for existing installations without reinstalling them', async () => {
+    vi.spyOn(pluginInstaller, 'installSource').mockResolvedValueOnce({
+      command: process.execPath, args: [entry], version: '2026.8.31', license: 'MIT',
+    });
+    await manager.install({ catalogId: 'memory' });
+    expect(manager.snapshot().plugins[0]!.license).toContain('Apache-2.0');
+    await manager.close();
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    expect(manager.snapshot().plugins[0]!.license).toContain('Apache-2.0');
+  });
+  it('restores OAuth as needs-auth without a request or browser opening and never publishes its cached catalog', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const fetcher = vi.spyOn(globalThis, 'fetch').mockRejectedValue(new Error('Unexpected network request'));
+    await manager.configure(row.id, { source: { kind: 'remote', url: 'https://oauth.example/mcp', auth: 'oauth' } });
+    expect(manager.snapshot().plugins[0]!).toMatchObject({ status: 'needs-auth', tools: [expect.objectContaining({ published: false })] });
+    expect(manager.tools()).toEqual([]);
+    await manager.restart(row.id); await manager.close();
+    const open = vi.fn(); manager = new PluginManager(open);
+    await manager.initialize(dir);
+    expect(manager.tools()).toEqual([]);
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('needs-auth'));
+    expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+    const outcome = vi.fn();
+    const refused = JSON.stringify(await manager.call('Echo.Mixed', { value: 'unavailable' }, outcome));
+    expect(refused).toContain('PLUGIN_NEEDS_AUTH');
+    expect(refused).toContain('Sign in');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(fetcher).not.toHaveBeenCalled(); expect(open).not.toHaveBeenCalled();
+  });
+  it('reports authenticating without dispatching or starting another sign-in', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    await manager.configure(row.id, { source: { kind: 'remote', url: 'https://oauth.example/mcp', auth: 'oauth' } });
+    let began!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { began = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    const signIn = vi.spyOn(PluginOAuth.prototype, 'signIn').mockImplementation(async () => { began(); await pending; });
+    await manager.authenticate(row.id); await started;
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const refused = JSON.stringify(await manager.call('Echo.Mixed'));
+    expect(refused).toContain('PLUGIN_AUTHENTICATING');
+    expect(refused).toContain('Finish the current sign-in');
+    expect(refused).toContain('This call was not dispatched.');
+    expect(signIn).toHaveBeenCalledTimes(1);
+    expect(upstream).not.toHaveBeenCalled();
+    await manager.cancelAuthentication(row.id); release();
+  });
+
+  it('distinguishes shutdown and startup failure while rejecting the requested tool exactly once', async () => {
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    await manager.close();
+    let outcome = vi.fn();
+    const closing = JSON.stringify(await manager.call('Echo.Mixed', {}, outcome));
+    expect(closing).toContain('PLUGIN_UNAVAILABLE: Plugins are shutting down.');
+    expect(closing).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+
+    const file = path.join(dir, 'state', 'plugins.json');
+    const stored = JSON.parse(await fs.readFile(file, 'utf8'));
+    stored[0].launch.command = 'cos-nonexistent-runtime';
+    await fs.writeFile(file, JSON.stringify(stored));
+    manager = new PluginManager(); await manager.initialize(dir);
+    outcome = vi.fn();
+    const failed = JSON.stringify(await manager.call('Echo.Mixed', {}, outcome));
+    expect(failed).toContain('PLUGIN_START_FAILED');
+    expect(failed).toContain('This call was not dispatched.');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+  it('keeps needs-auth and unpublishes cached tools after an authenticated call retires its expired connection', async () => {
+    const endpoint = 'https://oauth.example/mcp';
+    const row = (await manager.install({ source: { kind: 'remote', url: endpoint, auth: 'oauth' } })).plugins[0]!;
+    secrets.set(`plugin:${row.id}:oauth:state`, JSON.stringify({ endpoint, tokens: { access_token: 'oauth-access-token', token_type: 'Bearer', issuer: 'https://oauth.example' } }));
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async (_input, init) => {
+      if (init?.method !== 'POST') return new Response(null, { status: 405 });
+      expect(new Headers(init.headers).get('Authorization')).toBe('Bearer oauth-access-token');
+      const message = JSON.parse(String(init.body));
+      if (message.id === undefined) return new Response(null, { status: 202 });
+      const result = message.method === 'initialize' ? { protocolVersion: '2025-11-25', capabilities: { tools: {} }, serverInfo: { name: 'OAuth fixture', version: '1' } } : { tools: [{ name: 'oauth_action', inputSchema: { type: 'object' } }] };
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: message.id, result }), { headers: { 'Content-Type': 'application/json' } });
+    });
+    await manager.restart(row.id); expect(manager.snapshot().plugins[0]!.status).toBe('ready');
+    const close = vi.spyOn(Client.prototype, 'close');
+    vi.spyOn(Client.prototype, 'callTool').mockRejectedValueOnce(new PluginNeedsAuth());
+    expect((await manager.call('oauth_action', {})).isError).toBe(true);
+    await vi.waitFor(() => expect(close).toHaveBeenCalled());
+    expect(manager.snapshot().plugins[0]!.status).toBe('needs-auth');
+    expect(manager.snapshot().plugins[0]!.tools[0]!.published).toBe(false);
+    expect(manager.tools()).toEqual([]);
+  });
+  it.each(['cancel', 'disable', 'uninstall', 'update', 'endpoint', 'shutdown'] as const)('returns immediately from Sign in and revokes late token writes on %s', async action => {
+    let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const pending = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(PluginOAuth.prototype, 'signIn').mockImplementation(async function (this: PluginOAuth) {
+      begin(); await pending;
+      await this.saveTokens({ access_token: 'late-private-token', token_type: 'Bearer', issuer: 'https://oauth.example' });
+    });
+    const row = (await manager.install({ source: { kind: 'remote', url: 'https://oauth.example/mcp', auth: 'oauth' } })).plugins[0]!;
+    expect((await manager.authenticate(row.id)).plugins[0]!.status).toBe('authenticating');
+    await started;
+    const retire = action === 'cancel' ? manager.cancelAuthentication(row.id) : action === 'disable' ? manager.setEnabled(row.id, false) : action === 'uninstall' ? manager.uninstall(row.id) : action === 'update' ? manager.update(row.id) : action === 'endpoint' ? manager.configure(row.id, { source: { kind: 'remote', url: 'https://oauth.example/other', auth: 'oauth' } }) : manager.close();
+    release(); await retire;
+    await vi.waitFor(() => expect(manager.snapshot().plugins.some(plugin => plugin.status === 'authenticating')).toBe(false));
+    expect([...secrets.values()].some(value => value.includes('late-private-token'))).toBe(false);
+    expect(JSON.stringify(manager.snapshot())).not.toContain('late-private-token');
+    expect(manager.tools()).toEqual([]);
+  });
+  it('retains an installed and enabled server immediately after discovery', async () => {
+    const h = await trackedFixture();
+    expect(alive((await h.pids())[0]!.pid)).toBe(true);
+    expect(h.row.status).toBe('ready');
+  });
+  it('satisfies the pinned Blender scene-probe schema and accepts an object name containing Error', async () => {
+    // Pinned blender-mcp 1.9.1 requires user_prompt. The fixture enforces it instead
+    // of silently accepting the old {} probe that falsely reported a disconnected addon.
+    await fs.writeFile(entry, `const readline=require('node:readline');
+const tools=[{name:'get_scene_info',inputSchema:{type:'object',properties:{user_prompt:{title:'User Prompt',type:'string'}},required:['user_prompt'],title:'get_scene_infoArguments'},outputSchema:{type:'object',properties:{result:{title:'Result',type:'string'}},required:['result'],title:'get_scene_infoOutput'}}];
+readline.createInterface({input:process.stdin}).on('line',line=>{
+  const m=JSON.parse(line);if(m.id===undefined)return;let result;
+  if(m.method==='initialize')result={protocolVersion:'2025-11-25',capabilities:{tools:{}},serverInfo:{name:'Pinned Blender schema fixture',version:'1.9.1'}};
+  else if(m.method==='tools/list')result={tools};
+  else if(m.method==='tools/call'){
+    const args=m.params.arguments||{};
+    if(typeof args.user_prompt!=='string'||!args.user_prompt.startsWith('Read-only connection check:')||args.user_prompt.length>150||Object.keys(args).length!==1)
+      result={isError:true,content:[{type:'text',text:'Error: required bounded diagnostic user_prompt is missing or invalid'}]};
+    else {const text=JSON.stringify({name:'Error Cube'});result={content:[{type:'text',text}],structuredContent:{result:text}};}
+  }else result={};
+  process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');
+});`);
+    const row = (await manager.install({ catalogId: 'blender', source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    expect(row.status, row.error).toBe('ready');
+  });
+  it('redacts text secrets without corrupting image bytes, MIME types or protocol tags', async () => {
+    const data = (await sharp({ create: { width: 1, height: 1, channels: 4, background: '#ffffff' } }).png().toBuffer()).toString('base64');
+    await fs.writeFile(entry, fixture.replace("content:[{type:'text',text:process.env.TEST_SECRET||m.params.arguments.value}]", `content:[{type:'text',text:process.env.TEST_SECRET},{type:'image',mimeType:'image/png',data:'${data}',_meta:{echo:'i'}}]`));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] }, credentials: { TEST_SECRET: 'i' } });
+    const result = await manager.call(manager.tools()[0]!.name, { value: 'safe' });
+    expect(result.content[0]).toEqual({ type: 'text', text: '[redacted]' });
+    expect(result.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png', data });
+    expect(JSON.stringify(result.content[1])).not.toContain('"echo":"i"');
+    expect(manager.redactResult(result).content[1]).toMatchObject({ type: 'image', mimeType: 'image/png', data });
+  });
+  it('rejects plaintext configuration declared sensitive by a replacement bundle', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const bundle = path.join(dir, 'sensitive.mcpb');
+    const manifest = {
+      manifest_version: '0.3', name: 'sensitive-fixture', version: '1.0.0', description: 'Test', author: { name: 'CoS' },
+      user_config: { credential: { type: 'string', title: 'Credential', description: 'Server credential', sensitive: true } },
+      server: { type: 'node', entry_point: 'server.cjs', mcp_config: { command: process.execPath, args: ['server.cjs'] } },
+    };
+    await fs.writeFile(bundle, zipSync({ 'manifest.json': strToU8(JSON.stringify(manifest)), 'server.cjs': strToU8(fixture) }));
+    await expect(manager.configure(row.id, { source: { kind: 'mcpb', path: bundle }, config: { credential: 'must-stay-private' } })).rejects.toThrow('sensitive bundle fields');
+    expect(manager.snapshot().plugins[0]!.source.kind).toBe('command');
+    expect(JSON.stringify(manager.snapshot())).not.toContain('must-stay-private');
+    expect(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8')).not.toContain('must-stay-private');
+    await manager.configure(row.id, { source: { kind: 'mcpb', path: bundle }, credentials: { credential: 'private-value' } });
+    expect(manager.snapshot().plugins[0]!.fields).toEqual([expect.objectContaining({ key: 'credential', secret: true })]);
+    await manager.configure(row.id, { source: { kind: 'command', command: process.execPath, args: [entry] } });
+    expect(manager.snapshot().plugins[0]!.fields).toBeUndefined();
+  });
+  it('bounds endless empty discovery pages and releases lifecycle work', async () => {
+    await fs.writeFile(entry, fixture.replace('result={tools}', 'result={tools:[],nextCursor:String(m.id)}'));
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    expect(row.status).toBe('error');
+    expect(row.error).toContain('page/time limit');
+    await manager.uninstall(row.id);
+    expect(manager.snapshot().plugins).toEqual([]);
+  });
+  it('refuses queued replacement work once shutdown begins', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const update = manager.update(row.id);
+    const rejected = expect(update).rejects.toThrow('shutting down');
+    await manager.close();
+    await rejected;
+  });
+  it('launches an imported MCPB relative Node entry point with stable data cwd', async () => {
+    const bundle = path.join(dir, 'working.mcpb');
+    const manifest = {
+      manifest_version: '0.3',
+      name: 'fixture-bundle',
+      version: '1.0.0',
+      description: 'Test bundle',
+      author: { name: 'CoS' },
+      server: {
+        type: 'node',
+        entry_point: 'server/entry.cjs',
+        mcp_config: { command: process.execPath, args: ['server/entry.cjs'] },
+      },
+    };
+    await fs.writeFile(
+      bundle,
+      zipSync({ 'manifest.json': strToU8(JSON.stringify(manifest)), 'server/entry.cjs': strToU8(fixture) }),
+    );
+    const row = (await manager.install({ source: { kind: 'mcpb', path: bundle } })).plugins[0]!;
+    expect(row.status, row.error).toBe('ready');
+    expect((await manager.call(manager.tools()[0]!.name, { value: 'bundle works' })).structuredContent).toEqual({
+      value: 'bundle works',
+    });
+  });
+  it('routes Streamable HTTP with encrypted bearer configuration and never retries a failed mutation', async () => {
+    let calls = 0,
+      authorization = '';
+    const server = createServer(async (req, res) => {
+      if (req.method !== 'POST') {
+        res.writeHead(405).end();
+        return;
+      }
+      let body = '';
+      for await (const chunk of req) body += chunk;
+      const msg = JSON.parse(body);
+      authorization = req.headers.authorization ?? '';
+      if (msg.id === undefined) {
+        res.writeHead(202).end();
+        return;
+      }
+      let result: unknown;
+      if (msg.method === 'initialize')
+        result = {
+          protocolVersion: '2025-11-25',
+          capabilities: { tools: {} },
+          serverInfo: { name: 'HTTP fixture', version: '1' },
+        };
+      else if (msg.method === 'tools/list') result = { tools: [{ name: 'mutation', inputSchema: { type: 'object' } }] };
+      else {
+        calls++;
+        res.writeHead(500).end('Ambiguous server failure');
+        return;
+      }
+      res
+        .writeHead(200, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ jsonrpc: '2.0', id: msg.id, result }));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const address = server.address() as { port: number };
+      const row = (
+        await manager.install({
+          source: { kind: 'remote', url: `http://127.0.0.1:${address.port}/mcp` },
+          credentials: { token: 'http-test-secret' },
+        })
+      ).plugins[0]!;
+      expect(row.status, row.error).toBe('ready');
+      expect(authorization).toBe('Bearer http-test-secret');
+      expect((await manager.call(manager.tools()[0]!.name, {})).isError).toBe(true);
+      expect(calls).toBe(1);
+      await manager.uninstall(row.id);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+  it.runIf(process.env.COS_PLUGIN_LIVE_TEST === '1')(
+    'live pinned Memory npm server: install, discover, create/read and update without data loss',
+    async () => {
+      const row = (await manager.install({ catalogId: 'memory' })).plugins[0]!;
+      expect(row.status, row.error).toBe('ready');
+      const create = row.tools.find((t) => t.name === 'create_entities')!;
+      const read = row.tools.find((t) => t.name === 'read_graph')!;
+      expect(create).toBeDefined();
+      const written = await manager.call(create.exposedName, {
+        entities: [
+          { name: 'CoS plugin validation fixture', entityType: 'test', observations: ['End-to-end plugin routing'] },
+        ],
+      });
+      expect(written.isError).not.toBe(true);
+      expect(JSON.stringify(await manager.call(read.exposedName, {}))).toContain('CoS plugin validation fixture');
+      await manager.update(row.id);
+      expect(manager.snapshot().plugins[0]!.status).toBe('ready');
+      expect(JSON.stringify(await manager.call(read.exposedName, {}))).toContain('CoS plugin validation fixture');
+      await manager.uninstall(row.id);
+    },
+    180000,
+  );
+  it('discovers a real stdio subprocess, preserves schemas/results, rejects stale disabled calls', async () => {
+    const snapshot = await manager.install({
+      name: 'Fixture',
+      source: { kind: 'command', command: process.execPath, args: [entry] },
+    });
+    const row = snapshot.plugins[0]!;
+    expect(row.status).toBe('ready');
+    expect(row.tools[0]!.published).toBe(true);
+    const tool = manager.tools()[0]!;
+    expect(tool.annotations?.readOnlyHint).toBe(true);
+    expect(tool.inputSchema.required).toEqual(['value']);
+    expect(tool.outputSchema).toBeDefined();
+    expect(tool.name).toBe('Echo.Mixed');
+    expect((await manager.call(tool.name, { value: 'hello' })).structuredContent).toEqual({ value: 'hello' });
+    const upstreamOutcome = vi.fn();
+    expect((await manager.call(tool.name, { value: 'error' }, upstreamOutcome)).isError).toBe(true);
+    expect(upstreamOutcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error');
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    await manager.setToolEnabled(row.id, 'Echo.Mixed', false);
+    expect(manager.tools()).toEqual([]);
+    const toolDisabled = JSON.stringify(await manager.call(tool.name, { value: 'blocked' }));
+    expect(toolDisabled).toContain('PLUGIN_DISABLED');
+    expect(toolDisabled).toContain('This call was not dispatched.');
+    expect(upstream).not.toHaveBeenCalled();
+    await manager.setToolEnabled(row.id, 'Echo.Mixed', true);
+    await manager.setEnabled(row.id, false);
+    expect(manager.tools()).toEqual([]);
+    const blockedOutcome = vi.fn();
+    const pluginDisabled = JSON.stringify(await manager.call(tool.name, {}, blockedOutcome));
+    expect(pluginDisabled).toContain('PLUGIN_DISABLED');
+    expect(pluginDisabled).toContain('This call was not dispatched.');
+    expect(blockedOutcome).toHaveBeenCalledExactlyOnceWith('tool_rejected');
+    expect(upstream).not.toHaveBeenCalled();
+  });
+  it('seals credentials separately and redacts echoed credentials and recordable values', async () => {
+    const result = await manager.install({
+      source: { kind: 'command', command: process.execPath, args: [entry] },
+      credentials: { TEST_SECRET: 'secret-fixture-value' },
+    });
+    const row = result.plugins[0]!;
+    expect(row.credentialKeys).toEqual(['TEST_SECRET']);
+    expect(JSON.stringify(result)).not.toContain('secret-fixture-value');
+    expect(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8')).not.toContain('secret-fixture-value');
+    expect((await manager.call(manager.tools()[0]!.name, { value: 'safe' })).content).toEqual([
+      { type: 'text', text: '[redacted]' },
+    ]);
+    expect(manager.redact({ nested: ['secret-fixture-value'] })).toEqual({ nested: ['[redacted]'] });
+    await manager.uninstall(row.id);
+    expect(secrets.size).toBe(0);
+    expect(manager.tools()).toEqual([]);
+  });
+
+  it('masks pasted API keys in nested arguments and every authored result surface without altering upstream input', async () => {
+    const key = 'sk-or-v1-' + 'a'.repeat(64);
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } });
+    const upstream = vi.spyOn(Client.prototype, 'callTool');
+    const result = await manager.call('Echo.Mixed', { value: key });
+    expect(upstream).toHaveBeenCalledWith(expect.objectContaining({ arguments: { value: key } }), expect.anything());
+    expect(result.content).toEqual([{ type: 'text', text: '[redacted]' }]);
+    expect(result.structuredContent).toEqual({ value: '[redacted]' });
+    expect(manager.redact({ fields: [{ name: 'API key', value: key }], code: `fill('${key}')` })).toEqual({
+      fields: [{ name: 'API key', value: '[redacted]' }], code: "fill('[redacted]')"
+    });
+    const hash = 'a'.repeat(64);
+    const data = Buffer.from(key).toString('base64');
+    const mixed = manager.redactResult({ content: [
+      { type: 'text', text: `hash=${hash}; key=${key}` },
+      { type: 'image', mimeType: 'image/png', data },
+      { type: 'resource', resource: { uri: `https://example.com/${key}`, text: key } }
+    ], structuredContent: { nested: [key, hash] }, _meta: { detail: key } });
+    expect(JSON.stringify(mixed)).not.toContain(key);
+    expect(mixed.content[1]).toMatchObject({ type: 'image', mimeType: 'image/png', data });
+    expect(mixed.structuredContent).toEqual({ nested: ['[redacted]', hash] });
+  });
+
+  it('uses upstream codegen=none for existing official Playwright installs and preserves explicit configuration', async () => {
+    await fs.writeFile(entry, fixture.replace('process.env.TEST_SECRET||m.params.arguments.value',
+      'process.env.PLAYWRIGHT_MCP_CODEGEN||"unset"'));
+    vi.spyOn(pluginInstaller, 'installSource').mockResolvedValue({ command: process.execPath, args: [entry], version: '0.0.80', license: 'Apache-2.0' });
+    const row = (await manager.install({ catalogId: 'playwright' })).plugins[0]!;
+    expect((await manager.call('Echo.Mixed', { value: 'probe' })).content).toEqual([{ type: 'text', text: 'none' }]);
+    await manager.close();
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    await vi.waitFor(() => expect(manager.tools()).toHaveLength(1));
+    expect((await manager.call('Echo.Mixed', { value: 'probe' })).content).toEqual([{ type: 'text', text: 'none' }]);
+    await manager.configure(row.id, { config: { PLAYWRIGHT_MCP_CODEGEN: 'typescript' } });
+    expect((await manager.call('Echo.Mixed', { value: 'probe' })).content).toEqual([{ type: 'text', text: 'typescript' }]);
+  });
+  it('rolls back an invalid replacement and retains the previously working server', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } }))
+      .plugins[0]!;
+    const name = manager.tools()[0]!.name;
+    await expect(
+      manager.configure(row.id, { source: { kind: 'command', command: 'cos-nonexistent-runtime' } }),
+    ).rejects.toThrow('rolled back');
+    expect(manager.snapshot().plugins[0]!.status).toBe('ready');
+    expect(manager.tools()[0]!.name).toBe(name);
+    expect((await manager.call(name, { value: 'still works' })).structuredContent).toEqual({ value: 'still works' });
+    const persisted = JSON.parse(await fs.readFile(path.join(dir, 'state', 'plugins.json'), 'utf8'));
+    expect(persisted[0].source.command).toBe(process.execPath);
+  });
+  it('restores encrypted credentials when replacement fails', async () => {
+    const row = (
+      await manager.install({
+        source: { kind: 'command', command: process.execPath, args: [entry] },
+        credentials: { TEST_SECRET: 'previous-secret' },
+      })
+    ).plugins[0]!;
+    await expect(
+      manager.configure(row.id, {
+        source: { kind: 'command', command: 'cos-nonexistent-runtime' },
+        credentials: { TEST_SECRET: 'replacement-secret', ADDED_SECRET: 'new-secret' },
+      }),
+    ).rejects.toThrow('rolled back');
+    expect(secrets.get(`plugin:${row.id}:TEST_SECRET`)).toBe('previous-secret');
+    expect(secrets.get(`plugin:${row.id}:ADDED_SECRET`)).toBe('');
+    expect(manager.snapshot().plugins[0]!.credentialKeys).toEqual(['TEST_SECRET']);
+  });
+  it('revokes queued disable synchronously before another queued operation finishes', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } }))
+      .plugins[0]!;
+    const tool = manager.tools()[0]!.name;
+    const pendingRestart = manager.restart(row.id);
+    const disable = manager.setEnabled(row.id, false);
+    expect((await manager.call(tool, { value: 'must not reach server' })).isError).toBe(true);
+    await pendingRestart;
+    await disable;
+    expect(manager.tools()).toEqual([]);
+  });
+  it('ignores malformed persistent records without crashing startup', async () => {
+    await manager.close();
+    await fs.mkdir(path.join(dir, 'state'), { recursive: true });
+    await fs.writeFile(
+      path.join(dir, 'state', 'plugins.json'),
+      JSON.stringify([
+        { id: 'bad', directory: null },
+        null,
+        {
+          id: '11111111-1111-1111-1111-111111111111',
+          source: { kind: 'command' },
+          launch: { command: 'node', args: [] },
+          directory: 42,
+        },
+      ]),
+    );
+    manager = new PluginManager();
+    await expect(manager.initialize(dir)).resolves.toBeUndefined();
+    expect(manager.snapshot().plugins).toEqual([]);
+  });
+  it('keeps the latest Off authoritative through queued Off-On-Off changes', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const first = manager.setEnabled(row.id, false);
+    const middle = manager.setEnabled(row.id, true);
+    const last = manager.setEnabled(row.id, false);
+    let republished = false;
+    const unsubscribe = manager.onChanged(() => { if (manager.tools().length) republished = true; });
+    await Promise.all([first, middle, last]);
+    unsubscribe();
+    expect(republished).toBe(false);
+    expect(manager.snapshot().plugins[0]!.enabled).toBe(false);
+  });
+  it('keeps tool Off authoritative through queued changes and persists that final policy', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const first = manager.setToolEnabled(row.id, 'Echo.Mixed', false);
+    const middle = manager.setToolEnabled(row.id, 'Echo.Mixed', true);
+    const last = manager.setToolEnabled(row.id, 'Echo.Mixed', false);
+    let republished = false;
+    const unsubscribe = manager.onChanged(() => { if (manager.tools().length) republished = true; });
+    await Promise.all([first, middle, last]);
+    unsubscribe();
+    expect(republished).toBe(false);
+    await manager.restart(row.id);
+    expect(manager.tools()).toEqual([]);
+    expect(manager.snapshot().plugins[0]!.tools[0]!.enabled).toBe(false);
+  });
+  it('rejects credential-bearing URLs before persistence and secrets in plain configuration', async () => {
+    await expect(
+      manager.install({ source: { kind: 'remote', url: 'https://example.com/mcp?token=hidden' } }),
+    ).rejects.toThrow('without URL credentials');
+    await expect(
+      manager.install({ source: { kind: 'command', command: process.execPath }, config: { API_KEY: 'hidden' } }),
+    ).rejects.toThrow('secure credential fields');
+    expect(manager.snapshot().plugins).toEqual([]);
+  });
+  it('keeps IDs stable across restart and disabled state durable', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } }))
+      .plugins[0]!;
+    await manager.setEnabled(row.id, false);
+    await manager.close();
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    expect(manager.snapshot().plugins[0]!.id).toBe(row.id);
+    expect(manager.snapshot().plugins[0]!.status).toBe('disabled');
+    expect(manager.tools()).toEqual([]);
+  });
+  it('retains exact upstream names while restoring enabled servers in the background', async () => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    await manager.close();
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'), { timeout: 10_000 });
+    expect(manager.snapshot().plugins[0]!.tools[0]!.exposedName).toBe('Echo.Mixed');
+    expect(manager.tools()[0]!.name).toBe('Echo.Mixed');
+    expect(manager.snapshot().plugins[0]!.id).toBe(row.id);
+  });
+});
+
+
+const alive = (pid: number): boolean => { try { process.kill(pid, 0); return true; } catch { return false; } };
+async function trackedFixture(withChild = false) {
+  const pidLog = path.join(dir, 'owned-pids.jsonl');
+  const releaseFile = path.join(dir, 'release-call');
+  const prefix = `const fs=require('node:fs');
+const child=${withChild ? `require('node:child_process').spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'ignore',windowsHide:true})` : 'null'};
+fs.appendFileSync(process.env.PID_LOG,JSON.stringify({pid:process.pid,child:child?.pid})+'\\n');
+`;
+  const delayed = fixture.replace("process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');", `
+const send=()=>process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:m.id,result})+'\\n');
+if(m.method==='tools/call'&&m.params.arguments.value==='hold'){
+  const timer=setInterval(()=>{if(fs.existsSync(process.env.RELEASE_FILE)){clearInterval(timer);send();}},10);
+}else send();`);
+  await fs.writeFile(entry, prefix + delayed);
+  const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] }, config: { PID_LOG: pidLog, RELEASE_FILE: releaseFile } })).plugins[0]!;
+  const pids = async () => (await fs.readFile(pidLog, 'utf8')).trim().split('\n').map(line => JSON.parse(line) as { pid: number; child?: number });
+  return { row, pids, releaseFile };
+}
+
+describe('enabled plugin process ownership', () => {
+  it.each(['disable', 'uninstall'] as const)('%s retires its live process while a replacement download is pending', async action => {
+    const h = await trackedFixture();
+    const active = (await h.pids())[0]!;
+    const original = pluginInstaller.installSource;
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const installing = vi.spyOn(pluginInstaller, 'installSource').mockImplementationOnce(async (...args) => {
+      await gate; return original(...args);
+    });
+    const replacing = manager.update(h.row.id);
+    await vi.waitFor(() => expect(installing).toHaveBeenCalledTimes(1));
+    const revoke = action === 'disable' ? manager.setEnabled(h.row.id, false) : manager.uninstall(h.row.id);
+    try { await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: 1000 }); }
+    finally { release(); await replacing; await revoke; }
+    expect(await h.pids()).toHaveLength(1);
+    expect(manager.tools()).toEqual([]);
+  });
+  it.each(['disable', 'uninstall'] as const)('%s cancels its own pending restart before credentials resolve', async action => {
+    const h = await trackedFixture();
+    await manager.configure(h.row.id, { credentials: { TEST_SECRET: 'slow' } });
+    let release!: (value: string) => void;
+    vi.mocked(getSecret).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    const restarting = manager.restart(h.row.id);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const before = await h.pids();
+    try {
+      const revoke = action === 'disable' ? manager.setEnabled(h.row.id, false) : manager.uninstall(h.row.id);
+      // Credentials stay gated until finally. Completion therefore proves that
+      // revocation does not await them; disk cleanup need not fit a 500 ms race.
+      await revoke;
+      await restarting;
+      expect(manager.tools()).toEqual([]);
+    } finally { release('slow'); }
+    await new Promise(resolve => setImmediate(resolve));
+    expect(await h.pids()).toEqual(before);
+  });
+  it('does not let a slow startup block a ready peer call or shutdown its process', async () => {
+    const h = await trackedFixture();
+    const slowEntry = path.join(dir, 'slow-server.cjs');
+    await fs.writeFile(slowEntry, fixture.replaceAll('Echo.Mixed', 'Slow.Echo'));
+    await manager.install({ source: { kind: 'command', command: process.execPath, args: [slowEntry] }, credentials: { TEST_SECRET: 'slow' } });
+    await manager.close();
+    let release!: (value: string) => void;
+    vi.mocked(getSecret).mockImplementationOnce(() => new Promise(resolve => { release = resolve; }));
+    manager = new PluginManager(); await manager.initialize(dir);
+    try {
+      await vi.waitFor(() => expect(manager.snapshot().plugins.find(row => row.id === h.row.id)!.status).toBe('ready'));
+      const result = await Promise.race([manager.call('Echo.Mixed', { value: 'ready peer' }), new Promise(resolve => setTimeout(() => resolve('blocked'), 200))]);
+      expect(result).not.toBe('blocked');
+      const active = (await h.pids()).at(-1)!;
+      const closing = manager.close();
+      await vi.waitFor(() => expect(alive(active.pid)).toBe(false), { timeout: 1000 });
+      await closing;
+    } finally { release?.('slow'); }
+  });
+  it('starts with zero installations and does not wait for enabled-server credential discovery on reopen', async () => {
+    expect(manager.snapshot().plugins).toEqual([]);
+    expect(manager.tools()).toEqual([]);
+    const h = await trackedFixture();
+    await manager.configure(h.row.id, { credentials: { TEST_SECRET: 'fixture-value' } });
+    await manager.close();
+    let releaseSecret!: (value: string) => void;
+    vi.mocked(getSecret).mockImplementationOnce(() => new Promise(resolve => { releaseSecret = resolve; }));
+    manager = new PluginManager();
+    await manager.initialize(dir);
+    expect(manager.snapshot().plugins[0]!.status).toBe('connecting');
+    expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
+    await vi.waitFor(() => expect(releaseSecret).toBeTypeOf('function'));
+    releaseSecret('fixture-value');
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'));
+    await manager.setEnabled(h.row.id, false);
+    const before = await h.pids();
+    await manager.close(); manager = new PluginManager(); await manager.initialize(dir);
+    expect(manager.snapshot().plugins[0]!.status).toBe('disabled');
+    expect(manager.tools()).toEqual([]);
+    expect(await h.pids()).toEqual(before);
+  });
+  it('restores installed enabled servers and preserves a process across long gaps between calls', async () => {
+    const h = await trackedFixture();
+    expect(alive((await h.pids())[0]!.pid)).toBe(true);
+    await manager.close(); manager = new PluginManager(); await manager.initialize(dir);
+    expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
+    // Restoring a real Node child on a loaded Windows runner is not a one-second contract.
+    // Await the same ready postcondition before fake time tests process retention.
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'), { timeout: 10_000 });
+    const active = (await h.pids())[1]!;
+    vi.useFakeTimers();
+    expect((await manager.call('Echo.Mixed', { value: 'first' })).isError).not.toBe(true);
+    await vi.advanceTimersByTimeAsync(600_000);
+    manager.tools(); manager.snapshot();
+    expect(alive(active.pid)).toBe(true);
+    expect((await manager.call('Echo.Mixed', { value: 'stateful next step' })).isError).not.toBe(true);
+    expect(await h.pids()).toHaveLength(2);
+  });
+
+  it('keeps the same runtime across concurrent calls and after they settle', async () => {
+    const h = await trackedFixture();
+    const active = (await h.pids())[0]!;
+    const held = manager.call('Echo.Mixed', { value: 'hold' });
+    expect((await manager.call('Echo.Mixed', { value: 'concurrent' })).isError).not.toBe(true);
+    await fs.writeFile(h.releaseFile, 'finish');
+    expect((await held).isError).not.toBe(true);
+    vi.useFakeTimers();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(alive(active.pid)).toBe(true);
+    expect(await h.pids()).toHaveLength(1);
+  });
+
+  it.each(['disable', 'uninstall', 'close'] as const)('%s ends the owned process and refuses later calls', async action => {
+    const h = await trackedFixture(process.platform === 'win32');
+    await manager.call('Echo.Mixed', { value: 'first' });
+    const active = (await h.pids())[0]!;
+    expect(alive(active.pid)).toBe(true);
+    if (action === 'disable') await manager.setEnabled(h.row.id, false);
+    else if (action === 'uninstall') await manager.uninstall(h.row.id);
+    else await manager.close();
+    await vi.waitFor(() => expect(alive(active.pid)).toBe(false));
+    if (active.child) await vi.waitFor(() => expect(alive(active.child!)).toBe(false));
+    expect((await manager.call('Echo.Mixed', { value: 'must not restart' })).isError).toBe(true);
+    expect(await h.pids()).toHaveLength(1);
+  });
+
+  it('stops a failed call runtime and never retries the ambiguous operation', async () => {
+    const h = await trackedFixture();
+    await fs.appendFile(entry, "\nprocess.on('uncaughtException',()=>process.exit(2));\n");
+    // The response violates its declared output schema after startup/discovery succeeded.
+    const contents = await fs.readFile(entry, 'utf8');
+    await fs.writeFile(entry, contents.replace('structuredContent:{value:m.params.arguments.value}', 'structuredContent:{value:42}'));
+    await manager.restart(h.row.id);
+    expect((await manager.call('Echo.Mixed', { value: 'one attempt' })).isError).toBe(true);
+    const active = (await h.pids())[1]!;
+    await vi.waitFor(() => expect(alive(active.pid)).toBe(false));
+    expect(await h.pids()).toHaveLength(2);
+    expect(manager.snapshot().plugins[0]!.status).toBe('error');
+  });
+
+  it('shutdown during credential lookup cannot start a late unowned server', async () => {
+    const h = await trackedFixture();
+    await manager.configure(h.row.id, { credentials: { TEST_SECRET: 'fixture-value' } });
+    const before = await h.pids();
+    let releaseSecret!: (value: string) => void;
+    let requested = false;
+    vi.mocked(getSecret).mockImplementationOnce(() => {
+      requested = true;
+      return new Promise(resolve => { releaseSecret = resolve; });
+    });
+    const call = manager.restart(h.row.id);
+    await vi.waitFor(() => expect(requested).toBe(true));
+    const closing = manager.close();
+    releaseSecret('fixture-value');
+    await call;
+    await closing;
+    expect(await h.pids()).toEqual(before);
+  });
+
+  it('an old pending call cannot mark a successfully restarted installation as failed', async () => {
+    const h = await trackedFixture();
+    await manager.call('Echo.Mixed', { value: 'start runtime' });
+    let rejectCall!: (reason: Error) => void;
+    const request = vi.spyOn(Client.prototype, 'callTool').mockImplementationOnce(() =>
+      new Promise((_resolve, reject) => { rejectCall = reject; }));
+    const old = manager.call('Echo.Mixed', { value: 'delayed old transport result' });
+    await vi.waitFor(() => expect(request).toHaveBeenCalledTimes(1));
+    await manager.restart(h.row.id);
+    expect(manager.snapshot().plugins[0]!.status).toBe('ready');
+    rejectCall(new Error('old connection failed after replacement'));
+    expect((await old).isError).toBe(true);
+    expect(manager.snapshot().plugins[0]!.status).toBe('ready');
+    expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
+  });
+
+  it('rediscovers legacy or invalid cached schemas from the enabled installation in the background', async () => {
+    const h = await trackedFixture();
+    await manager.close();
+    const file = path.join(dir, 'state', 'plugins.json');
+    const stored = JSON.parse(await fs.readFile(file, 'utf8'));
+    stored[0].catalog = [{ name: 'unvalidated' }];
+    stored[0].tools = [{ name: 'Echo.Mixed', exposedName: 'old_hashed_name', enabled: true }];
+    await fs.writeFile(file, JSON.stringify(stored));
+    manager = new PluginManager(); await manager.initialize(dir);
+    expect(manager.tools()).toEqual([]);
+    await vi.waitFor(() => expect(manager.snapshot().plugins[0]!.status).toBe('ready'));
+    expect(manager.tools().map(tool => tool.name)).toEqual(['Echo.Mixed']);
+    expect(await h.pids()).toHaveLength(2);
+    expect(alive((await h.pids())[1]!.pid)).toBe(true);
+  });
+});

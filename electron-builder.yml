@@ -1,0 +1,221 @@
+appId: com.webgptagent.app
+productName: Web GPT Agent
+copyright: MIT licensed
+
+directories:
+  output: release
+  buildResources: build
+
+# Only built output + runtime dependencies ship. Native prebuilds are narrowed again in each
+# platform section so a package never carries another OS/CPU's executable payload.
+files:
+  - out/**
+  - package.json
+  - '!node_modules/@img/sharp-*/**/*'
+  - '!node_modules/@img/sharp-libvips-*/**/*'
+  - '!node_modules/@trycua/cua-driver-*/**/*'
+  # Cua ships its own compatible Node runtime in the target-specific package.
+  # @ubjs/node's optional generic N-API prebuilds are not imported by that path.
+  - '!node_modules/@ubjs/node-*/**/*'
+  # PDF.js is bundled into the renderer (including its worker). Its optional @napi-rs/canvas
+  # dependency is a Node-only fallback and is neither imported nor needed by the Electron UI.
+  - '!node_modules/pdfjs-dist/**/*'
+  - '!node_modules/@napi-rs/canvas/**/*'
+  - '!node_modules/@napi-rs/canvas-*/**/*'
+  # node-pty prefers build/Release over prebuilds. npm may leave a host-native build there,
+  # which would silently override the target prebuild in a cross-arch package.
+  - '!node_modules/node-pty/build/**/*'
+  - '!node_modules/node-pty/third_party/**/*'
+  - '!node_modules/node-pty/prebuilds/**/*'
+  - '!node_modules/tree-sitter/prebuilds/**/*'
+  - '!node_modules/tree-sitter-bash/prebuilds/**/*'
+
+# Common real-filesystem resources. Platform-specific tunnel/rg/native notices are appended
+# below because their filenames and executable formats differ by OS.
+extraResources:
+  - from: LICENSE
+    to: LICENSE
+  - from: THIRD-PARTY-NOTICES.txt
+    to: THIRD-PARTY-NOTICES.txt
+  # The `wgpt` wrapper. It resolves the CLI bundle inside app.asar, so it has to sit
+  # beside the app's resources rather than inside the asar it reads from.
+  - from: bin/wgpt
+    to: bin/wgpt
+  - from: bin/wgpt.mjs
+    to: bin/wgpt.mjs
+  - from: bin/wgpt.cmd
+    to: bin/wgpt.cmd
+  - from: node_modules/electron/dist/LICENSE
+    to: LICENSE.electron.txt
+  - from: node_modules/electron/dist/LICENSES.chromium.html
+    to: LICENSES.chromium.html
+  - from: extension
+    to: extension
+    filter:
+      - '**/*'
+      - '!**/*.map'
+
+npmRebuild: false
+
+# macOS only; a no-op on every other platform. See the hook and the mac.identity note below.
+afterPack: scripts/afterpack-macos-adhoc-seal.mjs
+
+asarUnpack:
+  # The standalone daemon runs on plain Node, which cannot read inside app.asar at all. Unpacking
+  # `out/daemon` puts it at `app.asar.unpacked/out/daemon/index.js`, one level under the
+  # `app.asar.unpacked/node_modules` the entries below produce — so its externalized native
+  # packages resolve by the ordinary node_modules walk, with no extra copy step.
+  #
+  # The pure-JavaScript dependencies are *inlined* into the daemon bundle (`externalizeDeps: false`
+  # in electron.vite.daemon.config.ts), so only these native packages and their own JavaScript
+  # dependency closure have to be real files: `sharp` needs detect-libc/semver/@img, and both
+  # tree-sitter packages need node-gyp-build to find their prebuilds. Leaving any of them inside
+  # the asar would make the daemon fail on exactly the machine it exists for.
+  - '**/out/daemon/**'
+  - '**/node_modules/node-pty/**'
+  - '**/node_modules/sharp/**'
+  - '**/node_modules/@img/**'
+  - '**/node_modules/tree-sitter/**'
+  - '**/node_modules/tree-sitter-bash/**'
+  - '**/node_modules/detect-libc/**'
+  - '**/node_modules/semver/**'
+  - '**/node_modules/node-addon-api/**'
+  - '**/node_modules/node-gyp-build/**'
+  # The code-mode sandbox resolves these two by name at run time (`createRequire(...).resolve` in
+  # code-mode-runtime.ts) rather than by a static `require`, so no bundler can inline them and the
+  # walk has to find them as real files: the `.wasm` payload they carry is the sandbox itself.
+  # Proven necessary — a packaged-layout daemon with these still inside the asar answers every
+  # `exec` with CODE_MODE_RUNTIME_ERROR while `read`/`exec_command` work.
+  - '**/node_modules/quickjs-emscripten-core/**'
+  - '**/node_modules/@jitl/**'
+  # Cua's FFI resolves its dylib from the SDK module's physical URL. Loading JavaScript from
+  # app.asar would resolve the native library inside that virtual archive, which dlopen rejects.
+  - '**/node_modules/@trycua/cua-driver/**'
+  - '**/node_modules/@ubjs/core/**'
+  - '**/node_modules/@ubjs/node/**'
+  - '**/node_modules/@trycua/cua-driver-*/**'
+compression: maximum
+
+# electron-builder 26 defaults to the legacy FUSE2 AppImage runtime. Ubuntu 24.04 renamed
+# libfuse2 to libfuse2t64 and does not install it by default, so use builder's static runtime
+# toolset instead. This keeps the standalone AppImage actually portable on the release target.
+toolsets:
+  appimage: "1.0.3"
+
+win:
+  target: nsis
+  icon: build/icon.ico
+  requestedExecutionLevel: asInvoker
+  files:
+    - from: resources/packaging/native/win32/${arch}/node_modules
+      to: node_modules
+      filter: ['**/*']
+  extraResources:
+    - from: resources/packaging/desktop/win32/${arch}
+      to: desktop
+      filter: ['cua-driver.exe', 'LICENSE.cua-driver.txt', 'SOURCE.cua-driver.json']
+    - from: resources/packaging/native/win32/${arch}/node_modules/@img/sharp-win32-${arch}/README.md
+      to: THIRD-PARTY-NOTICES-sharp-win32-${arch}.md
+    - from: resources/packaging/tunnel/win32/${arch}
+      to: tunnel
+      filter: ['**/*']
+    - from: resources/packaging/rg/win32/${arch}
+      to: rg
+      filter: ['**/*']
+
+nsis:
+  include: scripts/windows-installer-acl.nsh
+  oneClick: false
+  perMachine: false
+  buildUniversalInstaller: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: true
+  createStartMenuShortcut: true
+  shortcutName: Web GPT Agent
+  artifactName: Web-GPT-Agent-Setup-${arch}.${ext}
+  uninstallDisplayName: Web GPT Agent
+  deleteAppDataOnUninstall: false
+
+mac:
+  target:
+    - dmg
+    - zip
+  icon: build/icon.png
+  category: public.app-category.developer-tools
+  minimumSystemVersion: "13.0"
+  extendInfo:
+    NSUserNotificationAlertStyle: alert
+    NSScreenCaptureUsageDescription: Web GPT Agent captures a display or window only when the enabled Desktop connector asks to observe it.
+  # v2.0.2 intentionally ships unsigned/unnotarized macOS artifacts. Make that policy
+  # deterministic instead of depending on whatever identities or Apple env vars happen to be
+  # present on a hosted runner. Remove these two lines when real signing credentials are wired.
+  #
+  # Unsigned still has to mean *coherent*. Every arm64 Mach-O is ad-hoc signed by the linker
+  # whether anyone asks or not, so skipping bundle signing shipped an app whose executables
+  # claimed a resource seal the bundle did not have; macOS calls that damaged and refuses to
+  # launch it (issue #66). afterPack re-seals ad-hoc — no Authority, no TeamIdentifier, still
+  # nothing Gatekeeper will vouch for — and verifies the result. Where the machine-local signing
+  # keychain exists, it seals with that self-signed identity instead, so local rebuilds keep one
+  # stable designated requirement (and their macOS privacy grants). It is still not a publisher
+  # signature.
+  identity: null
+  notarize: false
+  artifactName: Web-GPT-Agent-macOS-${arch}.${ext}
+  files:
+    - from: resources/packaging/native/darwin/${arch}/node_modules
+      to: node_modules
+      filter: ['**/*']
+  extraResources:
+    - from: resources/packaging/desktop/darwin/${arch}
+      to: desktop
+      filter: ['cua-driver', 'LICENSE.cua-driver.txt', 'SOURCE.cua-driver.json']
+    - from: resources/packaging/native/darwin/${arch}/node_modules/@img/sharp-libvips-darwin-${arch}/README.md
+      to: THIRD-PARTY-NOTICES-sharp-libvips-darwin-${arch}.md
+    - from: resources/packaging/tunnel/darwin/${arch}
+      to: tunnel
+      filter: ['**/*']
+    - from: resources/packaging/rg/darwin/${arch}
+      to: rg
+      filter: ['**/*']
+
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: build/icon.png
+  category: Development
+  executableName: web-gpt-agent
+  maintainer: Web GPT Agent <227782719+totec448-spec@users.noreply.github.com>
+  syncDesktopName: true
+  # electron-builder rewrites x64 to x86_64 for AppImage and amd64 for DEB when ${arch}
+  # is used. Keep one stable public architecture label across formats/releases instead.
+  artifactName: Web-GPT-Agent-Linux-${env.COS_PACKAGE_ARCH}.${ext}
+  files:
+    - from: resources/packaging/native/linux/${arch}/node_modules
+      to: node_modules
+      filter: ['**/*']
+  extraResources:
+    - from: build/runtime-icon.png
+      to: runtime-icon.png
+    - from: resources/packaging/native/linux/${arch}/node_modules/@img/sharp-libvips-linux-${arch}/README.md
+      to: THIRD-PARTY-NOTICES-sharp-libvips-linux-${arch}.md
+    - from: resources/packaging/tunnel/linux/${arch}
+      to: tunnel
+      filter: ['**/*']
+    - from: resources/packaging/rg/linux/${arch}
+      to: rg
+      filter: ['**/*']
+
+deb:
+  depends:
+    # Ubuntu 24.04 renamed GTK 3's runtime package for the time64 transition. Keep the old
+    # package as an alternative so the same .deb remains installable on Ubuntu 22.04/Debian.
+    - libgtk-3-0 | libgtk-3-0t64
+    - libnotify4
+    - libnss3
+    - libxss1
+    - libxtst6
+    - xdg-utils
+    - libatspi2.0-0 | libatspi2.0-0t64
+    - libuuid1
+    - libsecret-1-0

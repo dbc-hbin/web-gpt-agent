@@ -1,0 +1,3583 @@
+/**
+ * Durable session history.
+ *
+ * Deliberately separate from the in-memory diagnostics log in logger.ts. That log
+ * stays small, redacted and RAM-only; this one is an explicit opt-in feature that
+ * writes what actually happened to disk so a five-hour session can be recovered.
+ *
+ * Structured activity is append-only JSONL. ChatGPT messages are different: streaming
+ * changes the content of one logical message, so storing each snapshot as another event
+ * creates duplicate transcript rows by construction. New writes live as one atomically
+ * replaceable shard per stable logical website identity. A legacy messages.json map is read
+ * as an overlay until each record is naturally rewritten, avoiding a startup-wide migration.
+ * Identity is decided by the page/Fiber producer before it gets here; this store never guesses
+ * that two different website ids are one message from their text, turn or timing.
+ *
+ *   sessions/<id>/events.jsonl    tool/turn/error/activity events, append-only
+ *   sessions/<id>/messages/*.json canonical user/assistant messages, one logical id per shard
+ *   sessions/<id>/messages.json   legacy canonical map, read during lazy migration
+ *   sessions/<id>/meta.json       the summary, rewritten atomically
+ *   sessions/<id>/assets/<id>     screenshots and other binaries
+ *   sessions/<id>/handoffs/<id>.json
+ */
+
+import { createHash, randomUUID } from 'node:crypto';
+import { isProModel } from '../../shared/chat-models.js';
+import { constants as fsConstants, promises as fs } from 'node:fs';
+import path from 'node:path';
+import type {
+  AssetRef,
+  Handoff,
+  ImageStorageClearMode,
+  ImageStorageClearResult,
+  ImageStorageInfo,
+  NewSessionEvent,
+  ReasoningEffort,
+  SessionEvent,
+  SessionOrigin,
+  SessionSummary,
+  StoredText
+} from '../../shared/session.js';
+import { continuationMarkerOf, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, storedTextTokens, workSequence } from '../../shared/session.js';
+import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline,
+  recordedRequestTurn, responseTurnId, type Chronological, type TimelineTurns } from '../../shared/chronology.js';
+import { automaticTitle, firstTitleMessage, legacyContextTitle, refreshUserTitle } from './title.js';
+import { agentPlanSchema, agentPlanUpdateSchema, MAX_AGENT_PLAN_BYTES, type AgentPlan, type AgentPlanUpdate } from '../../shared/agent-plan.js';
+import { getConfig } from '../config.js';
+import { logError, logInfo, logWarn } from '../logger.js';
+import { interruptCodeModeConversation } from '../mcp/code-mode-runtime.js';
+
+/**
+ * Caps on how much of a value is written *inline*, into the JSONL line itself.
+ *
+ * These are not caps on what is kept. Anything longer is written whole, redacted, as a
+ * `.txt` asset beside the log and referenced by `StoredText.assetId`, so the exact
+ * arguments of an edit and the exact output of a command stay recoverable however
+ * large they were — which is the entire premise of calling this history the source of
+ * truth. What the caps buy is a log whose lines a reader can still parse and a summary
+ * pass can still skim.
+ */
+// A Compact & Resume handoff becomes the next chat's opening user message. This is a wire /
+// storage safety bound, not a token budget; keep it comfortably above the model's 30k-token
+// handoff ceiling so the recorder does not immediately turn the carried brief into an inline
+// stub plus asset reference. Truly runaway messages still spill to assets through storeText().
+export const MAX_USER_MESSAGE_CHARS = 256_000;
+export const MAX_MESSAGE_CHARS = 12_000;
+export const MAX_TOOL_ARGS_CHARS = 8_000;
+export const MAX_TOOL_RESULT_CHARS = 8_000;
+/** Nothing is spilled to an overflow asset past this; a note records the shortfall. */
+export const MAX_OVERFLOW_ASSET_CHARS = 8 * 1024 * 1024;
+/** A single line that cannot be parsed back is dropped; this bounds the damage. */
+const MAX_LINE_BYTES = 512 * 1024;
+/** How many sessions the UI shows. Lookups and pruning still see every session. */
+const MAX_LISTED_SESSIONS = 200;
+/** Bound for legacy/model-facing full-list scans. Identity and retention use the uncapped cached catalog. */
+const MAX_SCANNED_SESSIONS = 5_000;
+/** Keep the uncapped authoritative scan fast without opening thousands of files at once. */
+const ATTACHMENT_CATALOG_READ_CONCURRENCY = 64;
+
+let root = '';
+/**
+ * Current-conversation misses already proven against this process's durable catalog.
+ *
+ * Browser activity polls repeatedly ask about chats this app has never recorded. Re-scanning
+ * every session folder for the same negative answer is pure work. Positive ownership remains
+ * sourced from metadata; this cache only remembers a miss, and every operation that can create
+ * that exact current attachment invalidates its key before a later lookup may trust it.
+ */
+const missingCurrentConversations = new Set<string>();
+
+interface AttachmentCatalog {
+  /** Durable summary projection used for attachment identity and the renderer summary index. */
+  summaries: Map<string, SessionSummary>;
+  /** Durable closed-session order. Open sessions are overlaid live and excluded while paging. */
+  orderedIds: string[];
+  current: Map<string, Set<string>>;
+  historical: Map<string, Set<string>>;
+}
+
+/**
+ * Derived, rebuildable attachment index. Durable `meta.json` remains the authority.
+ *
+ * Some model-facing compatibility reads intentionally cap directory scans at 5,000. Conversation
+ * identity and retention cannot use that cap: an arbitrary readdir prefix is not proof that an
+ * older chat has no owner or is exempt from expiry. The catalog performs one uncapped,
+ * crash-reconciling pass on first authoritative lookup, then normal `/activity`, renderer and
+ * retention reads reuse it. Attachment mutations update it only after their durable write lands.
+ */
+let attachmentCatalog: AttachmentCatalog | null = null;
+let attachmentCatalogLoading: Promise<AttachmentCatalog> | null = null;
+/**
+ * Invalidates an in-flight catalog build on ownership changes or when a live overlay retires.
+ * Ordinary event/meta ticks do not touch it.
+ */
+let attachmentEpoch = 0;
+const MAX_MISSING_CONVERSATION_CACHE = 1024;
+
+function rememberMissingCurrentConversation(conversationId: string): void {
+  missingCurrentConversations.add(conversationId);
+  if (missingCurrentConversations.size <= MAX_MISSING_CONVERSATION_CACHE) return;
+  const oldest = missingCurrentConversations.values().next().value as string | undefined;
+  if (oldest) missingCurrentConversations.delete(oldest);
+}
+
+export function initSessionStore(userDataDir: string): void {
+  root = path.join(userDataDir, 'sessions');
+  sessionAssetUsage.clear();
+  globalAssetUsage = null;
+  assetMutationEpoch = 0;
+  assetWrittenEpoch.clear();
+  removedAssetEpoch.clear();
+  missingCurrentConversations.clear();
+  attachmentCatalog = null;
+  attachmentCatalogLoading = null;
+  attachmentEpoch = 0;
+}
+
+export function sessionsRoot(): string {
+  return root;
+}
+
+/**
+ * Refuses to touch the disk before somebody has said where.
+ *
+ * `root` starts empty, and `path.join('', id)` is a *relative* path — so an uninitialised
+ * store does not fail, it writes real session folders into whatever the process's working
+ * directory happens to be. That stayed invisible for as long as recording was off by
+ * default; the moment it was switched on, a test run began scattering recordings through
+ * the repository. In the app proper this cannot happen — `initSessionStore` is called
+ * during start-up — which is exactly why it needs to be loud rather than left to chance.
+ */
+function assertReady(): void {
+  if (root === '') {
+    throw new Error('The session store was used before initSessionStore() named a directory');
+  }
+}
+
+function sessionDir(id: string): string {
+  assertReady();
+  return path.join(root, id);
+}
+
+/** Ids are generated here and never taken from a caller, so this is a sanity check. */
+function assertSessionId(id: string): void {
+  if (!/^[0-9a-z-]{8,64}$/i.test(id)) throw new Error('Invalid session id');
+}
+
+// ------------------------------------------------------------------ state
+
+interface OpenSession {
+  summary: SessionSummary;
+  nextSeq: number;
+  /** Highest durable journal/message seq already reflected by `summary`. */
+  historySeq: number;
+  /** Recent durable events, so incremental /activity polls do not reread the whole JSONL. */
+  tail: SessionEvent[];
+  /** Earliest cursor covered by tail; reopening starts with no journal rows cached. */
+  tailFrom: number;
+  activityHydrated: boolean;
+  /** Serialises appends so two events can never interleave inside one line. */
+  queue: Promise<void>;
+  /** Canonical messages and background calls, replaced by stable message/call identity. */
+  messages: Map<string, CanonicalEvent>;
+  metaDirty: boolean;
+  metaTimer: NodeJS.Timeout | null;
+}
+
+const open = new Map<string, OpenSession>();
+/** One disk reconstruction per session; direct concurrent callers must share it. */
+const opening = new Map<string, Promise<OpenSession>>();
+interface DurableSessionSnapshot {
+  summary: SessionSummary;
+  messages: Map<string, CanonicalEvent>;
+  historySeq: number;
+  reconciled: boolean;
+}
+/** Read-only recovery also shares one durable high-water check/rebuild per session. */
+const reconciling = new Map<string, Promise<DurableSessionSnapshot | null>>();
+const MAX_EVENT_TAIL = 4096;
+/** Hard ceiling for a bounded recent-history disk read. */
+const MAX_RECENT_READ_BYTES = 8 * 1024 * 1024;
+const MAX_CANONICAL_MESSAGE_BYTES = 1024 * 1024;
+export const MAX_ASSET_BYTES = 8 * 1024 * 1024;
+export const MAX_SESSION_ASSET_BYTES = 192 * 1024 * 1024;
+export const MAX_GLOBAL_ASSET_BYTES = 2 * 1024 * 1024 * 1024;
+
+const sessionAssetUsage = new Map<string, number>();
+let globalAssetUsage: number | null = null;
+let assetWriteQueue = Promise.resolve();
+let assetMutationEpoch = 0;
+const assetWrittenEpoch = new Map<string, number>();
+const removedAssetEpoch = new Map<string, number>();
+
+function enqueueAssetOperation<T>(operation: () => Promise<T>): Promise<T> {
+  const work = assetWriteQueue.then(operation);
+  assetWriteQueue = work.then(() => undefined, () => undefined);
+  return work;
+}
+
+function localAssetKey(sessionId: string, assetId: string): string {
+  return `${sessionId}\u0000${assetId}`;
+}
+
+function admittedAssets(sessionId: string, assets: readonly AssetRef[] | undefined): AssetRef[] | undefined {
+  if (!assets) return undefined;
+  const kept = assets.filter((asset) => {
+    const key = localAssetKey(sessionId, asset.id);
+    const writtenAt = assetWrittenEpoch.get(key);
+    const removedAt = removedAssetEpoch.get(key);
+    return writtenAt === undefined || removedAt === undefined || writtenAt >= removedAt;
+  });
+  return kept.length ? kept : undefined;
+}
+
+function deniedAssetIds(sessionId: string, assets: readonly AssetRef[] | undefined): string[] {
+  if (!assets) return [];
+  const admitted = new Set(admittedAssets(sessionId, assets)?.map((asset) => asset.id));
+  return assets.filter((asset) => !admitted.has(asset.id)).map((asset) => asset.id);
+}
+
+function mergedRetiredAssetIds(...groups: Array<readonly string[] | undefined>): string[] | undefined {
+  const ids = [...new Set(groups.flatMap((group) => group ?? []))];
+  return ids.length ? ids : undefined;
+}
+
+type MessageEvent = Extract<SessionEvent, { kind: 'user_message' | 'assistant_message' }>;
+type NativeImageEvent = Extract<SessionEvent, { kind: 'native_image' }>;
+type CanonicalEvent = MessageEvent | NativeImageEvent | Extract<SessionEvent, { kind: 'tool_call' }>;
+type NewMessageEvent = MessageEvent extends infer Event
+  ? Event extends MessageEvent
+    ? Omit<Event, 'seq'>
+    : never
+  : never;
+type NewNativeImageEvent = Omit<NativeImageEvent, 'seq' | 'origin'>;
+
+/** Internal checkpoint field persisted beside the public summary projection. */
+const META_HISTORY_SEQ = '__historySeq';
+// Alias shards remain forensic history, so the watermark alone cannot tell whether
+// their duplicate token/event contributions have already been removed from metadata.
+const META_CANONICAL_PROJECTION = '__canonicalProjection';
+const META_TOKEN_ESTIMATE = '__tokenEstimate';
+type PersistedSummary = SessionSummary & { [META_HISTORY_SEQ]?: number; [META_CANONICAL_PROJECTION]?: number; [META_TOKEN_ESTIMATE]?: number };
+interface MetaCheckpoint {
+  summary: SessionSummary;
+  /** Null means metadata written by a version that did not yet persist a history watermark. */
+  historySeq: number | null;
+  canonicalProjectionCurrent: boolean;
+  tokenEstimateCurrent: boolean;
+  /** Derived migration signal; never persisted. */
+  outcomeCountersMissing: boolean;
+  /** Derived final-message activity boundary was added after the original summaries. */
+  activityBoundaryMissing: boolean;
+}
+
+function messageKey(event: SessionEvent | Omit<MessageEvent, 'seq'> | NewNativeImageEvent): string | null {
+  if (event.kind === 'tool_call') return event.call?.callId ? `tool_call\u0000${event.call.callId}` : null;
+  if (event.kind === 'native_image') return event.messageId && event.providerAssetId
+    ? `native_image\u0000${event.messageId}\u0000${event.providerAssetId}` : null;
+  return (event.kind === 'user_message' || event.kind === 'assistant_message') && event.messageId
+    ? `${event.kind}\u0000${event.messageId}` : null;
+}
+
+/** Exact equality for the fixed StoredText wire shape without serialising large prose. */
+function storedTextEqual(left: StoredText | undefined, right: StoredText | undefined): boolean {
+  if (left === right) return true;
+  if (!left || !right) return false;
+  return (
+    left.text === right.text &&
+    left.truncated === right.truncated &&
+    left.chars === right.chars &&
+    left.assetId === right.assetId &&
+    left.digest === right.digest
+  );
+}
+
+function emptySummary(id: string, title: string, conversationId: string | null): SessionSummary {
+  const now = Date.now();
+  return {
+    id,
+    title,
+    conversationId,
+    bindingEpoch: 0,
+    chatIds: conversationId ? [conversationId] : [],
+    startedAt: now,
+    updatedAt: now,
+    endedAt: null,
+    events: 0,
+    timelineTurns: {},
+    nativeQuestion: null,
+    requestTurns: {},
+    userMessages: 0,
+    toolCalls: 0,
+    lastToolCallAt: null,
+    lastAssistantFinalAt: null,
+    lastTurnEndAt: null,
+    lastFinishReportAt: null,
+    processExitNonzero: 0,
+    toolRejected: 0,
+    toolInternalErrors: 0,
+    errors: 0,
+    estimatedTokens: 0,
+    contextTokens: 0,
+    lastHandoffId: null,
+    lastHandoffAt: null,
+    lastCommittedResumeHandoffId: null,
+    lastTurnOutcome: null,
+    activeTurnId: null,
+    finishTurn: null,
+    agents: [],
+    origin: null
+  };
+}
+
+/**
+ * Persists one summary atomically, without any live-entry bookkeeping.
+ *
+ * Split out so a *staged* summary can be written before it is published into memory. That
+ * ordering is what makes the compaction rebind safe to fail: see rebindSession.
+ */
+async function writeSummary(summary: SessionSummary, historySeq: number): Promise<void> {
+  const dir = sessionDir(summary.id);
+  const target = path.join(dir, 'meta.json');
+  const backup = path.join(dir, 'meta.backup.json');
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  const persisted: PersistedSummary = { ...summary, [META_HISTORY_SEQ]: historySeq, [META_CANONICAL_PROJECTION]: 1, [META_TOKEN_ESTIMATE]: 1 };
+  await fs.mkdir(dir, { recursive: true });
+  try {
+    await fs.writeFile(tmp, JSON.stringify(persisted, null, 2), 'utf8');
+    // Preserve the last validated checkpoint. Never copy arbitrary corrupt bytes over the
+    // backup: parse/id validation is what makes this a recovery source rather than a second
+    // name for the same damage.
+    try {
+      const current = JSON.parse(await fs.readFile(target, 'utf8')) as SessionSummary;
+      if (current?.id === summary.id) {
+        const backupTmp = `${backup}.${process.pid}.${randomUUID()}.tmp`;
+        try {
+          await fs.writeFile(backupTmp, JSON.stringify(current, null, 2), 'utf8');
+          await fs.rename(backupTmp, backup);
+        } finally {
+          await fs.rm(backupTmp, { force: true }).catch(() => undefined);
+        }
+      }
+    } catch {
+      // First write, or an already damaged primary. Keep any existing valid backup.
+    }
+    await fs.rename(tmp, target);
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+async function writeMeta(entry: OpenSession): Promise<void> {
+  await writeSummary(entry.summary, entry.historySeq);
+  // The attachment catalog is also the process-lifetime summary index used by the paged UI.
+  // Ordinary event ticks stay in `open` and are overlaid live, but once metadata is actually
+  // written keep the cached durable projection current too. Do not rebuild attachment maps:
+  // rename/end/token changes do not change conversation ownership.
+  publishCachedSummary(entry.summary, false);
+  entry.metaDirty = false;
+}
+
+function enqueueSessionOperation<T>(entry: OpenSession, label: string, operation: () => Promise<T>): Promise<T> {
+  const work = entry.queue.then(operation);
+  entry.queue = work.then(
+    () => undefined,
+    (err: Error) => logError(`session ${label} failed: ${err.message}`)
+  );
+  return work;
+}
+
+/**
+ * The summary is rewritten on a short delay rather than on every event. A long agent
+ * session appends thousands of events; rewriting the summary for each one would turn
+ * an append-only log into a write-amplified one for no benefit.
+ */
+function scheduleMeta(entry: OpenSession): void {
+  entry.metaDirty = true;
+  if (entry.metaTimer) return;
+  entry.metaTimer = setTimeout(() => {
+    entry.metaTimer = null;
+    void enqueueSessionOperation(entry, 'meta write', async () => {
+      if (entry.metaDirty) await writeMeta(entry);
+    });
+  }, 1500);
+  entry.metaTimer.unref?.();
+}
+
+/** Flushes any pending summary write. Called before the app quits and before reads. */
+export async function flushSessions(): Promise<void> {
+  for (const entry of open.values()) {
+    await flushSessionEntry(entry);
+  }
+}
+
+/**
+ * Waits only for mutations that belong to one session, then makes its summary current on disk.
+ *
+ * A read of session A must not become a global write barrier for every other open session.
+ * Besides the avoidable latency, the old `flushSessions()` call meant polling one chat could
+ * force metadata churn for dozens of unrelated generating chats. The per-session queue already
+ * is the serialization boundary, so joining that target queue is both sufficient and stronger:
+ * it also waits for an in-flight reconstruction of this exact session before deciding whether
+ * there is anything live to flush.
+ */
+async function flushSession(sessionId: string): Promise<void> {
+  let entry = open.get(sessionId);
+  if (!entry) {
+    const reconstructing = opening.get(sessionId);
+    if (reconstructing) entry = await reconstructing;
+  }
+  if (entry) await flushSessionEntry(entry);
+}
+
+async function flushSessionEntry(entry: OpenSession): Promise<void> {
+  if (entry.metaTimer) {
+    clearTimeout(entry.metaTimer);
+    entry.metaTimer = null;
+  }
+  await enqueueSessionOperation(entry, 'meta flush', async () => {
+    if (entry.metaDirty) await writeMeta(entry);
+  }).catch(() => undefined);
+}
+
+// ----------------------------------------------------------------- create
+
+export async function createSession(options: {
+  /** Reserved by an accepted opening outbox row; never supplied by model tools. */
+  reservedId?: string;
+  title?: string;
+  titleSource?: SessionSummary['titleSource'];
+  conversationId?: string | null;
+  origin?: SessionOrigin | null;
+}): Promise<SessionSummary> {
+  const id = options.reservedId ?? `${new Date().toISOString().slice(0, 10)}-${randomUUID().slice(0, 8)}`;
+  assertSessionId(id);
+  if (options.reservedId) {
+    const existing = await getSession(id);
+    if (existing) {
+      if (existing.origin?.kind !== 'desktop') throw new Error('Reserved opening session belongs to different work');
+      return existing;
+    }
+  }
+  const summary = emptySummary(id, options.title?.trim() || 'ChatGPT session', options.conversationId ?? null);
+  summary.origin = options.origin ?? null;
+  if (options.titleSource) summary.titleSource = options.titleSource;
+  if (options.origin?.fromSessionId) {
+    const source = await getSession(options.origin.fromSessionId);
+    if (source?.projectId) summary.projectId = source.projectId;
+  }
+  // Invalidate before exposing the in-flight live entry. A cached miss must never hide a
+  // session that this process has started creating, even while its first durable write awaits.
+  if (summary.conversationId) missingCurrentConversations.delete(summary.conversationId);
+  const entry: OpenSession = {
+    summary,
+    nextSeq: 1,
+    historySeq: 0,
+    tail: [],
+    tailFrom: 1,
+    activityHydrated: true,
+    queue: Promise.resolve(),
+    messages: new Map(),
+    metaDirty: false,
+    metaTimer: null
+  };
+  open.set(id, entry);
+  try {
+    await fs.mkdir(sessionDir(id), { recursive: true });
+    await fs.writeFile(path.join(sessionDir(id), 'events.jsonl'), '', { flag: 'a' });
+    // A reserved opening can retry after its shard was created but meta publication failed.
+    // Never append another object or overwrite already-recorded canonical messages.
+    await fs.writeFile(path.join(sessionDir(id), 'messages.json'), '{}', { flag: 'wx' }).catch(error => {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    });
+    await writeMeta(entry);
+    publishAttachmentSummary(entry.summary);
+  } catch (error) {
+    if (open.get(id) === entry) open.delete(id);
+    throw error;
+  }
+  return { ...summary };
+}
+
+// ----------------------------------------------------------------- append
+
+/** Reads the highest seq already on disk, so a restart never reuses a number. */
+async function lastSeqOnDisk(id: string): Promise<number> {
+  try {
+    const file = path.join(sessionDir(id), 'events.jsonl');
+    const stat = await fs.stat(file);
+    // One valid event line may be almost MAX_LINE_BYTES and a crash can leave another
+    // almost-full torn line after it. Read enough for both, otherwise the only parseable
+    // predecessor can sit outside the tail window and restart would reuse sequence 1.
+    const from = Math.max(0, stat.size - (MAX_LINE_BYTES * 2 + 2));
+    const handle = await fs.open(file, 'r');
+    try {
+      const buffer = Buffer.alloc(stat.size - from);
+      await handle.read(buffer, 0, buffer.length, from);
+      const lines = buffer.toString('utf8').split('\n');
+      for (let i = lines.length - 1; i >= 0; i--) {
+        const line = lines[i]?.trim();
+        if (!line) continue;
+        try {
+          const parsed = JSON.parse(line) as SessionEvent;
+          if (typeof parsed.seq === 'number') return parsed.seq;
+        } catch {
+          // A torn final line is expected after a crash; keep looking backwards.
+        }
+      }
+    } finally {
+      await handle.close();
+    }
+  } catch {
+    // No file yet, or unreadable: start from zero and let the append recreate it.
+  }
+  return 0;
+}
+
+/**
+ * Closes off a torn last line before anything is appended after it.
+ *
+ * A crash mid-append leaves a line with no newline. Appending straight onto it would
+ * glue a perfectly good new event onto the wreckage and lose that one too, so the
+ * damage is sealed with a newline first: one event lost, which is the promise.
+ */
+async function sealTornTail(id: string): Promise<void> {
+  const file = path.join(sessionDir(id), 'events.jsonl');
+  try {
+    const stat = await fs.stat(file);
+    if (stat.size === 0) return;
+    const handle = await fs.open(file, 'r');
+    try {
+      const buffer = Buffer.alloc(1);
+      await handle.read(buffer, 0, 1, stat.size - 1);
+      if (buffer[0] === 0x0a) return;
+    } finally {
+      await handle.close();
+    }
+    await fs.appendFile(file, '\n', 'utf8');
+    logWarn(`session ${id}: sealed an unterminated final line before appending`);
+  } catch {
+    // No file yet, or unreadable: the append will recreate it.
+  }
+}
+
+/** Canonical message snapshot file. Unknown/legacy shapes are ignored, never guessed. */
+async function readCanonicalMessages(id: string, aliasesCollapsed?: () => void): Promise<Map<string, CanonicalEvent>> {
+  const out = new Map<string, CanonicalEvent>();
+  try {
+    const raw = await fs.readFile(path.join(sessionDir(id), 'messages.json'), 'utf8');
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return out;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (!value || typeof value !== 'object') continue;
+      const event = value as CanonicalEvent;
+      if ((event.kind !== 'user_message' && event.kind !== 'assistant_message' && event.kind !== 'native_image' && event.kind !== 'tool_call') || typeof event.seq !== 'number') continue;
+      const expected = messageKey(event);
+      if (!expected || expected !== key) continue;
+      out.set(key, event);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+      logWarn(`session ${id}: canonical message file unreadable; legacy event log remains available`);
+    }
+  }
+  // Incremental shards overlay the legacy whole-map snapshot. This makes migration lazy:
+  // the first post-upgrade revision writes only its own logical message, while untouched
+  // history remains readable from messages.json.
+  const shards = path.join(sessionDir(id), 'messages');
+  try {
+    const names = await fs.readdir(shards);
+    for (const name of names) {
+      if (!/^[0-9a-f]{64}\.json$/.test(name)) continue;
+      try {
+        const raw = await fs.readFile(path.join(shards, name), 'utf8');
+        if (Buffer.byteLength(raw, 'utf8') > MAX_CANONICAL_MESSAGE_BYTES) continue;
+        const event = JSON.parse(raw) as CanonicalEvent;
+        const key = messageKey(event);
+        if (!key) continue;
+        const expectedName = `${createHash('sha256').update(key).digest('hex')}.json`;
+        if (expectedName !== name) continue;
+        out.set(key, event);
+      } catch {
+        logWarn(`session ${id}: ignored unreadable canonical message shard ${name}`);
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') logWarn(`session ${id}: canonical message shards unreadable`);
+  }
+  // Older builds persisted reload timestamp aliases as separate shards. Project
+  // those exact provider UUIDs as one message without deleting forensic history.
+  // First observation owns chronology; the latest terminal revision owns content.
+  const providers = new Map<string, Array<[string, Extract<MessageEvent, { kind: 'assistant_message' }>]>>();
+  for (const [key, event] of [...out].sort(([, a], [, b]) => (a.origin ?? a.seq) - (b.origin ?? b.seq))) {
+    if (event.kind !== 'assistant_message' || !event.providerMessageId) continue;
+    const group = providers.get(event.providerMessageId) ?? [];
+    group.push([key, event]);
+    providers.set(event.providerMessageId, group);
+  }
+  for (const group of providers.values()) {
+    if (group.length < 2) continue;
+    aliasesCollapsed?.();
+    const [firstKey, first] = group[0]!;
+    // Keep the winning content's own seq intact until selection finishes: a later
+    // streaming alias advances the read cursor but must not outrank a terminal revision.
+    let latest = first, seq = first.seq;
+    for (const [key, event] of group) {
+      const latestFinal = latest.final === true || latest.state === 'final';
+      const eventFinal = event.final === true || event.state === 'final';
+      if (latestFinal !== eventFinal ? eventFinal : event.seq > latest.seq) latest = event;
+      seq = Math.max(seq, event.seq);
+      out.delete(key);
+    }
+    out.set(firstKey, { ...latest, messageId: first.messageId, origin: first.origin ?? first.seq,
+      time: first.time, seq, turnId: group.find(([, event]) => event.turnId)?.[1].turnId,
+      ...(group.some(([, event]) => event.goalEligible === true) ? { goalEligible: true } : {}) });
+  }
+  return out;
+}
+
+async function writeCanonicalMessage(id: string, key: string, event: CanonicalEvent): Promise<void> {
+  const dir = path.join(sessionDir(id), 'messages');
+  await fs.mkdir(dir, { recursive: true });
+  const name = `${createHash('sha256').update(key).digest('hex')}.json`;
+  const target = path.join(dir, name);
+  const tmp = `${target}.${process.pid}.${randomUUID()}.tmp`;
+  const text = JSON.stringify(event);
+  if (Buffer.byteLength(text, 'utf8') > MAX_CANONICAL_MESSAGE_BYTES) {
+    throw new Error('Canonical message is too large');
+  }
+  try {
+    await fs.writeFile(tmp, text, 'utf8');
+    await fs.rename(tmp, target);
+  } finally {
+    await fs.rm(tmp, { force: true }).catch(() => undefined);
+  }
+}
+
+/**
+ * Explicit slow-path reconstruction from the durable journal plus canonical message shards.
+ *
+ * A stale metadata checkpoint cannot be patched incrementally for canonical revisions: the
+ * shard contains only the newest body, so the token weight of the superseded revision is gone.
+ * Rebuild the history-derived projection exactly, then preserve metadata-only facts (title,
+ * attachment lineage, compaction latch, close state) from the last valid checkpoint.
+ */
+async function rebuildSummaryFromHistory(
+  id: string,
+  messages: Map<string, CanonicalEvent>,
+  checkpoint: SessionSummary | null,
+  historySeq: number,
+  preserveAttachmentTurn = false,
+  migrateTokenEstimate = false
+): Promise<SessionSummary> {
+  const rebuilt = emptySummary(id, 'Recovered session', null);
+  let sawProjected = false;
+  let historicalReturnReduction = 0;
+  const canonicalKeys = new Set(messages.keys());
+  // Canonical shards are applied after the journal for token accounting. Response identity
+  // instead follows original authored order; retain only the small identity fields here.
+  const identities: Chronological[] = [];
+  const collectIdentity = (event: SessionEvent): void => {
+    if (!['user_message', 'turn_start', 'turn_end', 'tool_call'].includes(event.kind)) return;
+    identities.push({ seq: event.seq, origin: positionOf(event), time: event.time, kind: event.kind,
+      source: event.source, turnId: event.turnId,
+      ...(event.kind === 'user_message' ? { messageId: event.messageId, inputId: event.inputId } : {}),
+      ...(event.kind === 'tool_call' ? { call: { requestId: event.call.requestId,
+        conversationId: event.call.conversationId, attribution: event.call.attribution } } : {}) });
+  };
+  let carry = Buffer.alloc(0);
+  const handle = await fs.open(path.join(sessionDir(id), 'events.jsonl'), 'r').catch(() => null);
+  const accept = (line: Buffer): void => {
+    if (line.length === 0 || line.length > MAX_LINE_BYTES) return;
+    try {
+      const event = JSON.parse(line.toString('utf8')) as SessionEvent;
+      if (!event || typeof event.seq !== 'number' || typeof event.kind !== 'string') return;
+      // Once a stable website message has a canonical shard, any old append-only snapshot with
+      // the same identity is legacy storage for that same logical event, not another event.
+      if (
+        messageKey(event) &&
+        canonicalKeys.has(messageKey(event)!)
+      ) {
+        return;
+      }
+      if (!sawProjected) {
+        rebuilt.startedAt = event.time;
+        rebuilt.updatedAt = event.time;
+      }
+      if (!sawProjected && event.kind === 'session_start') rebuilt.title = event.title || rebuilt.title;
+      const eventConversation = 'conversationId' in event && typeof event.conversationId === 'string' ? event.conversationId : null;
+      if (eventConversation) {
+        rebuilt.conversationId = eventConversation;
+        if (!rebuilt.chatIds.includes(eventConversation)) rebuilt.chatIds.push(eventConversation);
+      }
+      // Rebind already removed old frontends from current context. During estimation
+      // migration, their return reductions belong only to the lifetime total.
+      if (migrateTokenEstimate && event.kind === 'tool_call' && checkpoint?.conversationId &&
+          event.call.conversationId && event.call.conversationId !== checkpoint.conversationId) {
+        historicalReturnReduction += Math.max(0, storedTextTokens(event.call.result) - MAX_TOOL_RESULT_TOKENS);
+      }
+      applyToSummary(rebuilt, event);
+      collectIdentity(event);
+      sawProjected = true;
+    } catch {
+      // A torn or corrupt line costs that line, not the complete session projection.
+    }
+  };
+  try {
+    if (handle) {
+      const chunk = Buffer.alloc(64 * 1024);
+      let position = 0;
+      for (;;) {
+        const { bytesRead } = await handle.read(chunk, 0, chunk.length, position);
+        if (bytesRead === 0) break;
+        position += bytesRead;
+        let joined = carry.length ? Buffer.concat([carry, chunk.subarray(0, bytesRead)]) : chunk.subarray(0, bytesRead);
+        let start = 0;
+        for (;;) {
+          const newline = joined.indexOf(0x0a, start);
+          if (newline < 0) break;
+          accept(joined.subarray(start, newline));
+          start = newline + 1;
+        }
+        carry = joined.subarray(start);
+        if (carry.length > MAX_LINE_BYTES) carry = Buffer.alloc(0);
+      }
+      accept(carry);
+    }
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  for (const message of [...messages.values()].sort((left, right) => left.seq - right.seq)) {
+    if (!sawProjected) {
+      rebuilt.startedAt = message.time;
+      rebuilt.updatedAt = message.time;
+    }
+    applyToSummary(rebuilt, message);
+    collectIdentity(message);
+    sawProjected = true;
+  }
+  if (!sawProjected) {
+    throw new Error(`Session ${id} has no recoverable metadata or history`);
+  }
+
+  rebuilt.timelineTurns = {}; rebuilt.requestTurns = {}; rebuilt.nativeQuestion = null;
+  for (const event of identities.sort((a, b) => positionOf(a) - positionOf(b))) applyTurnIdentity(rebuilt, event);
+
+  const summary = checkpoint
+    ? {
+        ...checkpoint,
+        updatedAt: Math.max(checkpoint.updatedAt, rebuilt.updatedAt),
+        events: rebuilt.events,
+        timelineTurns: rebuilt.timelineTurns,
+        requestTurns: rebuilt.requestTurns,
+        nativeQuestion: rebuilt.nativeQuestion,
+        userMessages: rebuilt.userMessages,
+        toolCalls: rebuilt.toolCalls,
+        lastToolCallAt: rebuilt.lastToolCallAt,
+        lastAssistantFinalAt: rebuilt.lastAssistantFinalAt,
+        lastTurnEndAt: rebuilt.lastTurnEndAt,
+        lastFinishReportAt: rebuilt.lastFinishReportAt,
+        processExitNonzero: rebuilt.processExitNonzero,
+        toolRejected: rebuilt.toolRejected,
+        toolInternalErrors: rebuilt.toolInternalErrors,
+        errors: rebuilt.errors,
+        estimatedTokens: rebuilt.estimatedTokens,
+        // `contextTokens` may have been reset by a durable rebind, which is metadata-only and
+        // therefore cannot be reconstructed from the event log. Every history mutation changes
+        // lifetime/context token totals by the same delta, so applying the rebuilt lifetime delta
+        // to the checkpoint preserves that reset while still recovering message revisions exactly.
+        contextTokens: Math.max(0, checkpoint.contextTokens + (rebuilt.estimatedTokens - checkpoint.estimatedTokens) + historicalReturnReduction),
+        lastHandoffId: rebuilt.lastHandoffId,
+        lastHandoffAt: rebuilt.lastHandoffAt,
+        lastTurnOutcome: rebuilt.lastTurnOutcome,
+        activeTurnId: preserveAttachmentTurn ? checkpoint.activeTurnId ?? null : rebuilt.activeTurnId ?? null,
+        finishTurn: rebuilt.finishTurn?.conversationId === checkpoint.conversationId ? rebuilt.finishTurn : null,
+        agents: [...new Set([...checkpoint.agents, ...rebuilt.agents])]
+      }
+    : rebuilt;
+  logWarn(`session ${id}: rebuilt metadata from durable event/message history`);
+  await writeSummary(summary, historySeq);
+  return summary;
+}
+
+/**
+ * Reads the durable source of truth without making the session live.
+ *
+ * `meta.json` is a projection and can legitimately lag the journal or a canonical message
+ * shard after a crash. Read-only callers still need the repaired projection, but routing them
+ * through `ensureOpen()` would change lifetime semantics: merely viewing old history would put
+ * it in `open` and make retention skip it. This helper performs the same high-water recovery
+ * while leaving `open` untouched.
+ */
+async function readDurableSnapshot(id: string): Promise<DurableSessionSnapshot | null> {
+  assertSessionId(id);
+  const existing = reconciling.get(id);
+  if (existing) return existing;
+  const work = (async () => {
+    let aliasesCollapsed = false;
+    const messages = await readCanonicalMessages(id, () => { aliasesCollapsed = true; });
+    let messageSeq = 0;
+    for (const event of messages.values()) messageSeq = Math.max(messageSeq, event.seq);
+    const journalSeq = await lastSeqOnDisk(id);
+    const historySeq = Math.max(journalSeq, messageSeq);
+    const checkpoint = await readMetaCheckpoint(id);
+    const titleRepaired = checkpoint ? refreshUserTitle(checkpoint.summary, messages.values()) : false;
+
+    // A pre-taxonomy checkpoint can have a current watermark but stale outcome classification.
+    if (
+      checkpoint?.historySeq === historySeq &&
+      checkpoint.tokenEstimateCurrent &&
+      (!aliasesCollapsed || checkpoint.canonicalProjectionCurrent) &&
+      !checkpoint.outcomeCountersMissing &&
+      !checkpoint.activityBoundaryMissing &&
+      checkpoint.summary.timelineTurns !== undefined &&
+      checkpoint.summary.requestTurns !== undefined &&
+      checkpoint.summary.nativeQuestion !== undefined &&
+      checkpoint.summary.finishTurn !== undefined
+    ) {
+      // A successful no-op migration is still a completed migration. Without this stamp,
+      // every launch rereads all old transcripts that happened to contain no aliases.
+      const migrated = !checkpoint.canonicalProjectionCurrent || titleRepaired;
+      if (migrated) await writeSummary(checkpoint.summary, historySeq);
+      return { summary: checkpoint.summary, messages, historySeq, reconciled: migrated };
+    }
+    if (checkpoint && historySeq === 0) {
+      // Nothing to replay: stamp the empty legacy projection in place.
+      const summary = {
+        ...checkpoint.summary,
+        ...(checkpoint.outcomeCountersMissing ? { errors: 0 } : {}),
+        timelineTurns: {},
+        nativeQuestion: null,
+        requestTurns: {},
+        lastToolCallAt: null,
+        lastAssistantFinalAt: null,
+        lastTurnEndAt: null,
+        lastFinishReportAt: null,
+        finishTurn: null
+      };
+      await writeSummary(summary, 0);
+      return { summary, messages, historySeq: 0, reconciled: true };
+    }
+    if (!checkpoint && historySeq === 0) return null;
+
+    const summary = await rebuildSummaryFromHistory(id, messages, checkpoint?.summary ?? null, historySeq, checkpoint?.historySeq === historySeq, !!checkpoint && !checkpoint.tokenEstimateCurrent);
+    return { summary, messages, historySeq, reconciled: true };
+  })();
+  reconciling.set(id, work);
+  try {
+    return await work;
+  } finally {
+    if (reconciling.get(id) === work) reconciling.delete(id);
+  }
+}
+
+async function readAuthoritativeSummary(id: string): Promise<SessionSummary | null> {
+  const live = open.get(id);
+  if (live) return live.summary;
+  const becomingLive = opening.get(id);
+  if (becomingLive) return (await becomingLive).summary;
+  const snapshot = await readDurableSnapshot(id);
+  if (!snapshot) return null;
+  // If a process-lifetime catalog already exists, or one is concurrently being built and may
+  // already have passed this row, invalidate/update it after a recovery write. The catalog's own
+  // build calls readDurableSnapshot directly, so its normal stale-row repairs do not self-loop.
+  if (snapshot.reconciled && (attachmentCatalog || attachmentCatalogLoading)) {
+    publishAttachmentSummary(snapshot.summary);
+  }
+  return snapshot.summary;
+}
+
+async function ensureOpen(id: string): Promise<OpenSession> {
+  assertSessionId(id);
+  const existing = open.get(id);
+  if (existing) return existing;
+  const inFlight = opening.get(id);
+  if (inFlight) return inFlight;
+  const reconstruction = (async () => {
+    await sealTornTail(id);
+    const snapshot = await readDurableSnapshot(id);
+    if (!snapshot) throw new Error(`Session ${id} has no recoverable metadata or history`);
+    const entry: OpenSession = {
+      summary: snapshot.summary,
+      nextSeq: snapshot.historySeq + 1,
+      historySeq: snapshot.historySeq,
+      tail: [],
+      tailFrom: snapshot.historySeq + 1,
+      activityHydrated: false,
+      queue: Promise.resolve(),
+      messages: snapshot.messages,
+      metaDirty: false,
+      metaTimer: null
+    };
+    open.set(id, entry);
+    if (snapshot.reconciled && (attachmentCatalog || attachmentCatalogLoading)) {
+      publishAttachmentSummary(entry.summary);
+    }
+    return entry;
+  })();
+  opening.set(id, reconstruction);
+  try {
+    return await reconstruction;
+  } finally {
+    if (opening.get(id) === reconstruction) opening.delete(id);
+  }
+}
+
+/** A hold-call result or app status is not evidence of new work. */
+function noteFinishWork(summary: SessionSummary, event: SessionEvent): void {
+  if (!summary.finishTurn || (event.turnId && event.turnId !== summary.finishTurn.turnId)) return;
+  const meaningful = event.kind === 'user_message' || event.kind === 'assistant_message' ||
+    (event.kind === 'progress' && event.source !== 'app') ||
+    (event.kind === 'tool_call' && !['keep_astra_on_forever', 'session_finish'].includes(event.call.tool));
+  if (meaningful) summary.finishTurn = { ...summary.finishTurn, workSeq: Math.max(summary.finishTurn.workSeq,
+    workSequence(event)) };
+}
+
+function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
+  applyTurnIdentity(summary, event);
+  summary.events += 1;
+  // Never backwards. A tool call is written once the app knows which chat it belongs to,
+  // which can be after the page has already reported the end of the turn it ran in, and
+  // the call carries the time it started. Taking that literally would age a session back
+  // to before its own last event and drop it down a list sorted by recency.
+  summary.updatedAt = Math.max(summary.updatedAt, event.time);
+  const tokens = eventTokens(event);
+  summary.estimatedTokens += tokens;
+  // What the attached chat is carrying. Reset by a compaction rebind; see rebindSession.
+  summary.contextTokens += tokens;
+  if (event.kind === 'user_message') summary.userMessages += 1;
+  if (event.kind === 'tool_call') {
+    summary.toolCalls += 1;
+    summary.lastToolCallAt = Math.max(summary.lastToolCallAt ?? 0, event.time);
+    if (event.call.endsActivity === true) {
+      summary.lastFinishReportAt = Math.max(summary.lastFinishReportAt ?? 0, event.time);
+    }
+    const outcome = normalizedToolOutcome(event.call);
+    if (outcome === 'process_exit_nonzero') summary.processExitNonzero += 1;
+    if (outcome === 'tool_rejected') summary.toolRejected += 1;
+    if (outcome === 'tool_internal_error') {
+      summary.toolInternalErrors += 1;
+      summary.errors += 1;
+    }
+  }
+  if (event.kind === 'assistant_message' && (event.final === true || event.state === 'final')) {
+    summary.lastAssistantFinalAt = Math.max(summary.lastAssistantFinalAt ?? 0, event.time);
+  }
+  if (event.kind === 'chat_error') summary.errors += 1;
+  if (event.kind === 'turn_end') {
+    summary.lastTurnOutcome = event.outcome;
+    summary.lastTurnEndAt = Math.max(summary.lastTurnEndAt ?? 0, event.time);
+  }
+  if (event.kind === 'turn_start') {
+    summary.activeTurnId = event.turnId ?? `seq-${event.seq}`;
+    if (summary.finishTurn?.turnId !== summary.activeTurnId) summary.finishTurn = {
+      turnId: summary.activeTurnId, conversationId: summary.conversationId, startedAt: event.time,
+      notified: false, released: false, decisionRevision: null, workSeq: 0, decisionSeq: 0, decisionInputRevision: null
+    };
+  }
+  if (event.kind === 'progress' && event.source === 'app' && event.turnId && summary.finishTurn?.turnId === event.turnId) {
+    const finish = { ...summary.finishTurn };
+    summary.finishTurn = finish;
+    // IDs cover already-shipped event rows; new rows additionally carry typed control.
+    if (event.progressId === `finish:${event.turnId}` || event.finishControl?.state === 'notified') finish.notified = true;
+    const prefix = `finish-goal:${event.turnId}:`;
+    const revision = event.finishControl?.state === 'decision' ? event.finishControl.revision
+      : event.progressId?.startsWith(prefix) ? event.progressId.slice(prefix.length) : null;
+    if (revision && /^[a-f0-9]{64}$/.test(revision) && finish.decisionRevision !== revision) {
+      finish.decisionRevision = revision;
+      finish.decisionAt = event.time;
+      finish.decisionSeq = Number.isSafeInteger(event.finishControl?.workSeq) ? event.finishControl!.workSeq! : event.seq;
+      finish.decisionInputRevision = event.finishControl?.inputRevision ?? null;
+    } else if (revision === finish.decisionRevision && event.finishControl?.state === 'decision' && Number.isSafeInteger(event.finishControl.workSeq)) {
+      finish.decisionSeq = Math.max(finish.decisionSeq, event.finishControl.workSeq!);
+    }
+    if (event.finishControl) finish.conversationId = event.finishControl.conversationId;
+    if (event.finishControl?.state === 'released') finish.released = true;
+  }
+  noteFinishWork(summary, event);
+  if (event.kind === 'turn_end' && (!event.turnId || summary.activeTurnId === event.turnId)) summary.activeTurnId = null;
+  if (event.kind === 'handoff') {
+    summary.lastHandoffId = event.handoffId;
+    summary.lastHandoffAt = event.time;
+  }
+  if (event.agent && !summary.agents.includes(event.agent)) summary.agents.push(event.agent);
+}
+
+/**
+ * Whether this chat is over its automatic-compaction line.
+ *
+ * A level, and deliberately not the edge this used to be. The edge version armed on the
+ * below-to-above crossing and then waited for that turn to end cleanly, which had two
+ * consequences the design never wanted: a single interrupted turn destroyed the trigger
+ * forever (a counter that only grows never crosses the same line twice), and every
+ * compaction it did manage to fire landed *after* the model had finished answering — the
+ * one moment where a handoff is pointless, because the work it would carry across is
+ * already done.
+ *
+ * So this half of the rule is just "over the line". The other half — that
+ * the model is working *right now* — is a fact about the open browser connection rather
+ * than about the recording, so it is asked at the point of use, in bridge.ts. That is what
+ * keeps a stale 500k chat quiet when it is merely opened: it is over the line all day, and
+ * nothing is running in it. The existing continuation transaction is the durable authority
+ * once a stopped/settled chat asks for its handoff prompt; pre-barrier refusal owns no durable
+ * state and may be attempted by a later generation.
+ */
+export function automaticCompactionAllowed(summary?: SessionSummary | null): boolean {
+  const config = getConfig();
+  const selected = summary?.selectedModel;
+  // The selected model owns this exemption; Infinite Astra with Sol still compacts.
+  return config.compaction.auto &&
+    !(selected?.conversationId === summary?.conversationId && isProModel(selected?.model, selected?.reasoningEffort));
+}
+
+export function autoCompactionReady(summary: SessionSummary | null | undefined): boolean {
+  if (!summary) return false;
+  const refusal = summary.autoCompactionRefusal;
+  if (refusal?.conversationId === summary.conversationId &&
+      (!summary.activeTurnId || summary.activeTurnId === refusal.turnId)) return false;
+  const config = getConfig().compaction;
+  return automaticCompactionAllowed(summary) && config.autoTokens > 0 && summary.contextTokens >= config.autoTokens;
+}
+
+/** Persist eligibility before retiring the ticket, so a restart cannot refile the refused turn. */
+export async function refuseAutomaticCompactionNow(id: string, conversationId: string, turnId: string | null): Promise<void> {
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'automatic compaction refusal', async () => {
+    if (entry.summary.conversationId !== conversationId ||
+        (entry.summary.activeTurnId && entry.summary.activeTurnId !== turnId)) return;
+    const staged = { ...entry.summary, autoCompactionRefusal: { conversationId, turnId } };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/**
+ * Appends one event and returns it with its assigned sequence number.
+ *
+ * The sequence number, not the timestamp, defines order: the extension and the MCP
+ * server both feed this store and their clocks are the same clock, but events can
+ * arrive out of order when the browser batches its observations.
+ */
+export function appendEvent(sessionId: string, event: NewSessionEvent): Promise<SessionEvent> {
+  return ensureOpen(sessionId).then((entry) => {
+    // Sequence assignment, durable append and projection update are one serial operation.
+    // The previous implementation incremented nextSeq and mutated the summary *before* the
+    // append succeeded. A disk failure therefore created a permanent seq gap and could even
+    // persist meta.json claiming events/tool calls/tokens that never existed in events.jsonl.
+    // Keep the append-only journal authoritative: nothing in memory advances until the line
+    // is on disk.
+    const write = entry.queue.then(async () => {
+      let admitted = event;
+      if (event.kind === 'tool_call') {
+        const denied = deniedAssetIds(sessionId, event.call.assets);
+        admitted = { ...event, call: {
+          ...event.call,
+          assets: admittedAssets(sessionId, event.call.assets),
+          ...(denied.length ? { retiredImageAssetIds: mergedRetiredAssetIds(event.call.retiredImageAssetIds, denied) } : {})
+        } };
+      } else if (event.kind === 'user_message') {
+        const denied = deniedAssetIds(sessionId, event.assets);
+        admitted = {
+          ...event,
+          assets: admittedAssets(sessionId, event.assets),
+          ...(denied.length ? { retiredImageAssetIds: mergedRetiredAssetIds(event.retiredImageAssetIds, denied) } : {})
+        };
+      }
+      const full = { ...admitted, seq: entry.nextSeq } as SessionEvent;
+      const line = `${JSON.stringify(full)}\n`;
+      if (Buffer.byteLength(line, 'utf8') > MAX_LINE_BYTES) {
+        throw new Error('Session event is too large to store');
+      }
+      try {
+        await fs.appendFile(path.join(sessionDir(sessionId), 'events.jsonl'), line, 'utf8');
+      } catch (error) {
+        // Windows/filesystem errors are allowed to be uncertain commits: the write may have
+        // reached disk before the promise rejected. Reconcile the authoritative tail before
+        // another queued writer is admitted. A complete line is treated as committed; a torn
+        // line is sealed and the normal browser/MCP retry may safely reuse that absent seq.
+        await sealTornTail(sessionId);
+        const durableSeq = await lastSeqOnDisk(sessionId);
+        if (durableSeq < full.seq) {
+          entry.nextSeq = Math.max(entry.nextSeq, durableSeq + 1);
+          throw error;
+        }
+        logWarn(`session ${sessionId}: append reported an error after sequence ${full.seq} was already durable`);
+      }
+      entry.nextSeq += 1;
+      entry.tail.push(full);
+      if (entry.tail.length > MAX_EVENT_TAIL) {
+        const removed = entry.tail.splice(0, entry.tail.length - MAX_EVENT_TAIL);
+        entry.tailFrom = removed[removed.length - 1]!.seq + 1;
+      }
+      applyToSummary(entry.summary, full);
+      entry.historySeq = full.seq;
+      scheduleMeta(entry);
+      return full;
+    });
+    entry.queue = write.then(
+      () => undefined,
+      (err: Error) => {
+        logError(`session append failed: ${err.message}`);
+      }
+    );
+    return write;
+  });
+}
+
+/**
+ * Creates or revises one canonical ChatGPT message by its own stable id.
+ *
+ * `seq` is the revision/cursor sequence so an incremental reader notices an update. `origin`
+ * preserves the sequence/time position where that stable website message first appeared, so
+ * revisions cannot move either a user response boundary or assistant prose through later work.
+ */
+export function upsertMessageEvent(
+  sessionId: string,
+  event: NewMessageEvent,
+  options: { preferTime?: boolean; work?: boolean } = {}
+): Promise<{ event: MessageEvent; changed: boolean; contentChanged: boolean }> {
+  const directKey = messageKey(event as MessageEvent);
+  if (!directKey) throw new Error('Canonical message update requires ChatGPT messageId');
+  return ensureOpen(sessionId).then((entry) => {
+    const write = entry.queue.then(async () => {
+      // Provider create_time can change after a tab reload while the actual message
+      // UUID stays identical. Preserve the first canonical anchor on that exact
+      // evidence; never collapse distinct authored segments by working-turn tuple
+      // or matching text. Legacy observations without a provider UUID keep their key.
+      const providerMessageId = event.kind === 'assistant_message' ? event.providerMessageId : undefined;
+      const providerMatches = providerMessageId
+        ? [...entry.messages.entries()].filter(([, candidate]) => candidate.kind === 'assistant_message' &&
+            candidate.providerMessageId === providerMessageId)
+        : [];
+      const key = !entry.messages.has(directKey) && providerMatches.length === 1 ? providerMatches[0]![0] : directKey;
+      const candidate = entry.messages.get(key);
+      const previous = candidate?.kind === 'tool_call' ? undefined : candidate;
+      // A changed provider timestamp caused this alias; it is not a correction of
+      // the original anchor. Same-key DOM-to-Fiber timestamp promotion still applies.
+      const preferTime = options.preferTime === true && key === directKey;
+      if (previous && key !== directKey) event = { ...event, messageId: previous.messageId };
+      // Final is terminal for one canonical ChatGPT message. The page can briefly re-report
+      // an older streaming DOM snapshot after settling/remounting; accepting that snapshot
+      // would turn a completed answer back into a partial one and could replace its text.
+      if (
+        previous?.kind === 'assistant_message' &&
+        event.kind === 'assistant_message' &&
+        (previous.final === true || previous.state === 'final') &&
+        event.final !== true &&
+        event.state !== 'final'
+      ) {
+        return { event: previous, changed: false, contentChanged: false };
+      }
+
+      // Message bodies can be hundreds of kilobytes. The old path JSON.stringify-compared the
+      // same StoredText pair once while preserving rendered HTML and then again while deciding
+      // whether the observation changed at all. StoredText has a fixed five-field shape, so a
+      // direct comparison is exact and avoids repeated full-string serialisation/allocation on
+      // every streaming observation.
+      const sameMessage =
+        previous?.kind === event.kind && storedTextEqual(previous.message, event.message);
+
+      const nextEvent: NewMessageEvent =
+        previous?.kind === 'assistant_message' && event.kind === 'assistant_message'
+          ? {
+              ...event,
+              // The producer already supplied the stable website identity. Keep that exact
+              // identity through every revision; a different id is a different logical row.
+              messageId: previous.messageId,
+              authoredAt: authoredTimeOf(previous) ?? event.authoredAt,
+              providerMessageId: event.providerMessageId ?? previous.providerMessageId,
+              // `final` is a compatibility mirror of state, not an independent truth.
+              state: event.state === 'final' || event.final === true ? 'final' : 'streaming',
+              final: event.state === 'final' || event.final === true,
+              // Goal eligibility is an accepted fact about this stable reply, not a property a
+              // later sparse page snapshot may retract. This is what makes a 503/reload replay
+              // re-offer the same durable obligation instead of silently dropping it.
+              ...(previous.goalEligible === true ? { goalEligible: true } : {}),
+              // A sparse re-observation of the same prose must not throw away the richer
+              // representation we already captured. If the prose itself changed, omitting
+              // HTML deliberately falls back to the new plain text instead of showing stale
+              // markup for different content.
+              ...(event.renderedHtml === undefined && sameMessage
+                ? { renderedHtml: previous.renderedHtml }
+                : {})
+            }
+          : previous?.kind === 'user_message' && event.kind === 'user_message'
+            ? { ...event, inputId: event.inputId ?? previous.inputId,
+                authoredAt: previous.authoredAt ?? event.authoredAt,
+                authoredText: event.authoredText ?? previous.authoredText,
+                // Generated provenance is an accepted fact about this stable message; a sparse
+                // page re-observation must not be able to promote it to a human requirement.
+                ...(previous.generated === true ? { generated: true as const } : {}),
+                reaction: event.reaction === undefined ? previous.reaction : event.reaction,
+                // App-owned originals/previews retain their outbox identity when the
+                // provider later observes different native attachment ids for that send.
+                attachments: previous.inputId ? previous.attachments ?? event.attachments : event.attachments ?? previous.attachments,
+                inputDelivery: previous.inputDelivery === 'confirmed' ? 'confirmed' : event.inputDelivery ?? previous.inputDelivery,
+                model: event.model ?? previous.model,
+                reasoningEffort: event.reasoningEffort ?? previous.reasoningEffort,
+                retiredImageAssetIds: mergedRetiredAssetIds(previous.retiredImageAssetIds,
+                  deniedAssetIds(sessionId, event.assets ?? previous.assets)),
+                assets: admittedAssets(sessionId,
+                  retainedAssets(event.assets ?? previous.assets, previous.retiredImageAssetIds)) }
+            : event.kind === 'user_message'
+              ? {
+                  ...event,
+                  retiredImageAssetIds: mergedRetiredAssetIds(event.retiredImageAssetIds,
+                    deniedAssetIds(sessionId, event.assets)),
+                  assets: admittedAssets(sessionId, event.assets)
+                }
+              : event;
+      // A canonical assistant message belongs to exactly one generation permanently. Ownership
+      // may still be *promoted* from "not known yet" to a durable generation id when the
+      // recorder learns it late, but a settled assistant answer may never move to another turn.
+      // User messages are different: their page-side turn marker is a boundary hint and can be
+      // revised as ChatGPT re-homes the same stable user object, so preserve that existing
+      // behaviour instead of freezing it under the first marker we happened to observe.
+      //
+      // Live 2026-08-21, session `00000019`: ChatGPT re-mounted its stop control for two
+      // seconds well after a page load, the extension minted generation `g-11kz85q585v4s-0-1`
+      // for it, and the re-observation of the already finished 08:40:34 answer re-filed that
+      // answer under a turn that started at 08:45:22. The consequences are not cosmetic — the
+      // answer is torn away from the eight tool calls that produced it, so the extension can
+      // no longer prove its reconstruction of that turn complete and drops the whole response
+      // back to ChatGPT's native rendering, and the desktop timeline draws an empty turn with
+      // a five-minute-old message inside it.
+      const settledTurnId =
+        previous?.kind === 'assistant_message' && nextEvent.kind === 'assistant_message'
+          ? previous.turnId ?? nextEvent.turnId ?? undefined
+          : nextEvent.turnId ?? undefined;
+      if (
+        previous &&
+        previous.kind === nextEvent.kind &&
+        sameMessage &&
+        nextEvent.authoredAt === previous.authoredAt &&
+        nextEvent.model === previous.model &&
+        nextEvent.reasoningEffort === previous.reasoningEffort &&
+        (previous.kind !== 'assistant_message' ||
+          (nextEvent.kind === 'assistant_message' &&
+            storedTextEqual(previous.renderedHtml, nextEvent.renderedHtml) &&
+            previous.state === nextEvent.state &&
+            previous.final === nextEvent.final &&
+            previous.goalEligible === nextEvent.goalEligible &&
+            previous.providerMessageId === nextEvent.providerMessageId)) &&
+        (nextEvent.kind !== 'user_message' || previous.kind !== 'user_message' ||
+          (nextEvent.reaction === previous.reaction && nextEvent.inputId === previous.inputId && nextEvent.authoredText === previous.authoredText && nextEvent.inputDelivery === previous.inputDelivery && nextEvent.generated === previous.generated && JSON.stringify(nextEvent.assets) === JSON.stringify(previous.assets) && JSON.stringify(nextEvent.retiredImageAssetIds) === JSON.stringify(previous.retiredImageAssetIds) && JSON.stringify(nextEvent.attachments) === JSON.stringify(previous.attachments))) &&
+        (previous.turnId ?? undefined) === settledTurnId &&
+        (nextEvent.agent === undefined || previous.agent === nextEvent.agent) &&
+        (!preferTime || previous.time === nextEvent.time)
+      ) {
+        return { event: previous, changed: false, contentChanged: false };
+      }
+      const full = {
+        ...nextEvent,
+        // Cursor revisions publish richer markup/identity without manufacturing work.
+        // A reload may reserialize an existing user bubble. Its updated text belongs
+        // in history, but only a just-authored observation may revoke its recovery.
+        // A new question identity and the first final still advance this work stamp.
+        contentSeq: options.work === false &&
+          ((nextEvent.kind === 'user_message' && !!previous) || (nextEvent.kind === 'assistant_message' && !nextEvent.final))
+          ? previous ? workSequence(previous) : 0
+          : sameMessage && previous && (nextEvent.kind !== 'assistant_message' ||
+          (previous.kind === 'assistant_message' && (previous.final === true || previous.state === 'final') === nextEvent.final))
+          ? workSequence(previous) : entry.nextSeq,
+        ...(nextEvent.kind === 'assistant_message' && nextEvent.final
+          ? { finalContentSeq: sameMessage && previous?.kind === 'assistant_message' &&
+                (previous.final === true || previous.state === 'final')
+              // Old records do not distinguish a content revision from an HTML update.
+              // Keep their first anchor until genuinely new final content is observed.
+              ? previous.finalContentSeq ?? previous.origin ?? previous.seq
+              : entry.nextSeq,
+              finalObservedAt: sameMessage && previous?.kind === 'assistant_message' &&
+                (previous.final === true || previous.state === 'final')
+                ? previous.finalObservedAt : Date.now() }
+          : {}),
+        // First appearance is chronology; current seq is delivery cursor/revision.
+        // A page-model authored timestamp is stronger than a DOM first-sight timestamp. The
+        // recorder opts into that correction explicitly; ordinary revisions still keep the
+        // original first-seen time forever.
+        time: preferTime ? nextEvent.time : previous?.time ?? nextEvent.time,
+        ...(settledTurnId === undefined ? {} : { turnId: settledTurnId }),
+        ...(previous?.agent && !nextEvent.agent ? { agent: previous.agent } : {}),
+        ...(nextEvent.kind === 'assistant_message' || nextEvent.kind === 'user_message'
+          ? { origin: previous?.kind === nextEvent.kind ? previous.origin ?? previous.seq : entry.nextSeq }
+          : {}),
+        seq: entry.nextSeq
+      } as MessageEvent;
+
+      await writeCanonicalMessage(sessionId, key, full);
+
+      entry.nextSeq += 1;
+      entry.messages.set(key, full);
+      if (full.kind === 'user_message') refreshUserTitle(entry.summary, entry.messages.values());
+      if (!previous) {
+        applyToSummary(entry.summary, full);
+      } else {
+        // A revision is not another logical event. Only its text/token weight and recency
+        // replace what the previous snapshot contributed to the session projection.
+        const delta = eventTokens(full) - eventTokens(previous);
+        entry.summary.estimatedTokens = Math.max(0, entry.summary.estimatedTokens + delta);
+        entry.summary.contextTokens = Math.max(0, entry.summary.contextTokens + delta);
+        entry.summary.updatedAt = Math.max(entry.summary.updatedAt, nextEvent.time);
+        noteFinishWork(entry.summary, full);
+        if (full.kind === 'assistant_message' && (full.final === true || full.state === 'final')) {
+          entry.summary.lastAssistantFinalAt = Math.max(
+            entry.summary.lastAssistantFinalAt ?? 0,
+            nextEvent.time
+          );
+        }
+        if (full.agent && !entry.summary.agents.includes(full.agent)) entry.summary.agents.push(full.agent);
+      }
+      entry.historySeq = full.seq;
+      scheduleMeta(entry);
+      return { event: full, changed: true, contentChanged: !sameMessage };
+    });
+    entry.queue = write.then(
+      () => undefined,
+      (err: Error) => logError(`session message upsert failed: ${err.message}`)
+    );
+    return write;
+  });
+}
+
+/**
+ * Creates or enriches one ChatGPT-native generated image by exact provider tuple.
+ *
+ * Metadata is canonical before preview capture starts. A later asset revision advances the
+ * sequence cursor while retaining the first origin/time and never contributes completion,
+ * Goal, tool-call, or activity facts. Local turn ownership may strengthen once from unknown;
+ * later document-local turn hints are ignored because reload remints them, while a conflicting
+ * durable agent owner still fails closed.
+ */
+export function upsertNativeImageEvent(
+  sessionId: string,
+  event: NewNativeImageEvent
+): Promise<{ event: NativeImageEvent; changed: boolean; accepted: boolean }> {
+  const key = messageKey(event);
+  if (!key) throw new Error('Canonical native image requires provider message and asset ids');
+  return ensureOpen(sessionId).then((entry) => {
+    const write = entry.queue.then(async () => {
+      const candidate = entry.messages.get(key);
+      const previous = candidate?.kind === 'native_image' ? candidate : undefined;
+      if (candidate && !previous) throw new Error('Canonical native image identity collision');
+      if (
+        previous &&
+        (previous.providerRole !== event.providerRole ||
+          (previous.agent && event.agent && previous.agent !== event.agent))
+      ) return { event: previous, changed: false, accepted: false };
+      // Explicit image-storage cleanup is a durable decision for this exact provider tuple.
+      // A later tab reload may rediscover and re-encode the same native image; accepting it
+      // would silently refill storage immediately after the user cleared it.
+      if (previous?.previewError === 'removed' && !previous.asset) {
+        return { event: previous, changed: false, accepted: false };
+      }
+
+      const incomingAsset = event.asset ? admittedAssets(sessionId, [event.asset])?.[0] : undefined;
+      const staleAsset = Boolean(event.asset && !incomingAsset);
+      const asset = previous?.asset ?? incomingAsset;
+      const previewError = previous?.previewError === 'quota' && !asset
+        ? 'quota'
+        : staleAsset
+          ? 'removed'
+          : event.previewError ?? previous?.previewError;
+      const previewStatus = asset
+        ? 'available'
+        : previewError
+          ? 'unavailable'
+          : event.previewStatus;
+      const next: NewNativeImageEvent = {
+        ...event,
+        time: previous?.time ?? event.time,
+        ...(previous?.turnId ? { turnId: previous.turnId } : event.turnId ? { turnId: event.turnId } : {}),
+        ...(previous?.agent && !event.agent ? { agent: previous.agent } : {}),
+        providerChannel: previous?.providerChannel ?? event.providerChannel,
+        providerStatus: previous?.providerStatus === 'finished_successfully'
+          ? previous.providerStatus : event.providerStatus ?? previous?.providerStatus,
+        width: previous?.width ?? event.width,
+        height: previous?.height ?? event.height,
+        asset: undefined,
+        previewStatus,
+        previewError,
+        ...(asset ? {
+          asset,
+          previewStatus: 'available',
+          previewWidth: previous?.previewWidth ?? event.previewWidth,
+          previewHeight: previous?.previewHeight ?? event.previewHeight,
+          previewError: undefined
+        } : {})
+      };
+      if (previous) {
+        const unchanged =
+          previous.turnId === next.turnId && previous.agent === next.agent &&
+          previous.providerChannel === next.providerChannel && previous.providerStatus === next.providerStatus &&
+          previous.width === next.width && previous.height === next.height &&
+          previous.previewWidth === next.previewWidth && previous.previewHeight === next.previewHeight &&
+          previous.previewStatus === next.previewStatus && previous.previewError === next.previewError &&
+          previous.asset?.id === next.asset?.id && previous.asset?.mimeType === next.asset?.mimeType &&
+          previous.asset?.bytes === next.asset?.bytes;
+        if (unchanged) return { event: previous, changed: false, accepted: true };
+      }
+      const full: NativeImageEvent = {
+        ...next,
+        origin: previous?.origin ?? previous?.seq ?? entry.nextSeq,
+        seq: entry.nextSeq
+      };
+      await writeCanonicalMessage(sessionId, key, full);
+      entry.messages.set(key, full);
+      entry.nextSeq += 1;
+      entry.historySeq = full.seq;
+      if (!previous) applyToSummary(entry.summary, full);
+      scheduleMeta(entry);
+      return { event: full, changed: true, accepted: true };
+    });
+    entry.queue = write.then(
+      () => undefined,
+      (err: Error) => logError(`session native image upsert failed: ${err.message}`)
+    );
+    return write;
+  });
+}
+
+function retainedAssets(assets: readonly AssetRef[] | undefined, retired: readonly string[] | undefined): AssetRef[] | undefined {
+  if (!assets) return undefined;
+  if (!retired?.length) return [...assets];
+  const denied = new Set(retired);
+  const kept = assets.filter((asset) => !denied.has(asset.id));
+  return kept.length ? kept : undefined;
+}
+
+/** Canonical background launch: the call UUID owns its later process status. */
+export async function recordProcessCall(sessionId: string, event: Omit<Extract<SessionEvent, { kind: 'tool_call' }>, 'seq'>): Promise<void> {
+  const entry = await ensureOpen(sessionId);
+  await enqueueSessionOperation(entry, 'process call', async () => {
+    const key = messageKey({ ...event, seq: 0 })!;
+    if (entry.messages.has(key)) throw new Error('Process call identity already recorded');
+    const denied = deniedAssetIds(sessionId, event.call.assets);
+    const full = {
+      ...event,
+      call: {
+        ...event.call,
+        assets: admittedAssets(sessionId, event.call.assets),
+        retiredImageAssetIds: mergedRetiredAssetIds(event.call.retiredImageAssetIds, denied)
+      },
+      seq: entry.nextSeq,
+      origin: entry.nextSeq
+    };
+    await writeCanonicalMessage(sessionId, key, full);
+    entry.messages.set(key, full);
+    entry.nextSeq += 1;
+    entry.historySeq = full.seq;
+    applyToSummary(entry.summary, full);
+    scheduleMeta(entry);
+  });
+}
+
+/** Exit revises its launch; it is not a tool invocation, output receipt or turn boundary. */
+export async function completeProcessCall(sessionId: string, callId: string, completion: {
+  completedAt: number; durationMs: number; exitCode: number | null; benignExit?: boolean;
+}): Promise<void> {
+  const entry = await ensureOpen(sessionId);
+  await enqueueSessionOperation(entry, 'process completion', async () => {
+    const key = `tool_call\u0000${callId}`;
+    const previous = entry.messages.get(key);
+    if (previous?.kind !== 'tool_call' || !previous.call.process || previous.call.process.completedAt !== undefined) return;
+    const { exitCode } = completion;
+    const failed = exitCode !== null && exitCode !== 0 && completion.benignExit !== true;
+    const full: Extract<SessionEvent, { kind: 'tool_call' }> = {
+      ...previous, seq: entry.nextSeq,
+      call: { ...previous.call, process: { ...previous.call.process, ...completion }, summary: {
+        ...previous.call.summary,
+        title: previous.call.summary.title.replace(/^Started /, failed ? 'Command failed ' : 'Completed '),
+        metric: exitCode === null ? 'finished (exit unknown)' : failed ? `✕ exit ${exitCode}` : '✓ finished',
+        tone: exitCode === null ? 'warn' : failed ? 'bad' : 'good'
+      } }
+    };
+    await writeCanonicalMessage(sessionId, key, full);
+    entry.messages.set(key, full);
+    entry.nextSeq += 1;
+    entry.historySeq = full.seq;
+    const delta = eventTokens(full) - eventTokens(previous);
+    entry.summary.estimatedTokens = Math.max(0, entry.summary.estimatedTokens + delta);
+    if (full.call.conversationId === entry.summary.conversationId)
+      entry.summary.contextTokens = Math.max(0, entry.summary.contextTokens + delta);
+    scheduleMeta(entry);
+  });
+}
+
+// ------------------------------------------------------------------- read
+
+export interface ReadOptions {
+  /** First sequence number to return, inclusive. */
+  from?: number;
+  limit?: number;
+  kinds?: readonly SessionEvent['kind'][];
+  agent?: string;
+}
+
+/**
+ * Reads events back.
+ *
+ * A malformed line is skipped and counted rather than throwing: the whole point of
+ * an append-only log is that a half-written final line costs one event, not the
+ * session. Reading the file in one go is fine at the sizes the caps allow.
+ */
+export async function readEvents(sessionId: string, options: ReadOptions = {}): Promise<SessionEvent[]> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  const from = options.from ?? 0;
+  const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
+
+  // /activity is an incremental feed. Canonical messages use their latest revision seq for
+  // the cursor while preserving their first-appearance time/origin for chronology.
+  const active = open.get(sessionId);
+  const timeline = active?.summary ?? (await readDurableSnapshot(sessionId))?.summary;
+  if (options.from !== undefined && active) {
+    if (from >= active.nextSeq) return [];
+    const cacheFloor = active.tailFrom;
+    if (from >= cacheFloor) {
+      const cached: SessionEvent[] = [...active.tail, ...active.messages.values()].filter((parsed) => {
+        if (parsed.seq < from) return false;
+        if (options.kinds && !options.kinds.includes(parsed.kind)) return false;
+        if (options.agent && parsed.agent !== options.agent) return false;
+        return true;
+      });
+      // `from` is a sequence cursor. Page in sequence order first and only then apply the
+      // presentation chronology inside that bounded page; otherwise chronology may move a later
+      // row ahead of an earlier seq at the slice boundary and advancing the cursor would skip it.
+      const page = cached.sort((left, right) => left.seq - right.seq).slice(0, limit);
+      return chronological(projectTimeline(page, timeline?.timelineTurns, timeline?.requestTurns, active.messages.values()));
+    }
+  }
+  let raw: string;
+  try {
+    raw = await fs.readFile(path.join(sessionDir(sessionId), 'events.jsonl'), 'utf8');
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') raw = '';
+    else throw err;
+  }
+  const messages = active?.messages ?? (await readCanonicalMessages(sessionId));
+  const canonicalKeys = new Set(messages.keys());
+  const out: SessionEvent[] = [];
+  let damaged = 0;
+  for (const line of raw.split('\n')) {
+    if (!line.trim()) continue;
+    let parsed: SessionEvent;
+    try {
+      parsed = JSON.parse(line) as SessionEvent;
+    } catch {
+      damaged++;
+      continue;
+    }
+    if (typeof parsed?.seq !== 'number' || typeof parsed?.kind !== 'string') {
+      damaged++;
+      continue;
+    }
+    if (parsed.seq < from) continue;
+    if (options.kinds && !options.kinds.includes(parsed.kind)) continue;
+    if (options.agent && parsed.agent !== options.agent) continue;
+    // Once a message has a canonical record, a pre-1.8 append-only snapshot with the same
+    // ChatGPT identity is legacy journal history, not another transcript item.
+    if (messageKey(parsed) && canonicalKeys.has(messageKey(parsed)!)) {
+      continue;
+    }
+    out.push(parsed);
+  }
+  for (const message of messages.values()) {
+    if (message.seq < from) continue;
+    if (options.kinds && !options.kinds.includes(message.kind)) continue;
+    if (options.agent && message.agent !== options.agent) continue;
+    out.push(message);
+  }
+  if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable event line(s)`);
+  // `seq` is the immutable cursor domain; logical chronology is only allowed to reorder a
+  // bounded turn whose `turn_start` is present in this read window. Global time sorting used
+  // to move unrelated/replayed page history across turn boundaries and disagreed with the
+  // extension renderer, which already used the shared rule. One function now defines the
+  // transcript order everywhere.
+  if (options.from !== undefined) {
+    const page = out.sort((left, right) => left.seq - right.seq).slice(0, limit);
+    return chronological(projectTimeline(page, timeline?.timelineTurns, timeline?.requestTurns, messages.values()));
+  }
+  return chronological(projectTimeline(out, timeline?.timelineTurns, timeline?.requestTurns, messages.values())).slice(0, limit);
+}
+
+/**
+ * Reads only the newest matching presentation window without materialising the whole JSONL journal.
+ *
+ * This exists for UI/default-history tails. Full-text search, call expansion and explicit old
+ * cursors still use `readEvents()` because they genuinely need older rows. The scan walks the
+ * journal backwards and stops once it has enough matching rows (or reaches the bounded byte
+ * budget), so `limit: 1` cannot turn into a 40 MB read. Tool status revisions retain their
+ * invocation position; they cannot displace newer model work from a limit-one read.
+ */
+export async function readRecentEvents(
+  sessionId: string,
+  limit: number,
+  options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number; before?: number; after?: number; orderByOrigin?: boolean } = {}
+): Promise<SessionEvent[]> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  return readRecentEventsFromDisk(sessionId, limit, options);
+}
+
+/** The latest authored question. A recovery source excludes its injected corrections,
+ * which have no native user bubble and cannot grant another error reload. */
+export async function readLatestUserMessage(sessionId: string, _turnId?: string | null): Promise<Extract<SessionEvent, { kind: 'user_message' }> | undefined> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  const summary = await readAuthoritativeSummary(sessionId);
+  const [message] = await readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
+    before: Number.POSITIVE_INFINITY, acceptEvent: (event: SessionEvent) => !injectedUserMessage(event, summary?.timelineTurns) });
+  return message?.kind === 'user_message' ? message : undefined;
+}
+
+/**
+ * One canonical user message by its exact ChatGPT id.
+ *
+ * The canonical store is keyed by that identity, so this is a direct lookup rather than a scan:
+ * provenance questions must still answer for a message that has long since left any bounded tail
+ * window. A missing row is a real miss, not a truncation.
+ */
+export async function readUserMessageByMessageId(sessionId: string, messageId: string): Promise<Extract<SessionEvent, { kind: 'user_message' }> | null> {
+  if (!messageId) return null;
+  const entry = await ensureOpen(sessionId);
+  await flushSession(sessionId);
+  const event = entry.messages.get(`user_message\u0000${messageId}`);
+  return event?.kind === 'user_message' ? event : null;
+}
+
+/** An injected instruction belongs to its existing generation, even after native reconciliation. */
+function isTurnCorrection(event: SessionEvent, turnId?: string | null, turns?: TimelineTurns): boolean {
+  return injectedUserMessage(event, turns) && !!turnId && !!event.turnId &&
+    responseTurnId(turns, event.turnId) === responseTurnId(turns, turnId);
+}
+
+/** Latest lifecycle boundary for one recovery source. Injected same-turn instructions
+ * do not replace it; a new question, another turn, or a stop still does. Message revisions
+ * retain their authored position so replaying an old question cannot cancel current work. */
+export async function readRecoveryBoundary(sessionId: string, turnId?: string | null): Promise<SessionEvent | undefined> {
+  const entry = await ensureOpen(sessionId);
+  await flushSession(sessionId);
+  // Read under this session's existing queue. Another read or metadata flush
+  // must not invalidate the boundary and permanently spend a valid silence grant.
+  return enqueueSessionOperation(entry, 'recovery boundary read', async () => {
+    const [boundary] = await readRecentEventsFromDisk(sessionId, 1, {
+      kinds: ['turn_start', 'turn_end', 'user_message'], orderByOrigin: true,
+      before: Number.POSITIVE_INFINITY,
+      acceptEvent: event => !isTurnCorrection(event, turnId, entry.summary.timelineTurns)
+    });
+    return boundary;
+  });
+}
+
+/** Canonical completion evidence shared by activity retirement and input eligibility.
+ * No turn is manufactured: an unowned reply must follow the latest recorded question.
+ * Committed history and binding changes invalidate the snapshot. Unrelated reads
+ * replacing a queue promise do not make a known final into an unfinished response. */
+export async function readCompletedFinal(sessionId: string, conversationId: string, turnId?: string | null): Promise<{
+  messageId: string; turnId: string | null; completedAt: number; contentSeq: number; text: string;
+} | null> {
+  const entry = await ensureOpen(sessionId);
+  await flushSession(sessionId);
+  const revision = entry.nextSeq;
+  if (entry.summary.conversationId !== conversationId) return null;
+  const [recent, questions] = await Promise.all([
+    readRecentEventsFromDisk(sessionId, 256, { kinds: ['turn_start', 'turn_end', 'user_message', 'assistant_message', 'tool_call', 'page_tool'] }),
+    readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
+      before: Infinity, acceptEvent: event => !injectedUserMessage(event, entry.summary.timelineTurns) })
+  ]);
+  if (entry.nextSeq !== revision || entry.summary.conversationId !== conversationId) return null;
+  const sameTurn = (left: string | null | undefined, right: string | null | undefined) => !!left && !!right &&
+    responseTurnId(entry.summary.timelineTurns, left) === responseTurnId(entry.summary.timelineTurns, right);
+  const final = recent.findLast(event => event.kind === 'assistant_message' && event.final === true &&
+    (!!event.message.text.trim() || !!event.providerMessageId) && !!event.messageId && (!turnId || event.turnId === turnId ||
+      (!!event.providerMessageId && sameTurn(event.turnId, turnId)) ||
+      (turnId.startsWith('reply:') && event.messageId === turnId.slice(6))));
+  if (!final || final.kind !== 'assistant_message' || !final.messageId) return null;
+  const seq = final.finalContentSeq ?? positionOf(final);
+  const completedAt = final.finalObservedAt ?? final.time;
+  const question = questions[0];
+  const correction = (event: SessionEvent) => isTurnCorrection(event, final.turnId, entry.summary.timelineTurns) && positionOf(event) < seq;
+  if (question && positionOf(question) >= positionOf(final) && !correction(question)) return null;
+  // With no generation identity, require an actual preceding authored boundary.
+  if (!final.turnId && (!question || question.time > final.time)) return null;
+  if (entry.summary.activeTurnId && !sameTurn(entry.summary.activeTurnId, final.turnId)) return null;
+  const boundaries = recent.filter(event => event.kind === 'turn_start' || event.kind === 'turn_end').sort((a, b) => a.seq - b.seq);
+  const last = boundaries.at(-1), prior = boundaries.at(-2);
+  const nativeReopen = !!final.providerMessageId && last?.kind === 'turn_start' && last.source === 'app' &&
+    last.turnId === final.turnId && prior?.kind === 'turn_end' && prior.turnId === final.turnId && prior.outcome === 'completed';
+  if (recent.some(event => {
+    if (event === final || workSequence(event) <= seq) return false;
+    if (event.kind === 'tool_call') {
+      if (event.time <= completedAt) return false;
+      // A public native final settles its request even when Pro delivers another
+      // connector call afterwards. Require proof recorded BEFORE that final; a new
+      // request or conflicting generation is fresh work, not a trailing result.
+      const owner = event.source === 'mcp' && event.call.attribution === 'request_id'
+        ? recordedRequestTurn(entry.summary.requestTurns, event.call.requestId, conversationId) : undefined;
+      return !(final.providerMessageId && final.state === 'final' && owner && owner.origin < seq &&
+        sameTurn(owner.turnId, final.turnId) && event.call.conversationId === conversationId &&
+        (!event.turnId || sameTurn(event.turnId, final.turnId)));
+    }
+    if (event.kind === 'turn_end') return !sameTurn(event.turnId, final.turnId) || event.outcome !== 'completed';
+    if (event.kind === 'turn_start') return !(nativeReopen && event === last);
+    if (event.kind === 'user_message') return !correction(event);
+    return event.kind === 'assistant_message' || event.kind === 'page_tool';
+  })) return null;
+  return { messageId: final.messageId, turnId: final.turnId ?? null, completedAt, contentSeq: seq, text: final.message.text };
+}
+
+/** Recorded local execution, not a native tool label or a request-id sighting alone. */
+export async function turnHasMcpCall(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  // Attribution repair appends historical calls, often without a known turn. Such a tail
+  // cannot erase earlier exact proof. Filter inside one bounded-buffer reverse scan so a
+  // missing proof does not repeatedly rescan the journal for each presentation page.
+  const calls = await readRecentEventsFromDisk(sessionId, 1, {
+    kinds: ['tool_call'], before: Number.POSITIVE_INFINITY,
+    acceptEvent: call => call.kind === 'tool_call' && call.turnId === turnId && call.source === 'mcp' &&
+      call.call?.conversationId === conversationId && call.call.attribution === 'request_id'
+  });
+  return calls.length > 0;
+}
+
+/** Exact native terminal evidence can replace a first MCP call, never ordinary silence.
+ * The latest lifecycle boundary, authored question and start must all name one current
+ * source; a stale header or a marker without a terminal reason grants nothing. */
+export async function turnHasRecoveryEvidence(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
+  if (await turnHasMcpCall(sessionId, conversationId, turnId)) return true;
+  const [boundary, question, starts, session] = await Promise.all([
+    readRecoveryBoundary(sessionId, turnId), readLatestUserMessage(sessionId),
+    readRecentEvents(sessionId, 1, { kinds: ['turn_start'] }), getSession(sessionId)
+  ]);
+  const start = starts[0];
+  return session?.conversationId === conversationId &&
+    session.origin?.kind !== 'worker' && session.origin?.kind !== 'helper' && !!question?.messageId &&
+    start?.kind === 'turn_start' && start.turnId === turnId &&
+    ((question.origin ?? question.seq) < start.seq || question.turnId === turnId) &&
+    boundary?.kind === 'turn_end' && boundary.source === 'extension' && boundary.turnId === turnId &&
+    ((boundary.outcome === 'failed' && boundary.reason === 'thinking_failed') ||
+      (boundary.outcome === 'interrupted' && boundary.reason === 'thinking_stopped'));
+}
+
+/** Late exact attribution can prove chat health without pretending historical work is new. */
+export async function conversationHasMcpCallSince(
+  sessionId: string, conversationId: string, startedAt: number, turnId: string | null
+): Promise<boolean> {
+  assertSessionId(sessionId);
+  await flushSession(sessionId);
+  const calls = await readRecentEventsFromDisk(sessionId, 1, {
+    kinds: ['tool_call'], before: Number.POSITIVE_INFINITY,
+    // Repaired calls may lack a local turn id. Exact conversation and original call
+    // time still prove attribution; an explicitly different turn does not.
+    acceptEvent: event => event.kind === 'tool_call' && event.source === 'mcp' && event.time >= startedAt &&
+      (!event.turnId || event.turnId === turnId) && event.call?.conversationId === conversationId &&
+      event.call.attribution === 'request_id'
+  });
+  return calls.length > 0;
+}
+
+async function readRecentEventsFromDisk(
+  sessionId: string,
+  limit: number,
+  options: Pick<ReadOptions, 'kinds' | 'agent'> & {
+    maxBytes?: number; before?: number; after?: number; acceptEvent?: (event: SessionEvent) => boolean; orderByOrigin?: boolean
+  } = {}
+): Promise<SessionEvent[]> {
+  const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
+  const active = open.get(sessionId);
+  const needsMessages =
+    !options.kinds || options.kinds.includes('user_message') || options.kinds.includes('assistant_message') ||
+    options.kinds.includes('native_image') || options.kinds.includes('tool_call');
+  const messages = needsMessages ? active?.messages ?? (await readCanonicalMessages(sessionId)) : new Map<string, CanonicalEvent>();
+  const canonicalKeys = new Set(messages.keys());
+  // Pre-canonical sessions could append every streaming revision of one stable website
+  // message to events.jsonl. This reader builds a *presentation* tail, so those revisions are
+  // one logical row here just as a canonical message is one row today. Because the journal is
+  // scanned newest-first, the first key seen is the latest revision; duplicates must not spend
+  // the row cap or a long old answer can hide every earlier user turn from Goal/history tails.
+  const legacyMessageKeys = new Set<string>();
+  const rawTail: SessionEvent[] = [];
+  const sequence = options.orderByOrigin ? positionOf : workSequence;
+  const forward = options.after !== undefined;
+  let replaced = 0;
+  let reachedStart = false;
+  const scanning = () => !reachedStart;
+  let damaged = 0;
+  // Explicit history navigation may seek beyond the recent-tail budget. It streams backwards
+  // in fixed chunks and retains only this page, never materializing the complete journal.
+  const readBudget = options.before === undefined && !forward ? Math.max(64 * 1024, Math.min(MAX_RECENT_READ_BYTES, options.maxBytes ?? MAX_RECENT_READ_BYTES)) : Number.POSITIVE_INFINITY;
+
+  const accept = (line: Buffer): void => {
+    if (!scanning() || line.length === 0) return;
+    if (line.length > MAX_LINE_BYTES) {
+      damaged += 1;
+      return;
+    }
+    let parsed: SessionEvent;
+    try {
+      parsed = JSON.parse(line.toString('utf8')) as SessionEvent;
+    } catch {
+      damaged += 1;
+      return;
+    }
+    if (typeof parsed?.seq !== 'number' || typeof parsed?.kind !== 'string') {
+      damaged += 1;
+      return;
+    }
+    // A late label/status revision can have an old work sequence. Filling the
+    // row cap with it is not proof that we reached the newest actual work.
+    const oldest = !forward && rawTail.length === cap
+      ? rawTail.reduce((a, b) => sequence(a) < sequence(b) ? a : b) : undefined;
+    if (oldest && parsed.seq < sequence(oldest)) { reachedStart = true; return; }
+    // Journal sequence is append ordered. Canonical revisions are joined below;
+    // crossing the forward origin boundary retires this backwards scan.
+    if (forward && parsed.seq <= options.after!) { reachedStart = true; return; }
+    if (options.before !== undefined && sequence(parsed) >= options.before) return;
+    if (forward && sequence(parsed) <= options.after!) return;
+    if (options.kinds && !options.kinds.includes(parsed.kind)) return;
+    if (options.agent && parsed.agent !== options.agent) return;
+    if (options.acceptEvent && !options.acceptEvent(parsed)) return;
+    if (messageKey(parsed)) {
+      const key = messageKey(parsed);
+      if (key) {
+        if (canonicalKeys.has(key) || legacyMessageKeys.has(key)) return;
+        legacyMessageKeys.add(key);
+      }
+    }
+    if (rawTail.length < cap) rawTail.push(parsed);
+    else if (forward) rawTail[replaced++ % cap] = parsed;
+    else if (oldest && sequence(parsed) > sequence(oldest)) rawTail[rawTail.indexOf(oldest)] = parsed;
+  };
+
+  const file = path.join(sessionDir(sessionId), 'events.jsonl');
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    handle = await fs.open(file, 'r');
+    let cursor = (await handle.stat()).size;
+    let bytes = 0;
+    let carry = Buffer.alloc(0);
+    while (cursor > 0 && scanning() && bytes < readBudget) {
+      const wanted = Math.min(64 * 1024, cursor, readBudget - bytes);
+      if (wanted <= 0) break;
+      cursor -= wanted;
+      const buffer = Buffer.allocUnsafe(wanted);
+      const { bytesRead } = await handle.read(buffer, 0, wanted, cursor);
+      const joined = Buffer.concat([buffer.subarray(0, bytesRead), carry]);
+      bytes += bytesRead;
+      const firstNewline = joined.indexOf(0x0a);
+      if (firstNewline < 0) {
+        // A corrupt/no-newline tail used to repeatedly copy the complete 8 MiB budget:
+        // 64 KiB + 128 KiB + ... . Retain only one maximum event while seeking a boundary.
+        if (joined.length > MAX_LINE_BYTES + 1) damaged += 1;
+        carry = joined.subarray(0, Math.min(joined.length, MAX_LINE_BYTES + 1));
+        continue;
+      }
+      carry = joined.subarray(0, firstNewline);
+      const complete = joined.subarray(firstNewline + 1);
+      let endAt = complete.length;
+      for (let at = complete.length - 1; at >= 0 && scanning(); at--) {
+        if (complete[at] !== 0x0a) continue;
+        const line = complete.subarray(at + 1, endAt);
+        if (line.length > 0) accept(line);
+        endAt = at;
+      }
+      if (scanning() && endAt > 0) accept(complete.subarray(0, endAt));
+    }
+    if (cursor === 0 && scanning() && carry.length > 0) accept(carry);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+
+  const candidates: SessionEvent[] = [...rawTail];
+  for (const message of messages.values()) {
+    if (options.before !== undefined && sequence(message) >= options.before) continue;
+    if (forward && sequence(message) <= options.after!) continue;
+    if (options.kinds && !options.kinds.includes(message.kind)) continue;
+    if (options.agent && message.agent !== options.agent) continue;
+    if (options.acceptEvent && !options.acceptEvent(message)) continue;
+    candidates.push(message);
+  }
+  candidates.sort((left, right) => sequence(left) - sequence(right));
+  const selected = forward ? candidates.slice(0, cap) : candidates.slice(Math.max(0, candidates.length - cap));
+  if (damaged > 0) logWarn(`session ${sessionId}: skipped ${damaged} unreadable recent event line(s)`);
+  const timeline = active?.summary ?? (await readDurableSnapshot(sessionId))?.summary;
+  return chronological(projectTimeline(selected, timeline?.timelineTurns, timeline?.requestTurns, messages.values()));
+}
+
+/** Browser projection joins committed writes without forcing the debounced metadata to disk.
+ * A cold store hydrates one bounded journal tail. Thereafter the existing append/message owners
+ * maintain it, including revisions whose origin is older than the browser cursor. */
+export async function readActivityEvents(sessionId: string, since: number, limit = 1200): Promise<{
+  events: SessionEvent[]; reset: boolean; resumeBoundary: number;
+  openingUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null;
+  resumeUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null;
+}> {
+  const entry = await ensureOpen(sessionId);
+  return enqueueSessionOperation(entry, 'activity read', async () => {
+    if (!entry.activityHydrated) {
+      const recent = await readRecentEventsFromDisk(sessionId, MAX_EVENT_TAIL);
+      entry.tail = recent.filter((event) => !(messageKey(event) && entry.messages.has(messageKey(event)!)));
+      // Old canonical messages do not prove that intervening journal rows fitted inside
+      // the byte budget. Only the retained journal suffix establishes cursor coverage.
+      entry.tailFrom = entry.tail.reduce((first, event) => Math.min(first, event.seq), entry.nextSeq);
+      entry.activityHydrated = true;
+    }
+    const cap = Math.max(1, Math.min(MAX_EVENT_TAIL, Math.floor(limit)));
+    const cursor = Number.isFinite(since) ? Math.max(0, since) : 0;
+    const candidates = [...entry.tail, ...entry.messages.values()].sort((a, b) => a.seq - b.seq);
+    const reset = cursor < entry.tailFrom && !(cursor === 0 && entry.tailFrom === 1);
+    const selected = reset || cursor === 0
+      ? candidates.slice(-cap)
+      : candidates.filter((event) => event.seq >= cursor).slice(0, cap);
+    // All canonical messages remain authoritative after tail eviction and message revision.
+    let openingUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null = null;
+    let resumeUserMessage: Extract<SessionEvent, { kind: 'user_message' }> | null = null;
+    for (const event of candidates) {
+      if (event.kind !== 'user_message') continue;
+      const position = event.origin ?? event.seq;
+      if (!openingUserMessage || position < (openingUserMessage.origin ?? openingUserMessage.seq)) openingUserMessage = event;
+      if (continuationMarkerOf(event.message.text)?.kind === 'RESUME' &&
+          (!resumeUserMessage || position > (resumeUserMessage.origin ?? resumeUserMessage.seq))) resumeUserMessage = event;
+    }
+    const resumeBoundary = resumeUserMessage ? resumeUserMessage.origin ?? resumeUserMessage.seq : 0;
+    return { events: chronological(projectTimeline(selected, entry.summary.timelineTurns, entry.summary.requestTurns, entry.messages.values())), reset: reset || (cursor === 0 && candidates.length > cap), resumeBoundary,
+      openingUserMessage, resumeUserMessage };
+  });
+}
+
+/**
+ * Reads one exact tool record that the browser's bounded activity projection has already
+ * hydrated. This is deliberately not a history lookup: opening a disclosure must never open a
+ * session, scan its journal, or resolve an overflow asset independently of `/activity`.
+ */
+export async function readHydratedActivityCall(
+  sessionId: string,
+  conversationId: string,
+  callId: string,
+  detailRevision: number
+): Promise<Extract<SessionEvent, { kind: 'tool_call' }> | null> {
+  const entry = open.get(sessionId);
+  if (!entry || !entry.activityHydrated || entry.summary.conversationId !== conversationId) return null;
+  return enqueueSessionOperation(entry, 'activity call detail', async () => {
+    // The entry may have been closed/replaced while this read waited behind an accepted write.
+    if (open.get(sessionId) !== entry || !entry.activityHydrated || entry.summary.conversationId !== conversationId) return null;
+    const exact = (event: SessionEvent | undefined): event is Extract<SessionEvent, { kind: 'tool_call' }> =>
+      event?.kind === 'tool_call' &&
+      event.seq === detailRevision &&
+      event.call.callId === callId &&
+      event.call.conversationId === conversationId;
+
+    // Canonical background-process revisions supersede every ordinary copy. A stale requested
+    // revision therefore fails closed here instead of falling back to the launch in `tail`.
+    const canonical = entry.messages.get(`tool_call\u0000${callId}`);
+    if (canonical) return exact(canonical) ? canonical : null;
+
+    // `tail` is already the bounded in-memory suffix owned by readActivityEvents(). Its public
+    // ordering is chronology/origin based, so choose the greatest canonical revision explicitly.
+    const newest = entry.tail.reduce<Extract<SessionEvent, { kind: 'tool_call' }> | null>((held, event) =>
+      event.kind === 'tool_call' && event.call.callId === callId && (!held || event.seq > held.seq) ? event : held, null);
+    return newest && exact(newest) ? newest : null;
+  });
+}
+
+/**
+ * Atomically keeps only the supplied tool calls in an Unattributed activity session.
+ *
+ * This is deliberately not a general history editor. 1.8.2 uses it for one deterministic
+ * migration: calls whose exact request-id owner is now known are copied to that owner's
+ * session, then removed from the legacy Unattributed bucket. Unknown calls remain under the
+ * same local session id. Re-sequencing is safe here because this bucket has no ChatGPT
+ * conversation, canonical messages, or turn lifecycle: it is only a holding area for calls.
+ */
+export async function rewriteUnattributedToolCalls(
+  sessionId: string,
+  calls: readonly Extract<SessionEvent, { kind: 'tool_call' }>[],
+  scannedThroughSeq: number,
+  deleteEmpty = false
+): Promise<{ retained: number; deleted: boolean }> {
+  assertSessionId(sessionId);
+  const entry = await ensureOpen(sessionId);
+  const rewrite = entry.queue.then(async () => {
+    if (entry.summary.conversationId !== null || entry.summary.title !== 'Unattributed activity') {
+      throw new Error(`Session ${sessionId} is not an Unattributed activity bucket`);
+    }
+
+    // `calls` is the repairer's snapshot of rows that were still unattributed. New MCP calls can
+    // append to this same holding bucket while the repair is pre-copying assets/destinations. The
+    // session queue orders those appends before this rewrite, but blindly writing only the old
+    // snapshot would then erase them. Read the now-serialized journal and retain every tool call
+    // that appeared after the snapshot's high-water seq. Appends that arrive after this operation
+    // has been queued naturally run after the rewrite and receive fresh sequence numbers.
+    const concurrentCalls: Extract<SessionEvent, { kind: 'tool_call' }>[] = [];
+    try {
+      const raw = await fs.readFile(path.join(sessionDir(sessionId), 'events.jsonl'), 'utf8');
+      for (const line of raw.split('\n')) {
+        if (!line.trim()) continue;
+        try {
+          const event = JSON.parse(line) as SessionEvent;
+          if (event.kind === 'tool_call' && event.seq > scannedThroughSeq) concurrentCalls.push(event);
+        } catch {
+          // Legacy damaged rows were already excluded by the deterministic repair snapshot. The
+          // general reader reports those separately; do not make this narrowly-scoped migration
+          // fail after all destination copies succeeded because of an unrelated torn legacy line.
+        }
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+
+    const start: SessionEvent = {
+      seq: 1,
+      time: entry.summary.startedAt,
+      source: 'app',
+      kind: 'session_start',
+      conversationId: null,
+      title: entry.summary.title
+    };
+    const retainedCalls = [...calls, ...concurrentCalls].sort((left, right) => left.seq - right.seq);
+    // Only the recorder can prove this is not its writable bucket: a live call may hold
+    // that bucket's id while preparing assets outside this queue. For inactive history,
+    // the empty check and deletion share the same queue operation as concurrent-row capture.
+    if (deleteEmpty && retainedCalls.length === 0 && entry.queue === settled) {
+      if (entry.metaTimer) clearTimeout(entry.metaTimer);
+      await fs.rm(sessionDir(sessionId), { recursive: true, force: true });
+      if (open.get(sessionId) === entry) open.delete(sessionId);
+      invalidateAssetUsage(sessionId);
+      publishAttachmentRemoval(sessionId);
+      return { retained: 0, deleted: true };
+    }
+    const kept: SessionEvent[] = [start, ...retainedCalls.map((event, index) => ({ ...event, seq: index + 2 }))];
+
+    const target = path.join(sessionDir(sessionId), 'events.jsonl');
+    const tmp = `${target}.repair-${process.pid}-${Date.now()}.tmp`;
+    await fs.writeFile(tmp, kept.map((event) => `${JSON.stringify(event)}\n`).join(''), 'utf8');
+    await fs.rename(tmp, target);
+
+    const staged: SessionSummary = {
+      ...entry.summary,
+      updatedAt: entry.summary.startedAt,
+      events: 0,
+      requestTurns: {},
+      userMessages: 0,
+      toolCalls: 0,
+      lastToolCallAt: null,
+      lastAssistantFinalAt: null,
+      lastTurnEndAt: null,
+      lastFinishReportAt: null,
+      processExitNonzero: 0,
+      toolRejected: 0,
+      toolInternalErrors: 0,
+      errors: 0,
+      estimatedTokens: 0,
+      contextTokens: 0,
+      lastHandoffId: null,
+      lastHandoffAt: null,
+      lastCommittedResumeHandoffId: null,
+      lastTurnOutcome: null,
+      agents: []
+    };
+    for (const event of kept) applyToSummary(staged, event);
+    const rewrittenHistorySeq = kept.at(-1)?.seq ?? 0;
+    await writeSummary(staged, rewrittenHistorySeq);
+
+    Object.assign(entry.summary, staged);
+    entry.nextSeq = kept.length + 1;
+    entry.historySeq = rewrittenHistorySeq;
+    entry.tail = kept.slice(-MAX_EVENT_TAIL);
+    entry.tailFrom = entry.tail[0]?.seq ?? entry.nextSeq;
+    entry.activityHydrated = true;
+    entry.metaDirty = false;
+    return { retained: retainedCalls.length, deleted: false };
+  });
+  const settled = rewrite.then(
+    () => undefined,
+    (err: Error) => logError(`session unattributed repair failed: ${err.message}`)
+  );
+  entry.queue = settled;
+  return rewrite;
+}
+
+function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
+  try {
+    const parsed = JSON.parse(raw) as PersistedSummary;
+    if (parsed?.id !== id) return null;
+    const historySeq =
+      Number.isSafeInteger(parsed[META_HISTORY_SEQ]) && (parsed[META_HISTORY_SEQ] as number) >= 0
+        ? (parsed[META_HISTORY_SEQ] as number)
+        : null;
+    const { [META_HISTORY_SEQ]: _historySeq, [META_CANONICAL_PROJECTION]: canonicalProjection, [META_TOKEN_ESTIMATE]: tokenEstimate, ...publicFields } = parsed;
+    const publicSummary = publicFields as SessionSummary;
+    if (publicSummary.retiredChatAt !== undefined) {
+      const retired = publicSummary.retiredChatAt;
+      publicSummary.retiredChatAt = retired && typeof retired === 'object' && !Array.isArray(retired)
+        ? Object.fromEntries(Object.entries(retired).filter(([chat, at]) =>
+          Array.isArray(publicSummary.chatIds) && publicSummary.chatIds.includes(chat) &&
+          chat !== publicSummary.conversationId && typeof at === 'number' && Number.isFinite(at) && at >= 0))
+        : {};
+    }
+    if (publicSummary.titleSource !== undefined && !['fallback', 'provider', 'manual'].includes(publicSummary.titleSource)) delete publicSummary.titleSource;
+    const selected = publicSummary.selectedModel;
+    if (selected !== undefined && (!selected || typeof selected !== 'object' ||
+        typeof selected.conversationId !== 'string' || typeof selected.model !== 'string' ||
+        !/^[a-zA-Z0-9 ._-]{1,80}$/.test(selected.model) || !Number.isFinite(selected.observedAt))) {
+      delete publicSummary.selectedModel;
+    }
+    const finish = publicSummary.finishTurn;
+    if (finish !== undefined && finish !== null && (!finish || typeof finish !== 'object' ||
+        typeof finish.turnId !== 'string' || !Number.isFinite(finish.startedAt) ||
+        typeof finish.notified !== 'boolean' || typeof finish.released !== 'boolean' ||
+        !Number.isSafeInteger(finish.workSeq) || finish.workSeq < 0 || !Number.isSafeInteger(finish.decisionSeq) || finish.decisionSeq < 0 ||
+        !(finish.decisionInputRevision === null || (typeof finish.decisionInputRevision === 'string' && /^[a-f0-9]{64}$/.test(finish.decisionInputRevision))) ||
+        !(finish.conversationId === null || typeof finish.conversationId === 'string') ||
+        !(finish.decisionRevision === null || /^[a-f0-9]{64}$/.test(finish.decisionRevision)))) delete publicSummary.finishTurn;
+
+    // A meta.json written before agents, app-opened chats or the session lineage existed
+    // has no such field. A session recorded before the lineage was a single chat by
+    // definition, and everything it holds was in that chat's context, so both defaults are
+    // the truth rather than a placeholder.
+    const outcomeCountersMissing =
+      typeof publicSummary.processExitNonzero !== 'number' ||
+      typeof publicSummary.toolRejected !== 'number' ||
+      typeof publicSummary.toolInternalErrors !== 'number';
+    const activityBoundaryMissing = !Object.prototype.hasOwnProperty.call(publicSummary, 'lastAssistantFinalAt');
+    return {
+      historySeq,
+      canonicalProjectionCurrent: canonicalProjection === 1,
+      tokenEstimateCurrent: tokenEstimate === 1,
+      outcomeCountersMissing,
+      activityBoundaryMissing,
+      summary: {
+        ...publicSummary,
+        // A missing legacy epoch predates any fenced continuation from this version.
+        bindingEpoch: Number.isSafeInteger(publicSummary.bindingEpoch) && publicSummary.bindingEpoch! >= 0
+          ? publicSummary.bindingEpoch : 0,
+        // Keep in-place increments numeric until the forced rebuild supplies the real values.
+        processExitNonzero: publicSummary.processExitNonzero ?? 0,
+        toolRejected: publicSummary.toolRejected ?? 0,
+        toolInternalErrors: publicSummary.toolInternalErrors ?? 0,
+        // A two-minute display clock is not worth replaying every legacy session during the
+        // attachment-catalog scan. The next real tool call sets the exact value immediately.
+        lastToolCallAt:
+          typeof publicSummary.lastToolCallAt === 'number' && Number.isFinite(publicSummary.lastToolCallAt)
+            ? publicSummary.lastToolCallAt
+            : null,
+        lastAssistantFinalAt:
+          typeof publicSummary.lastAssistantFinalAt === 'number' && Number.isFinite(publicSummary.lastAssistantFinalAt)
+            ? publicSummary.lastAssistantFinalAt
+            : null,
+        lastTurnEndAt:
+          typeof publicSummary.lastTurnEndAt === 'number' && Number.isFinite(publicSummary.lastTurnEndAt)
+            ? publicSummary.lastTurnEndAt
+            : null,
+        lastFinishReportAt:
+          typeof publicSummary.lastFinishReportAt === 'number' && Number.isFinite(publicSummary.lastFinishReportAt)
+            ? publicSummary.lastFinishReportAt
+            : null,
+        agents: Array.isArray(publicSummary.agents) ? publicSummary.agents : [],
+        origin: publicSummary.origin ?? null,
+        chatIds: Array.isArray(publicSummary.chatIds)
+          ? publicSummary.chatIds
+          : publicSummary.conversationId
+            ? [publicSummary.conversationId]
+            : [],
+        contextTokens:
+          typeof publicSummary.contextTokens === 'number' ? publicSummary.contextTokens : publicSummary.estimatedTokens,
+        // Older summaries predate successful-resume provenance. Missing means unknown, never
+        // "use lastHandoffId": capture publication happens before the continuation rebind.
+        lastCommittedResumeHandoffId:
+          typeof publicSummary.lastCommittedResumeHandoffId === 'string' &&
+          /^[0-9a-z-]{8,64}$/i.test(publicSummary.lastCommittedResumeHandoffId)
+            ? publicSummary.lastCommittedResumeHandoffId
+            : null
+      }
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function readMetaCheckpoint(id: string): Promise<MetaCheckpoint | null> {
+  const dir = sessionDir(id);
+  try {
+    const primary = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.json'), 'utf8'));
+    if (primary) return primary;
+  } catch {
+    // Try the last validated checkpoint below.
+  }
+  try {
+    const backup = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.backup.json'), 'utf8'));
+    if (backup) {
+      logWarn(`session ${id}: primary meta.json unreadable; using the last validated checkpoint`);
+      return backup;
+    }
+  } catch {
+    // No recovery checkpoint.
+  }
+  logWarn(`session ${id}: no valid metadata projection; refusing to treat it as an empty session`);
+  return null;
+}
+
+async function readMeta(id: string): Promise<SessionSummary | null> {
+  return (await readMetaCheckpoint(id))?.summary ?? null;
+}
+
+/**
+ * A cold sidebar needs metadata, not every retained message body. A validated modern
+ * checkpoint can prove that its projection follows all history writes: the journal and
+ * legacy map are files, while canonical shards are replaced by rename, which changes
+ * their directory's timestamp. Read the checkpoint timestamp BEFORE its contents so a
+ * concurrent atomic metadata replacement can only make this test conservative.
+ *
+ * Equal clocks, old schemas, unreadable metadata and any newer history keep the existing
+ * full recovery path. No guessed summary is allowed to suppress crash reconciliation.
+ */
+async function readCatalogSummary(id: string): Promise<SessionSummary | null> {
+  const dir = sessionDir(id);
+  try {
+    const metadata = await fs.stat(path.join(dir, 'meta.json'));
+    const checkpoint = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.json'), 'utf8'));
+    if (checkpoint && checkpoint.historySeq !== null && checkpoint.canonicalProjectionCurrent && checkpoint.tokenEstimateCurrent &&
+        !checkpoint.outcomeCountersMissing && !checkpoint.activityBoundaryMissing && checkpoint.summary.finishTurn !== undefined && !legacyContextTitle(checkpoint.summary)) {
+      const mutations = await Promise.all(['events.jsonl', 'messages.json', 'messages'].map(async name => {
+        try { return (await fs.stat(path.join(dir, name))).mtimeMs; }
+        catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0; throw error; }
+      }));
+      if (metadata.mtimeMs > 0 && mutations.every(at => at < metadata.mtimeMs)) return checkpoint.summary;
+    }
+  } catch { /* Existing full reconstruction owns missing/corrupt/uncertain checkpoints. */ }
+  return (await readDurableSnapshot(id))?.summary ?? null;
+}
+
+function addAttachment(map: Map<string, Set<string>>, conversationId: string, sessionId: string): void {
+  if (!conversationId) return;
+  const ids = map.get(conversationId) ?? new Set<string>();
+  ids.add(sessionId);
+  map.set(conversationId, ids);
+}
+
+function removeAttachment(map: Map<string, Set<string>>, conversationId: string, sessionId: string): void {
+  if (!conversationId) return;
+  const ids = map.get(conversationId);
+  if (!ids) return;
+  ids.delete(sessionId);
+  if (ids.size === 0) map.delete(conversationId);
+}
+
+function indexSummary(catalog: AttachmentCatalog, summary: SessionSummary): void {
+  catalog.summaries.set(summary.id, { ...summary, chatIds: [...summary.chatIds], agents: [...summary.agents] });
+  if (summary.conversationId) addAttachment(catalog.current, summary.conversationId, summary.id);
+  for (const chatId of summary.chatIds) addAttachment(catalog.historical, chatId, summary.id);
+}
+
+function unindexSummary(catalog: AttachmentCatalog, summary: SessionSummary): void {
+  catalog.summaries.delete(summary.id);
+  const orderedAt = catalog.orderedIds.indexOf(summary.id);
+  if (orderedAt >= 0) catalog.orderedIds.splice(orderedAt, 1);
+  if (summary.conversationId) removeAttachment(catalog.current, summary.conversationId, summary.id);
+  for (const chatId of summary.chatIds) removeAttachment(catalog.historical, chatId, summary.id);
+}
+
+function insertSummaryOrder(catalog: AttachmentCatalog, summary: SessionSummary): void {
+  let low = 0;
+  let high = catalog.orderedIds.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const other = catalog.summaries.get(catalog.orderedIds[middle]!);
+    if (!other || compareSummariesNewestFirst(summary, other) < 0) high = middle;
+    else low = middle + 1;
+  }
+  catalog.orderedIds.splice(low, 0, summary.id);
+}
+
+/** Refreshes only the summary projection; attachment ownership is unchanged. */
+function publishCachedSummary(summary: SessionSummary, reorder: boolean): void {
+  const catalog = attachmentCatalog;
+  if (!catalog) return;
+  const clone = { ...summary, chatIds: [...summary.chatIds], agents: [...summary.agents] };
+  catalog.summaries.set(summary.id, clone);
+  if (!reorder) return;
+  const orderedAt = catalog.orderedIds.indexOf(summary.id);
+  if (orderedAt >= 0) catalog.orderedIds.splice(orderedAt, 1);
+  insertSummaryOrder(catalog, clone);
+}
+
+/** Update the derived index only after an attachment mutation is durable. */
+function publishAttachmentSummary(summary: SessionSummary): void {
+  attachmentEpoch += 1;
+  missingCurrentConversations.delete(summary.conversationId ?? '');
+  const catalog = attachmentCatalog;
+  if (!catalog) return;
+  const previous = catalog.summaries.get(summary.id);
+  if (previous) unindexSummary(catalog, previous);
+  indexSummary(catalog, summary);
+  insertSummaryOrder(catalog, catalog.summaries.get(summary.id)!);
+}
+
+/** Remove one durable session from the derived ownership index. */
+function publishAttachmentRemoval(sessionId: string): void {
+  attachmentEpoch += 1;
+  const catalog = attachmentCatalog;
+  if (!catalog) return;
+  const previous = catalog.summaries.get(sessionId);
+  if (previous) unindexSummary(catalog, previous);
+}
+
+/** A closing live session must become the durable ordered row before its live overlay vanishes. */
+function publishClosedSummary(summary: SessionSummary): void {
+  // If the first catalog pass already read this row before close, force that in-flight snapshot
+  // to retry. Once a catalog exists, this is just one binary-positioned row update.
+  attachmentEpoch += 1;
+  publishCachedSummary(summary, true);
+}
+
+function newAttachmentCatalog(): AttachmentCatalog {
+  return { summaries: new Map(), orderedIds: [], current: new Map(), historical: new Map() };
+}
+
+/**
+ * Builds the identity catalog from every valid session metadata folder, without the UI's
+ * 5,000-session cap. If create/rebind/delete lands while the pass is reading disk, its epoch
+ * change invalidates the pass and it is repeated, so a completed catalog is never a snapshot
+ * that silently predates a concurrent ownership mutation.
+ */
+async function ensureAttachmentCatalog(): Promise<AttachmentCatalog> {
+  if (attachmentCatalog) return attachmentCatalog;
+  if (attachmentCatalogLoading) return attachmentCatalogLoading;
+  const loading = (async () => {
+    const startedAt = Date.now();
+    for (;;) {
+      assertReady();
+      const epoch = attachmentEpoch;
+      let names: string[];
+      try {
+        names = await fs.readdir(root);
+      } catch (error) {
+        // A fresh install legitimately has no sessions directory yet. Any other failure is not
+        // evidence that the durable catalog is empty. Caching EBUSY/EACCES/IO errors here poisons
+        // every ownership, retention and latest-handoff lookup for the rest of the process.
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') names = [];
+        else throw error;
+      }
+      const catalog = newAttachmentCatalog();
+      const candidates = names.filter((name) => /^[0-9a-z-]{8,64}$/i.test(name));
+      for (let offset = 0; offset < candidates.length; offset += ATTACHMENT_CATALOG_READ_CONCURRENCY) {
+        const summaries = await Promise.all(
+          candidates.slice(offset, offset + ATTACHMENT_CATALOG_READ_CONCURRENCY).map(async (name) => {
+            const live = open.get(name);
+            return live?.summary ?? await readCatalogSummary(name).catch(() => null);
+          })
+        );
+        for (const summary of summaries) if (summary) indexSummary(catalog, summary);
+      }
+      catalog.orderedIds = [...catalog.summaries.values()]
+        .sort(compareSummariesNewestFirst)
+        .map((summary) => summary.id);
+      if (attachmentEpoch !== epoch) continue;
+      attachmentCatalog = catalog;
+      logInfo(`session catalog ready: ${catalog.summaries.size} sessions in ${Date.now() - startedAt} ms`);
+      return catalog;
+    }
+  })();
+  attachmentCatalogLoading = loading;
+  try {
+    return await loading;
+  } finally {
+    if (attachmentCatalogLoading === loading) attachmentCatalogLoading = null;
+  }
+}
+
+/**
+ * Every readable session, newest first. Live summaries win over what is on disk.
+ *
+ * Legacy/model-facing bounded list. Do not use this for correctness properties that promise
+ * to see every retained session; identity, latest-handoff recovery and retention use the
+ * uncapped process catalog instead.
+ */
+async function readAllSummaries(): Promise<SessionSummary[]> {
+  assertReady();
+  let names: string[];
+  try {
+    names = await fs.readdir(root);
+  } catch {
+    return [];
+  }
+  const summaries: SessionSummary[] = [];
+  const candidates = names.filter(name => /^[0-9a-z-]{8,64}$/i.test(name));
+  if (candidates.length > MAX_SCANNED_SESSIONS)
+    logWarn(`session store: more than ${MAX_SCANNED_SESSIONS} session folders; older ones were not scanned`);
+  for (let offset = 0; offset < Math.min(candidates.length, MAX_SCANNED_SESSIONS); offset += ATTACHMENT_CATALOG_READ_CONCURRENCY) {
+    const rows = await Promise.all(candidates.slice(offset, Math.min(offset + ATTACHMENT_CATALOG_READ_CONCURRENCY, MAX_SCANNED_SESSIONS))
+      .map(async name => open.get(name)?.summary ?? await readMeta(name)));
+    for (const summary of rows) if (summary) summaries.push({ ...summary });
+  }
+  summaries.sort((a, b) => b.updatedAt - a.updatedAt);
+  return summaries;
+}
+
+/**
+ * Every valid session summary, with no maintenance/UI scan cap.
+ *
+ * Most callers deliberately stop after 5,000 folders so a pathological history cannot make a
+ * routine UI refresh unbounded. `latestHandoff()` is different: its answer is a recovery
+ * authority. Missing the newest resumable handoff because `readdir()` happened to return that
+ * folder after an arbitrary cap can resume the wrong work. Keep the expensive path explicit
+ * and use it only where "every session" is part of the contract.
+ */
+async function readEverySummary(): Promise<SessionSummary[]> {
+  const catalog = await ensureAttachmentCatalog();
+  const summaries = new Map<string, SessionSummary>();
+  for (const summary of catalog.summaries.values()) summaries.set(summary.id, summary);
+  // Live projections are authoritative between debounced meta writes.
+  for (const entry of open.values()) summaries.set(entry.summary.id, entry.summary);
+  return [...summaries.values()].map((summary) => ({ ...summary })).sort(compareSummariesNewestFirst);
+}
+
+export interface SessionListCursor {
+  updatedAt: number;
+  id: string;
+}
+
+export interface SessionPage {
+  sessions: SessionSummary[];
+  total: number;
+  nextCursor: SessionListCursor | null;
+}
+
+function compareSummariesNewestFirst(left: SessionSummary, right: SessionSummary): number {
+  if (right.updatedAt !== left.updatedAt) return right.updatedAt - left.updatedAt;
+  if (left.id === right.id) return 0;
+  return left.id < right.id ? 1 : -1;
+}
+
+function comesAfterCursor(summary: SessionSummary, cursor: SessionListCursor): boolean {
+  return summary.updatedAt < cursor.updatedAt || (summary.updatedAt === cursor.updatedAt && summary.id < cursor.id);
+}
+
+/**
+ * One bounded UI page from a process-lifetime summary index.
+ *
+ * The first call pays the one metadata discovery pass that identity already needs. Every hot
+ * refresh after that is memory-only in the number of retained summaries plus the tiny live
+ * overlay; no coalesced recorder tick rereads thousands of meta.json files. The cursor is the
+ * last visible sort key rather than an offset, so a live session moving to the front cannot make
+ * history pagination duplicate/skip the boundary it already crossed.
+ */
+export async function listSessionPage(options: {
+  limit?: number;
+  cursor?: SessionListCursor;
+} = {}): Promise<SessionPage> {
+  const catalog = await ensureAttachmentCatalog();
+  const limit = Math.max(1, Math.min(MAX_LISTED_SESSIONS, Math.floor(options.limit ?? MAX_LISTED_SESSIONS)));
+  const openIds = new Set(open.keys());
+  const candidates: SessionSummary[] = [];
+
+  // Open summaries are authoritative between debounced metadata writes. There are normally one
+  // or a handful, so overlay them explicitly instead of rebuilding/sorting every retained row.
+  for (const entry of open.values()) {
+    if (entry.summary.origin?.kind === 'helper') continue;
+    if (options.cursor && !comesAfterCursor(entry.summary, options.cursor)) continue;
+    candidates.push({ ...entry.summary, chatIds: [...entry.summary.chatIds], agents: [...entry.summary.agents] });
+  }
+
+  // The durable order is already maintained incrementally. Collect only one page plus one
+  // sentinel; a hot first-page refresh therefore stays O(page + open sessions), even with
+  // thousands of retained sessions. Deep pages scan to their cursor only when the user asks.
+  let durableEligible = 0;
+  let durableHasMore = false;
+  for (const id of catalog.orderedIds) {
+    if (openIds.has(id)) continue;
+    const summary = catalog.summaries.get(id);
+    if (!summary || summary.origin?.kind === 'helper' || (options.cursor && !comesAfterCursor(summary, options.cursor))) continue;
+    if (durableEligible > limit) {
+      durableHasMore = true;
+      break;
+    }
+    candidates.push({ ...summary, chatIds: [...summary.chatIds], agents: [...summary.agents] });
+    durableEligible += 1;
+  }
+
+  candidates.sort(compareSummariesNewestFirst);
+  const sessions = candidates.slice(0, limit);
+  const last = sessions.at(-1);
+  const hasMore = durableHasMore || candidates.length > sessions.length;
+  const nextCursor = hasMore && last ? { updatedAt: last.updatedAt, id: last.id } : null;
+  let total = 0;
+  for (const summary of catalog.summaries.values()) {
+    if (!openIds.has(summary.id) && summary.origin?.kind !== 'helper') total += 1;
+  }
+  for (const entry of open.values()) if (entry.summary.origin?.kind !== 'helper') total += 1;
+  return { sessions, total, nextCursor };
+}
+
+/** Newest first, capped for older internal/UI callers. */
+export async function listSessions(): Promise<SessionSummary[]> {
+  return (await listSessionPage({ limit: MAX_LISTED_SESSIONS })).sessions;
+}
+
+/** Full bounded compatibility/model-facing view. Never use it for retention or identity. */
+/** Usage shares the live metadata index; it must not reopen every meta.json per visit. */
+export async function listUsageSessions(): Promise<SessionSummary[]> {
+  return readEverySummary();
+}
+
+export async function listAllSessions(): Promise<SessionSummary[]> {
+  return readAllSummaries();
+}
+
+/** Uncapped authoritative catalog plus live projections, without reopening every metadata file. */
+export async function indexedSessions(): Promise<SessionSummary[]> {
+  return readEverySummary();
+}
+
+/**
+ * Finds the durable session that owns one ChatGPT conversation id.
+ *
+ * `listSessions()` is intentionally capped for the UI and therefore must never be used as an
+ * ownership index: once a chat falls outside the UI's current display cap, doing so silently turns "not in
+ * the list" into "never existed" and can fork a second session for the same conversation.
+ *
+ * Page/browser reopen paths use the default current-only lookup. A proven late MCP request may
+ * opt into `includeHistorical` so a conversation that was superseded by Compact & Resume still
+ * resolves to the durable session whose `chatIds` lineage contains it. Ambiguity fails closed.
+ */
+export async function findSessionByConversation(
+  conversationId: string,
+  options: { includeHistorical?: boolean; requireUnique?: boolean } = {}
+): Promise<SessionSummary | null> {
+  if (!conversationId) return null;
+  if (options.includeHistorical !== true && missingCurrentConversations.has(conversationId)) return null;
+  const catalog = await ensureAttachmentCatalog();
+  const currentIds = new Set(catalog.current.get(conversationId) ?? []);
+  // A create is deliberately visible to this process from the moment its live entry exists.
+  // That prevents a concurrent recorder batch from manufacturing a second session while the
+  // first session's initial files are still being written. Rebinds never expose B here early:
+  // they mutate the live summary only after durable meta says B.
+  for (const [id, entry] of open) {
+    if (entry.summary.conversationId === conversationId) currentIds.add(id);
+  }
+  const current = (
+    await Promise.all(
+      [...currentIds].map((id) => getSession(id).catch(() => null))
+    )
+  )
+    .filter((summary): summary is SessionSummary => summary?.conversationId === conversationId)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  if (current.length === 1) return current[0] ?? null;
+  if (current.length > 1) {
+    if (options.requireUnique === true) {
+      logWarn(`session store: conversation ${conversationId} is current on ${current.length} sessions; refusing safety-sensitive lookup`);
+      return null;
+    }
+    // Browser/page reopen semantics historically used the newest current session. Keep that
+    // deterministic choice rather than manufacturing a third session. Safety-sensitive
+    // callers (orphan retirement) opt into requireUnique above.
+    return current[0] ?? null;
+  }
+  if (options.includeHistorical !== true) {
+    rememberMissingCurrentConversation(conversationId);
+    return null;
+  }
+  const historicalIds = new Set(catalog.historical.get(conversationId) ?? []);
+  for (const [id, entry] of open) {
+    if (entry.summary.chatIds.includes(conversationId)) historicalIds.add(id);
+  }
+  const historical = (
+    await Promise.all(
+      [...historicalIds].map((id) => getSession(id).catch(() => null))
+    )
+  )
+    .filter((summary): summary is SessionSummary => summary?.chatIds.includes(conversationId) === true)
+    .sort((a, b) => b.updatedAt - a.updatedAt);
+  if (historical.length === 1) return historical[0] ?? null;
+  if (historical.length > 1) {
+    logWarn(`session store: conversation ${conversationId} appears in ${historical.length} session lineages; refusing to guess`);
+  }
+  return null;
+}
+
+/**
+ * Has this ChatGPT conversation already been replaced inside any durable session lineage?
+ *
+ * This is intentionally independent of current attachment. Opening an old source chat after
+ * Compact & Resume may create a new recording epoch for genuinely new user activity there, but
+ * it must never restore automation authority that the successful A->B handoff retired. The
+ * lineage is the durable fact: if any retained session contains A while being attached to a
+ * different conversation, A is historical for browser recovery, Goal and Loop forever.
+ */
+export async function conversationWasSuperseded(conversationId: string): Promise<boolean> {
+  if (!conversationId) return false;
+  const catalog = await ensureAttachmentCatalog();
+  const sessionIds = new Set(catalog.historical.get(conversationId) ?? []);
+  for (const [id, entry] of open) {
+    if (entry.summary.chatIds.includes(conversationId)) sessionIds.add(id);
+  }
+  for (const id of sessionIds) {
+    const summary = open.get(id)?.summary ?? catalog.summaries.get(id) ?? null;
+    if (summary?.chatIds.includes(conversationId) && summary.conversationId !== conversationId) return true;
+  }
+  return false;
+}
+
+/**
+ * Whether one ChatGPT frontend is still the session's executable attachment.
+ *
+ * Historical `chatIds` are transcript lineage, not continuing authority. Compact & Resume
+ * deliberately keeps A there so old messages remain readable, while `conversationId` moves to
+ * B. Every caller that has to decide whether new work from A is still admissible uses this one
+ * store-owned verdict rather than reinterpreting lineage for itself.
+ */
+export async function conversationAttachment(
+  conversationId: string,
+  sessionId: string | null = null
+): Promise<'current' | 'superseded' | 'unknown'> {
+  if (!conversationId) return 'unknown';
+  if (sessionId) {
+    const exact = await getSession(sessionId);
+    if (!exact || !exact.chatIds.includes(conversationId)) return 'unknown';
+    return exact.conversationId === conversationId ? 'current' : 'superseded';
+  }
+  const current = await findSessionByConversation(conversationId, { requireUnique: true });
+  if (current) return 'current';
+  return (await conversationWasSuperseded(conversationId)) ? 'superseded' : 'unknown';
+}
+
+/**
+ * Filesystem time of the newest durable mutation belonging to a session.
+ *
+ * Session event timestamps describe when an action happened, not when it finally reached
+ * disk. A five-minute MCP call therefore appends today with a `startedAt` from five minutes
+ * ago. Stale/orphan cleanup must not look only at that semantic clock and immediately retire
+ * work that was just written. The max mtime of the three mutable session projections is the
+ * durable inactivity clock it needs.
+ */
+export async function sessionDurableModifiedAt(id: string): Promise<number | null> {
+  assertSessionId(id);
+  let newest = 0;
+  for (const name of ['events.jsonl', 'messages.json', 'messages', 'meta.json']) {
+    try {
+      const stat = await fs.stat(path.join(sessionDir(id), name));
+      newest = Math.max(newest, stat.mtimeMs);
+    } catch {
+      // A session can legitimately predate messages.json or have no structured events yet.
+    }
+  }
+  return newest > 0 ? newest : null;
+}
+
+export async function getSession(id: string): Promise<SessionSummary | null> {
+  assertSessionId(id);
+  const summary = await readAuthoritativeSummary(id);
+  return summary ? { ...summary } : null;
+}
+
+/** Positive absence for retiring an exact delivered receipt, never corrupt metadata. */
+export async function sessionDirectoryMissing(id: string): Promise<boolean> {
+  assertSessionId(id);
+  const dir = sessionDir(id);
+  if (open.has(id) || opening.has(id)) return false;
+  try {
+    await fs.lstat(dir);
+    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return false;
+  }
+  // An unavailable history root is not evidence that the user removed this session.
+  try {
+    return (await fs.stat(root)).isDirectory() && !open.has(id) && !opening.has(id);
+  } catch { return false; }
+}
+
+/** A plan is one replaceable session document, not another execution queue. */
+async function readPlanFile(id: string): Promise<AgentPlan | null> {
+  let handle;
+  try {
+    handle = await fs.open(path.join(sessionDir(id), 'plan.json'), 'r');
+    const buffer = Buffer.alloc(MAX_AGENT_PLAN_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > MAX_AGENT_PLAN_BYTES) return null;
+    const parsed = agentPlanSchema.safeParse(JSON.parse(buffer.toString('utf8', 0, bytesRead)));
+    return parsed.success ? parsed.data : null;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT' || error instanceof SyntaxError) return null;
+    throw error;
+  } finally {
+    await handle?.close();
+  }
+}
+
+export async function readSessionPlan(id: string): Promise<AgentPlan | null> {
+  assertSessionId(id);
+  await open.get(id)?.queue;
+  return readPlanFile(id);
+}
+
+export async function updateSessionPlan(
+  id: string, conversationId: string, input: AgentPlanUpdate, startedAt: number,
+  recovery?: { storedAt: number }
+): Promise<boolean> {
+  const plan = agentPlanSchema.parse({ ...agentPlanUpdateSchema.parse(input), updatedAt: startedAt });
+  const bytes = JSON.stringify(plan);
+  if (Buffer.byteLength(bytes) > MAX_AGENT_PLAN_BYTES) throw new Error('Plan exceeds its storage budget');
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'plan', async () => {
+    // Rebind and plan updates use this same queue. A delayed A call cannot overwrite
+    // B's plan after Compact & Resume, even if A was current when the tool started.
+    if (entry.summary.conversationId !== conversationId) {
+      const retiredAt = entry.summary.retiredChatAt?.[conversationId];
+      if (!recovery || !entry.summary.conversationId || !entry.summary.chatIds.includes(conversationId) ||
+        typeof retiredAt !== 'number' || !Number.isFinite(recovery.storedAt) || recovery.storedAt < 0 ||
+        Math.max(startedAt, recovery.storedAt) >= retiredAt) return false;
+    }
+    const previous = await readPlanFile(id);
+    if (previous && previous.updatedAt > startedAt) return false;
+    const target = path.join(sessionDir(id), 'plan.json');
+    const temporary = `${target}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, bytes, 'utf8');
+      await fs.rename(temporary, target);
+    } finally {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+    }
+    return true;
+  });
+}
+
+export async function endSession(id: string, dismissBrowserRecovery = false, expectedConversationId?: string): Promise<void> {
+  const entry = dismissBrowserRecovery ? await ensureOpen(id) : open.get(id);
+  if (!entry) return;
+  const ended = await enqueueSessionOperation(entry, 'end', async () => {
+    // A source tab may close while Compact & Resume commits a different frontend.
+    if (expectedConversationId !== undefined && entry.summary.conversationId !== expectedConversationId) return false;
+    if (entry.metaTimer) {
+      clearTimeout(entry.metaTimer);
+      entry.metaTimer = null;
+    }
+    entry.summary.endedAt = Date.now();
+    if (dismissBrowserRecovery) entry.summary.browserRecoveryDismissedAt = entry.summary.endedAt;
+    await writeMeta(entry);
+    publishClosedSummary(entry.summary);
+    return true;
+  });
+  if (ended && open.get(id) === entry) open.delete(id);
+}
+
+/**
+ * Marks a session live again.
+ *
+ * Closing a ChatGPT tab ends its session, and reopening the same conversation
+ * continues it — deliberately, so a chat is one history rather than a fragment per
+ * visit. Without this the reopened session kept the `endedAt` from the close, and
+ * everything after it was appended to a session the UI still drew as finished.
+ */
+export async function reopenSession(id: string, pageObservedAt?: number): Promise<void> {
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'reopen', async () => {
+    const dismissedAt = entry.summary.browserRecoveryDismissedAt;
+    const returned = dismissedAt !== undefined && pageObservedAt !== undefined && pageObservedAt > dismissedAt;
+    if (entry.summary.endedAt === null && !returned) return;
+    if (returned) delete entry.summary.browserRecoveryDismissedAt;
+    entry.summary.endedAt = null;
+    entry.summary.updatedAt = Date.now();
+    await writeMeta(entry);
+  });
+}
+
+export async function renameSession(id: string, title: string, source: SessionSummary['titleSource'] = 'manual', conversationId?: string): Promise<void> {
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'rename', async () => {
+    if (source !== 'manual') {
+      if (conversationId && entry.summary.conversationId !== conversationId) return;
+      if (!automaticTitle(entry.summary, firstTitleMessage(entry.messages.values()))) return;
+      if (source === 'fallback' && entry.summary.titleSource === 'provider') return;
+    }
+    if (entry.summary.title === title.slice(0, 120) && entry.summary.titleSource === source) return;
+    entry.summary.title = title.slice(0, 120);
+    entry.summary.titleSource = source;
+    await writeMeta(entry);
+  });
+}
+
+/** Persist current provider selection independently of recording/history replay. */
+export async function observeSessionModel(
+  id: string, conversationId: string, model: string, observedAt: number,
+  reasoningEffort?: ReasoningEffort
+): Promise<void> {
+  if (!/^[a-zA-Z0-9 ._-]{1,80}$/.test(model) || !Number.isFinite(observedAt)) return;
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'model-selection', async () => {
+    // Late old-document reports cannot change the replacement's policy. Repeated observations
+    // and delayed delivery receipts cannot overwrite a newer provider selection either.
+    if (entry.summary.conversationId !== conversationId ||
+        observedAt < (entry.summary.selectedModel?.observedAt ?? 0)) return;
+    const selectedModel = { conversationId, model, observedAt, ...(reasoningEffort ? { reasoningEffort } : {}) };
+    if (JSON.stringify(entry.summary.selectedModel) === JSON.stringify(selectedModel)) return;
+    const staged = { ...entry.summary, selectedModel };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/** Bind once before publishing project work; a task never silently changes folders. */
+export async function bindSessionProject(id: string, projectId: string): Promise<void> {
+  if (!/^[a-f0-9-]{36}$/i.test(projectId)) throw new Error('Invalid project id');
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'project', async () => {
+    if (entry.summary.projectId === projectId) return;
+    if (entry.summary.projectId) throw new Error('Session already belongs to another project');
+    const staged = { ...entry.summary, projectId };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/**
+ * Records that this app opened the chat, and names the session accordingly.
+ *
+ * One write rather than a rename followed by a stamp, because the two are the same
+ * fact: the origin is where the name came from, and a session that carried one without
+ * the other would either show the bootstrap prompt as its name or claim a role the
+ * name contradicts.
+ */
+export async function setSessionOrigin(id: string, origin: SessionOrigin, title: string): Promise<void> {
+  const inheritedProject = origin.fromSessionId ? (await getSession(origin.fromSessionId))?.projectId : undefined;
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'origin write', async () => {
+    if (inheritedProject && entry.summary.projectId && entry.summary.projectId !== inheritedProject) throw new Error('Session origin belongs to another project');
+    const staged = { ...entry.summary, origin, title: title.slice(0, 120), ...(inheritedProject ? { projectId: inheritedProject } : {}) };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/**
+ * Attaches this durable session to a different ChatGPT conversation.
+ *
+ * The single canonical session-transfer primitive: Compact & Resume does not create a
+ * second session and copy state into it, it moves the one session's frontend from chat A
+ * to chat B. Everything the session owns — its recorded history, its title, its origin, its
+ * handoffs, and by extension the workspace and swarm binding keyed off it — follows for
+ * free, precisely because none of it was ever keyed on the ChatGPT conversation.
+ *
+ * `contextTokens` is the one figure that resets, and it is not an exception to that rule:
+ * it measures what the *attached chat* is carrying, and chat B is carrying only the
+ * handoff. `estimatedTokens` keeps counting the session's whole life.
+ *
+ * Refuses rather than guesses when the session is not attached where the caller thinks it
+ * is. That check is what makes the commit safe to retry and impossible to apply twice.
+ *
+ * ## Commit on success, never before
+ *
+ * The move is staged on a *clone* and only published into the live summary once the durable
+ * write has actually landed. Mutating the live summary first and writing afterwards looked
+ * equivalent and was not: a failed `writeMeta` returned false while memory already said
+ * chat B, and the next scheduled flush then wrote that state to disk anyway — so a commit
+ * that reported failure completed itself a second later. The requirement is absolute in the
+ * other direction: a failed A→B commit leaves the session attached to A, in memory and on
+ * disk alike. Publishing is a field-by-field copy into the existing object, because callers
+ * hold that reference.
+ */
+export async function rebindSession(
+  id: string,
+  fromConversationId: string | null,
+  toConversationId: string,
+  committedResumeHandoffId?: string
+): Promise<boolean> {
+  if (!toConversationId || fromConversationId === toConversationId) return false;
+  if (committedResumeHandoffId !== undefined && !/^[0-9a-z-]{8,64}$/i.test(committedResumeHandoffId)) return false;
+  // Same rule as createSession: once a mutation may attach B, no pre-existing cached miss for
+  // B is authoritative. Clearing it early is safe even if the move later refuses or fails.
+  missingCurrentConversations.delete(toConversationId);
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'rebind', async () => {
+    if (entry.summary.conversationId !== fromConversationId) return false;
+    // Browser conversation ids are UUID-like. A handful of store unit tests deliberately
+    // use short symbolic ids and reuse them across retained temp sessions; ownership safety
+    // applies to the real identity domain rather than manufacturing a test-only collision.
+    if (/^[0-9a-f-]{8,64}$/i.test(toConversationId)) {
+      // Any existing owner is a collision witness. A unique-only lookup also returns
+      // null for duplicate owners and would incorrectly admit a third local session.
+      const target = await findSessionByConversation(toConversationId);
+      if (target && target.id !== id) {
+        logWarn(`session ${id} cannot move to ${toConversationId}: that chat already belongs to ${target.id}`);
+        return false;
+      }
+    }
+    const epoch = entry.summary.bindingEpoch ?? 0;
+    if (!Number.isSafeInteger(epoch) || epoch < 0 || epoch >= Number.MAX_SAFE_INTEGER) return false;
+    const staged: SessionSummary = {
+      ...entry.summary,
+      conversationId: toConversationId,
+      bindingEpoch: epoch + 1,
+      retiredChatAt: fromConversationId ? { ...entry.summary.retiredChatAt, [fromConversationId]: Date.now() } : entry.summary.retiredChatAt,
+      chatIds: entry.summary.chatIds.includes(toConversationId)
+        ? [...entry.summary.chatIds]
+        : [...entry.summary.chatIds, toConversationId],
+      contextTokens: 0,
+      activeTurnId: null,
+      finishTurn: null,
+      browserRecoveryDismissedAt: undefined,
+      ...(committedResumeHandoffId !== undefined
+        ? { lastCommittedResumeHandoffId: committedResumeHandoffId }
+        : {}),
+      updatedAt: Date.now(),
+      // A session whose chat was closed during the handover is live again the moment its new
+      // chat is attached; leaving `endedAt` set would draw a visibly growing session as over.
+      endedAt: null
+    };
+
+    try {
+      await writeSummary(staged, entry.historySeq);
+    } catch (err) {
+      logWarn(`session ${id} could not be moved to ${toConversationId}: ${(err as Error).message}`);
+      return false;
+    }
+
+    // Past this point nothing can fail: the durable record already says chat B.
+    Object.assign(entry.summary, staged);
+    entry.metaDirty = false;
+    missingCurrentConversations.delete(toConversationId);
+    publishAttachmentSummary(entry.summary);
+    // The durable cutover retires the old interpreter too, even if it is sleeping
+    // through A -> B -> A and never observes the intermediate binding. Session
+    // store/load data remains owned by this durable session.
+    if (fromConversationId) interruptCodeModeConversation(fromConversationId);
+    logInfo(`session ${id} moved from ChatGPT conversation ${fromConversationId} to ${toConversationId}`);
+    return true;
+  });
+}
+
+/**
+ * Repairs successful-resume provenance after recovery proves the A→B session move already landed.
+ *
+ * Normal continuation commit writes this id atomically inside {@link rebindSession}. A crash can
+ * leave the continuation WAL in `committing` after that metadata write, and older builds could
+ * move the session before this field existed. In either case, the durable continuation's handoff
+ * id plus the session already being attached to B authorises this one-field repair. Any other
+ * current attachment is refused rather than inferred.
+ */
+export async function ensureCommittedResumeHandoff(
+  id: string,
+  conversationId: string,
+  handoffId: string
+): Promise<boolean> {
+  if (!conversationId || !/^[0-9a-z-]{8,64}$/i.test(handoffId)) return false;
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'committed resume provenance repair', async () => {
+    if (entry.summary.conversationId !== conversationId) return false;
+    if (entry.summary.lastCommittedResumeHandoffId === handoffId) return true;
+    const staged: SessionSummary = {
+      ...entry.summary,
+      // This is recovery of an already-landed semantic move, not new user/session activity.
+      // Preserve the original recency rather than making an app restart reorder old sessions.
+      lastCommittedResumeHandoffId: handoffId
+    };
+    await writeSummary(staged, entry.historySeq);
+    Object.assign(entry.summary, staged);
+    entry.metaDirty = false;
+    publishCachedSummary(entry.summary, false);
+    return true;
+  });
+}
+
+// ----------------------------------------------------------------- assets
+
+/**
+ * Stores a binary beside the log and returns a reference.
+ *
+ * Content-addressed, so a screenshot taken twice costs one file. This is the whole
+ * reason the log stays readable: a 300 KB PNG never becomes a 400 KB base64 string
+ * inside a line that a summary pass then has to skip over.
+ */
+export async function writeAsset(
+  sessionId: string,
+  data: Buffer,
+  mimeType: string
+): Promise<AssetRef> {
+  assertSessionId(sessionId);
+  if (data.length === 0 || data.length > MAX_ASSET_BYTES) throw new Error('Session asset exceeds the per-asset limit');
+  const hash = createHash('sha256').update(data).digest('hex').slice(0, 32);
+  const extension =
+    mimeType === 'image/png'
+      ? '.png'
+      : mimeType === 'image/jpeg'
+        ? '.jpg'
+        : mimeType === 'text/plain'
+          ? '.txt'
+          : '.bin';
+  const id = `${hash}${extension}`;
+  // Invocation time, rather than queue execution time, decides which side of an explicit
+  // cleanup this write belongs to. A write already admitted when cleanup starts may finish,
+  // but its late reference cannot resurrect the retired file.
+  const admittedAt = assetMutationEpoch;
+  return enqueueAssetOperation(async () => {
+    const dir = path.join(sessionDir(sessionId), 'assets');
+    await fs.mkdir(dir, { recursive: true });
+    const target = path.join(dir, id);
+    try {
+      await fs.stat(target);
+      assetWrittenEpoch.set(localAssetKey(sessionId, id), admittedAt);
+      return { id, mimeType, bytes: data.length };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+    }
+    const used = await sessionAssetBytesOnDisk(sessionId);
+    const globalUsed = await globalAssetBytesOnDisk();
+    if (used + data.length > MAX_SESSION_ASSET_BYTES) throw new Error('Session asset quota exceeded');
+    if (globalUsed + data.length > MAX_GLOBAL_ASSET_BYTES) throw new Error('Global session asset quota exceeded');
+    try {
+      await fs.writeFile(target, data, { flag: 'wx' });
+      sessionAssetUsage.set(sessionId, used + data.length);
+      globalAssetUsage = globalUsed + data.length;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+    }
+    assetWrittenEpoch.set(localAssetKey(sessionId, id), admittedAt);
+    return { id, mimeType, bytes: data.length };
+  });
+}
+
+async function directoryFileBytes(dir: string): Promise<number> {
+  let total = 0;
+  let handle: Awaited<ReturnType<typeof fs.opendir>> | null = null;
+  try {
+    handle = await fs.opendir(dir);
+    for await (const entry of handle) {
+      if (!entry.isFile()) continue;
+      try {
+        total += (await fs.stat(path.join(dir, entry.name))).size;
+      } catch {
+        // A concurrent delete simply removes it from the durable total.
+      }
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  return total;
+}
+
+async function sessionAssetBytesOnDisk(sessionId: string): Promise<number> {
+  const cached = sessionAssetUsage.get(sessionId);
+  if (cached !== undefined) return cached;
+  const used = await directoryFileBytes(path.join(sessionDir(sessionId), 'assets'));
+  sessionAssetUsage.set(sessionId, used);
+  return used;
+}
+
+async function globalAssetBytesOnDisk(): Promise<number> {
+  if (globalAssetUsage !== null) return globalAssetUsage;
+  let total = 0;
+  let handle: Awaited<ReturnType<typeof fs.opendir>> | null = null;
+  try {
+    handle = await fs.opendir(root);
+    for await (const entry of handle) {
+      if (!entry.isDirectory() || !/^[0-9a-z-]{8,64}$/i.test(entry.name)) continue;
+      total += await sessionAssetBytesOnDisk(entry.name);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+  globalAssetUsage = total;
+  return total;
+}
+
+interface StoredImageFile {
+  sessionId: string;
+  assetId: string;
+  bytes: number;
+  mtimeMs: number;
+  dev: number;
+  ino: number;
+}
+
+interface VerifiedAssetsDirectory {
+  path: string;
+  realPath: string;
+}
+
+function imageHeader(header: Buffer): boolean {
+  return (
+    (header.length >= 8 && header.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) ||
+    (header.length >= 3 && header[0] === 0xff && header[1] === 0xd8 && header[2] === 0xff) ||
+    (header.length >= 12 && header.subarray(0, 4).toString('ascii') === 'RIFF' && header.subarray(8, 12).toString('ascii') === 'WEBP')
+  );
+}
+
+function sameFilesystemPath(left: string, right: string): boolean {
+  const normalize = (value: string): string => {
+    const resolved = path.resolve(value);
+    return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+  };
+  return normalize(left) === normalize(right);
+}
+
+async function verifiedAssetsDirectory(sessionId: string): Promise<VerifiedAssetsDirectory | null> {
+  const expectedSession = sessionDir(sessionId);
+  const expectedAssets = path.join(expectedSession, 'assets');
+  try {
+    const rootStat = await fs.lstat(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return null;
+    const rootReal = await fs.realpath(root);
+    const sessionStat = await fs.lstat(expectedSession);
+    if (!sessionStat.isDirectory() || sessionStat.isSymbolicLink()) return null;
+    const sessionReal = await fs.realpath(expectedSession);
+    if (!sameFilesystemPath(path.dirname(sessionReal), rootReal) || path.basename(sessionReal) !== sessionId) return null;
+    const assetsStat = await fs.lstat(expectedAssets);
+    if (!assetsStat.isDirectory() || assetsStat.isSymbolicLink()) return null;
+    const assetsReal = await fs.realpath(expectedAssets);
+    if (!sameFilesystemPath(path.dirname(assetsReal), sessionReal) || path.basename(assetsReal) !== 'assets') return null;
+    return { path: expectedAssets, realPath: assetsReal };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+}
+
+interface VerifiedAssetFile {
+  bytes: number;
+  mtimeMs: number;
+  dev: number;
+  ino: number;
+  image: boolean;
+}
+
+async function inspectVerifiedAssetFile(directory: VerifiedAssetsDirectory, name: string): Promise<VerifiedAssetFile | null> {
+  const target = path.join(directory.path, name);
+  let handle: Awaited<ReturnType<typeof fs.open>> | null = null;
+  try {
+    const before = await fs.lstat(target);
+    if (!before.isFile() || before.isSymbolicLink()) return null;
+    const real = await fs.realpath(target);
+    if (!sameFilesystemPath(path.dirname(real), directory.realPath) || path.basename(real) !== name) return null;
+    handle = await fs.open(target, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.dev !== before.dev || stat.ino !== before.ino) return null;
+    const header = Buffer.alloc(12);
+    const { bytesRead } = await handle.read(header, 0, header.length, 0);
+    const image = imageHeader(header.subarray(0, bytesRead));
+    const after = await fs.lstat(target);
+    if (!after.isFile() || after.isSymbolicLink() || after.dev !== stat.dev || after.ino !== stat.ino || after.size !== stat.size) return null;
+    return { bytes: stat.size, mtimeMs: stat.mtimeMs, dev: stat.dev, ino: stat.ino, image };
+  } catch (error) {
+    if (['ENOENT', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '')) return null;
+    throw error;
+  } finally {
+    await handle?.close().catch(() => undefined);
+  }
+}
+
+/** Exact physical quota inventory. Directory entries, not caller paths, define the scope. */
+async function imageStorageInventory(collectImages = true): Promise<{ usedBytes: number; images: StoredImageFile[] }> {
+  assertReady();
+  let usedBytes = 0;
+  const images: StoredImageFile[] = [];
+  const usage = new Map<string, number>();
+  let sessions: Awaited<ReturnType<typeof fs.opendir>> | null = null;
+  try {
+    const rootStat = await fs.lstat(root);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      sessionAssetUsage.clear();
+      globalAssetUsage = 0;
+      return { usedBytes: 0, images: [] };
+    }
+    sessions = await fs.opendir(root);
+    for await (const session of sessions) {
+      if (!session.isDirectory() || !/^[0-9a-z-]{8,64}$/i.test(session.name)) continue;
+      const assetsDir = await verifiedAssetsDirectory(session.name);
+      if (!assetsDir) continue;
+      let entries: Awaited<ReturnType<typeof fs.opendir>> | null = null;
+      let sessionBytes = 0;
+      try {
+        entries = await fs.opendir(assetsDir.path);
+        for await (const entry of entries) {
+          // Symlinks and other special files neither consume the app's quota nor become cleanup targets.
+          if (!entry.isFile() || !/^[0-9a-f]{8,64}\.(?:bin|png|jpg|txt)$/i.test(entry.name)) continue;
+          // Usage needs metadata only. Opening every file to classify its contents belongs
+          // to confirmed cleanup, not to displaying the quota (including a cold start).
+          if (!collectImages) {
+            try {
+              const stat = await fs.lstat(path.join(assetsDir.path, entry.name));
+              if (stat.isFile() && !stat.isSymbolicLink()) sessionBytes += stat.size;
+            } catch (error) {
+              if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+            }
+            continue;
+          }
+          const file = await inspectVerifiedAssetFile(assetsDir, entry.name);
+          if (!file) continue;
+          sessionBytes += file.bytes;
+          if (file.image) {
+            const { image: _image, ...stored } = file;
+            images.push({ sessionId: session.name, assetId: entry.name, ...stored });
+          }
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      } finally {
+        await entries?.close().catch(() => undefined);
+      }
+      usage.set(session.name, sessionBytes);
+      usedBytes += sessionBytes;
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+  } finally {
+    await sessions?.close().catch(() => undefined);
+  }
+  sessionAssetUsage.clear();
+  for (const [sessionId, bytes] of usage) sessionAssetUsage.set(sessionId, bytes);
+  globalAssetUsage = usedBytes;
+  return { usedBytes, images };
+}
+
+function sameStoredImage(file: StoredImageFile, observed: VerifiedAssetFile): boolean {
+  return observed.image && observed.dev === file.dev && observed.ino === file.ino && observed.bytes === file.bytes;
+}
+
+/**
+ * Atomically moves the selected directory entry aside, then verifies the moved object before
+ * unlinking it. A path replacement can therefore make cleanup abstain, but cannot make it
+ * delete the replacement. The app's asset queue excludes legitimate writers throughout.
+ */
+async function deleteSelectedImage(file: StoredImageFile): Promise<number> {
+  const directory = await verifiedAssetsDirectory(file.sessionId);
+  if (!directory) return 0;
+  const observed = await inspectVerifiedAssetFile(directory, file.assetId);
+  if (!observed || !sameStoredImage(file, observed)) return 0;
+  const currentDirectory = await verifiedAssetsDirectory(file.sessionId);
+  if (!currentDirectory || !sameFilesystemPath(currentDirectory.realPath, directory.realPath)) return 0;
+  const target = path.join(currentDirectory.path, file.assetId);
+  const quarantineName = `.cleanup-${process.pid}-${randomUUID()}.tmp`;
+  const quarantine = path.join(currentDirectory.path, quarantineName);
+  try {
+    await fs.rename(target, quarantine);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 0;
+    throw error;
+  }
+  try {
+    const movedDirectory = await verifiedAssetsDirectory(file.sessionId);
+    if (!movedDirectory || !sameFilesystemPath(movedDirectory.realPath, currentDirectory.realPath)) return 0;
+    const moved = await inspectVerifiedAssetFile(movedDirectory, quarantineName);
+    if (!moved || !sameStoredImage(file, moved)) return 0;
+    await fs.unlink(quarantine);
+    return moved.bytes;
+  } finally {
+    // A replacement is never deleted. Restore the selected directory entry when possible;
+    // otherwise leave the quarantined file as forensic evidence outside future inventories.
+    try {
+      await fs.lstat(quarantine);
+      try { await fs.lstat(target); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') await fs.rename(quarantine, target);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
+}
+
+function referencedAssetIds(event: SessionEvent): readonly AssetRef[] {
+  if (event.kind === 'native_image') return event.asset ? [event.asset] : [];
+  if (event.kind === 'user_message') return event.assets ?? [];
+  if (event.kind === 'tool_call') return event.call.assets ?? [];
+  return [];
+}
+
+function retireImageReferences(event: CanonicalEvent, selected: ReadonlySet<string>): CanonicalEvent | null {
+  if (event.kind === 'native_image') {
+    if (!event.asset || !selected.has(event.asset.id)) return null;
+    const { asset: _asset, ...withoutAsset } = event;
+    return { ...withoutAsset, previewStatus: 'unavailable', previewError: 'removed' };
+  }
+  if (event.kind === 'user_message') {
+    const removed = (event.assets ?? []).filter((asset) => selected.has(asset.id));
+    if (!removed.length) return null;
+    const retiredImageAssetIds = [...new Set([...(event.retiredImageAssetIds ?? []), ...removed.map((asset) => asset.id)])];
+    return { ...event, assets: retainedAssets(event.assets, retiredImageAssetIds), retiredImageAssetIds };
+  }
+  if (event.kind !== 'tool_call') return null;
+  const removed = (event.call.assets ?? []).filter((asset) => selected.has(asset.id));
+  if (!removed.length) return null;
+  const retiredImageAssetIds = [...new Set([...(event.call.retiredImageAssetIds ?? []), ...removed.map((asset) => asset.id)])];
+  return { ...event, call: { ...event.call, assets: retainedAssets(event.call.assets, retiredImageAssetIds), retiredImageAssetIds } };
+}
+
+/**
+ * Retires every durable reference before physical deletion. Canonical shards overlay ordinary
+ * journal tool rows, so history remains immutable while future reads cannot claim a removed file
+ * is available. Unsupported unkeyed references veto deletion for their exact asset.
+ */
+async function retireSessionImages(sessionId: string, selected: ReadonlySet<string>): Promise<Set<string>> {
+  const events = await readEvents(sessionId);
+  const safe = new Set(selected);
+  const keyed = new Map<string, CanonicalEvent>();
+  for (const event of events) {
+    if (!referencedAssetIds(event).some((asset) => selected.has(asset.id))) continue;
+    const key = messageKey(event);
+    if (!key || !['user_message', 'native_image', 'tool_call'].includes(event.kind)) {
+      for (const asset of referencedAssetIds(event)) safe.delete(asset.id);
+      continue;
+    }
+    keyed.set(key, event as CanonicalEvent);
+  }
+  const entry = await ensureOpen(sessionId);
+  await enqueueSessionOperation(entry, 'image storage cleanup', async () => {
+    for (const [key, observed] of keyed) {
+      const current = entry.messages.get(key) ?? observed;
+      const retired = retireImageReferences(current, safe);
+      if (!retired) continue;
+      const full = { ...retired, origin: retired.origin ?? retired.seq, seq: entry.nextSeq } as CanonicalEvent;
+      await writeCanonicalMessage(sessionId, key, full);
+      entry.messages.set(key, full);
+      entry.nextSeq += 1;
+      entry.historySeq = full.seq;
+    }
+    if (keyed.size) scheduleMeta(entry);
+  });
+  return safe;
+}
+
+export function getImageStorage(): Promise<ImageStorageInfo> {
+  return enqueueAssetOperation(async () => {
+    assertReady();
+    // Asset writes and cleanup already maintain this quota authority under the same queue.
+    const usedBytes = globalAssetUsage ?? (await imageStorageInventory(false)).usedBytes;
+    return { usedBytes, limitBytes: MAX_GLOBAL_ASSET_BYTES };
+  });
+}
+
+/** Explicit user cleanup. No automatic eviction and no alternate cache can bypass the 2 GiB cap. */
+export async function clearImageStorage(mode: ImageStorageClearMode): Promise<ImageStorageClearResult> {
+  assertReady();
+  // This synchronous edge separates already-admitted writers from writes initiated after the
+  // explicit cleanup request, including callers that are still waiting on the asset queue.
+  const cleanupEpoch = ++assetMutationEpoch;
+  let announceSelection!: (files: StoredImageFile[]) => void;
+  let rejectSelection!: (error: unknown) => void;
+  let finishRetirement!: (files: Set<string>) => void;
+  let rejectRetirement!: (error: unknown) => void;
+  const selection = new Promise<StoredImageFile[]>((resolve, reject) => {
+    announceSelection = resolve; rejectSelection = reject;
+  });
+  const retirement = new Promise<Set<string>>((resolve, reject) => {
+    finishRetirement = resolve; rejectRetirement = reject;
+  });
+
+  // Claim the existing asset queue before inspecting disk. Prior writes finish first; later writes
+  // wait until references are retired and selected files are gone.
+  const cleanup = enqueueAssetOperation(async () => {
+    try {
+      const inventory = await imageStorageInventory();
+      const ordered = [...inventory.images].sort((left, right) =>
+        left.mtimeMs - right.mtimeMs || left.sessionId.localeCompare(right.sessionId) || left.assetId.localeCompare(right.assetId));
+      const chosen: StoredImageFile[] = [];
+      let chosenBytes = 0;
+      for (const file of ordered) {
+        if (mode === 'oldest-gib' && chosenBytes >= 1024 * 1024 * 1024) break;
+        chosen.push(file);
+        chosenBytes += file.bytes;
+      }
+      for (const file of chosen) removedAssetEpoch.set(localAssetKey(file.sessionId, file.assetId), cleanupEpoch);
+      announceSelection(chosen);
+      const deletable = await retirement;
+      let freedBytes = 0;
+      let removedFiles = 0;
+      for (const file of chosen) {
+        const identity = `${file.sessionId}\u0000${file.assetId}`;
+        if (!deletable.has(identity)) continue;
+        const removed = await deleteSelectedImage(file);
+        if (!removed) continue;
+        freedBytes += removed;
+        removedFiles += 1;
+      }
+      sessionAssetUsage.clear();
+      globalAssetUsage = null;
+      const after = await imageStorageInventory(false);
+      return { freedBytes, removedFiles, usedBytes: after.usedBytes, limitBytes: MAX_GLOBAL_ASSET_BYTES };
+    } catch (error) {
+      rejectSelection(error);
+      throw error;
+    }
+  });
+
+  try {
+    const chosen = await selection;
+    const bySession = new Map<string, Set<string>>();
+    for (const file of chosen) {
+      const ids = bySession.get(file.sessionId) ?? new Set<string>();
+      ids.add(file.assetId);
+      bySession.set(file.sessionId, ids);
+    }
+    const deletable = new Set<string>();
+    for (const [sessionId, ids] of bySession) {
+      for (const assetId of await retireSessionImages(sessionId, ids)) deletable.add(`${sessionId}\u0000${assetId}`);
+    }
+    finishRetirement(deletable);
+  } catch (error) {
+    rejectRetirement(error);
+  }
+  return cleanup;
+}
+
+function invalidateAssetUsage(sessionId: string): void {
+  sessionAssetUsage.delete(sessionId);
+  globalAssetUsage = null;
+}
+
+export async function readAsset(sessionId: string, assetId: string, maxBytes?: number): Promise<Buffer | null> {
+  assertSessionId(sessionId);
+  if (!/^[0-9a-f]{8,64}\.(png|jpg|txt|bin)$/.test(assetId)) return null;
+  try {
+    const file = path.join(sessionDir(sessionId), 'assets', assetId);
+    if (maxBytes === undefined) return await fs.readFile(file);
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0) return null;
+    const handle = await fs.open(file, 'r');
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > maxBytes) return null;
+      // One bounded allocation and the same file handle throughout: an extra byte
+      // detects growth after stat instead of letting readFile grow the allocation.
+      const buffer = Buffer.alloc(stat.size + 1);
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (!bytesRead) return buffer.subarray(0, length);
+        length += bytesRead;
+      }
+      return null;
+    } finally { await handle.close(); }
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stores text too long to sit inline, and returns the reference to put in the event.
+ *
+ * Content-addressed like any other asset, so a command run twice with the same enormous
+ * output costs one file. Returns null only when the text is beyond even this — at which
+ * point the event says so rather than pretending the record is complete.
+ */
+export async function writeOverflowText(sessionId: string, text: string): Promise<string | null> {
+  if (text.length > MAX_OVERFLOW_ASSET_CHARS) return null;
+  try {
+    const asset = await writeAsset(sessionId, Buffer.from(text, 'utf8'), 'text/plain');
+    return asset.id;
+  } catch (err) {
+    logWarn(`session ${sessionId}: overflow text not stored: ${(err as Error).message}`);
+    return null;
+  }
+}
+
+/** Reads back text spilled by writeOverflowText. */
+export async function readOverflowText(sessionId: string, assetId: string): Promise<string | null> {
+  const data = await readAsset(sessionId, assetId);
+  return data ? data.toString('utf8') : null;
+}
+
+// --------------------------------------------------------------- handoffs
+
+export async function saveHandoff(handoff: Handoff): Promise<void> {
+  assertSessionId(handoff.sessionId);
+  const dir = path.join(sessionDir(handoff.sessionId), 'handoffs');
+  await fs.mkdir(dir, { recursive: true });
+  const target = path.join(dir, `${handoff.id}.json`);
+  const tmp = `${target}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(handoff, null, 2), 'utf8');
+  await fs.rename(tmp, target);
+}
+
+export async function readHandoff(sessionId: string, handoffId: string): Promise<Handoff | null> {
+  assertSessionId(sessionId);
+  if (!/^[0-9a-z-]{8,64}$/i.test(handoffId)) return null;
+  try {
+    const raw = await fs.readFile(path.join(sessionDir(sessionId), 'handoffs', `${handoffId}.json`), 'utf8');
+    const parsed = JSON.parse(raw) as Handoff;
+    return typeof parsed?.text === 'string' ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The newest handoff across every session — what a fresh chat asks for by default.
+ *
+ * Deliberately over every session rather than the capped UI list: the point of "the last
+ * handoff" is that it is the last one, and "unless you happen to have more than two
+ * hundred sessions" is not a property worth shipping.
+ */
+export async function latestHandoff(): Promise<Handoff | null> {
+  const sessions = await readEverySummary();
+  let best: Handoff | null = null;
+  for (const summary of sessions) {
+    if (!summary.lastHandoffId) continue;
+    const handoff = await readHandoff(summary.id, summary.lastHandoffId);
+    if (handoff && (!best || handoff.createdAt > best.createdAt)) best = handoff;
+  }
+  return best;
+}
+
+// ------------------------------------------------------------------ prune
+
+/**
+ * Compatibility seam for older callers. Age-based recording deletion was removed: only the
+ * explicit delete-session and confirmed image-storage cleanup paths may remove history now.
+ */
+export async function pruneSessions(_retainDays: number): Promise<number> {
+  return 0;
+}
+
+export async function deleteSession(id: string): Promise<void> {
+  assertSessionId(id);
+  const entry = open.get(id);
+  if (entry) {
+    if (entry.metaTimer) clearTimeout(entry.metaTimer);
+    await entry.queue.catch(() => undefined);
+    open.delete(id);
+  }
+  await fs.rm(sessionDir(id), { recursive: true, force: true });
+  invalidateAssetUsage(id);
+  publishAttachmentRemoval(id);
+}
+
+/** Test seam: forgets in-memory state without touching the files. */
+export function resetSessionStoreForTests(): void {
+  for (const entry of open.values()) if (entry.metaTimer) clearTimeout(entry.metaTimer);
+  open.clear();
+  opening.clear();
+  reconciling.clear();
+  sessionAssetUsage.clear();
+  globalAssetUsage = null;
+  assetMutationEpoch = 0;
+  assetWrittenEpoch.clear();
+  removedAssetEpoch.clear();
+  missingCurrentConversations.clear();
+  attachmentCatalog = null;
+  attachmentCatalogLoading = null;
+  attachmentEpoch = 0;
+}
+
+/** Test seam: puts the store back to never having been told where to write. */
+export function unsetSessionRootForTests(): void {
+  root = '';
+  sessionAssetUsage.clear();
+  globalAssetUsage = null;
+  assetMutationEpoch = 0;
+  assetWrittenEpoch.clear();
+  removedAssetEpoch.clear();
+  missingCurrentConversations.clear();
+  attachmentCatalog = null;
+  attachmentCatalogLoading = null;
+  attachmentEpoch = 0;
+}
