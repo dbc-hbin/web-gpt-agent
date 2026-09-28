@@ -122,8 +122,11 @@ managed extension copy; its Fiber hash matches both source and installed bundle.
 settings were not manually edited, and Chrome was not debug-attached or forcibly reloaded.
 
 The replacement backend answered authenticated `host.status` and the bridge reconnected to
-the extension. Full GUI readiness remains blocked on macOS Keychain: `state:get` timed out
+the extension. GUI initialization initially waited on macOS Keychain: `state:get` timed out
 and a process sample showed `SecItemCopyMatching` / keychain content decryption waiting on
-the Security server. No security setting or credential was changed to bypass that consent.
-Actual signed-in receipt acceptance and GUI-ready state remain unverified until that wait
-is resolved; installed-file and isolated-script checks are not a substitute.
+the Security server. After the user approved access, the same replacement backend returned
+`state:get` successfully; the app logged `renderer state ready`, Core/Desktop tunnel
+connections and an authenticated browser wake channel. No security setting or credential
+was changed to bypass consent. Actual signed-in receipt acceptance remains unverified;
+installed-file, startup and isolated-script checks do not prove that already-open Chrome
+documents loaded the replacement helper or that a previously stuck receipt settled.
