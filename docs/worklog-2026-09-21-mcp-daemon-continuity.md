@@ -72,6 +72,36 @@ behavior, observed verification results, and remaining work.
   in 213 passing files and six separate shutdown tests; 83 tests were skipped. No package
   installation or live-ledger repair was performed.
 
+### Installed replay acceptance (2026-09-29)
+
+- Commit `e4090af` was built through the normal Electron/CLI/daemon and pinned-resource
+  preparation steps into a separate arm64 package directory, without replacing a running
+  bundle. Packaged native execution, isolated plain-Node daemon start/stop and macOS bundle
+  checks passed (25 thin Mach-O payloads, nine executable modes). The local signing identity
+  sealed the candidate. GUI quit and authenticated `host.stop` preceded installation; the
+  old bundle was retained as a rollback copy, and user data was not edited.
+- Installed executable, `app.asar` and CodeResources SHA-256 hashes matched the candidate;
+  installed deep/strict signature verification passed. The installed 2.1.14 backend and
+  companion reconnected. An explicit fresh GUI launch produced an on-screen window while
+  retaining the resident backend. The driver's default no-activation reuse returned only the
+  headless host; this did not exercise a physical Dock activation.
+- A harmless real ChatGPT opening was admitted in 17 ms and appeared in `sessions:list`
+  in 3 ms while still queued. Native Send, exact request-id attribution, one successful
+  Core `exec_read` and the requested native final were observed. No files or workers were
+  created by the model.
+- Reloading that exact signed-in page reproduced native historical text reserialization:
+  the original message changed from 9,156 to 9,100 characters while retaining message identity,
+  origin 1 and content/work sequence 1. Its canonical revision advanced from 2 to 9, then 10.
+  After a clean installed-backend restart, outbox replay restored the exact frozen 9,156-character
+  text at revision 11 without advancing work sequence 1 or origin 1. The same local/provider
+  session, single tool result and completed final survived, with no duplicate Send or unwanted
+  Continue. These lengths are character counts, not UTF-8 transport byte counts.
+- This live run proves the formerly wrong history-replay boundary. It completed normally,
+  so an actual pending Continue delivery was not exercised; ticket survival/authorization
+  and new-question revocation are covered by the failing-before/passing-after integration
+  cases above. No provider failure, synthetic browser evidence or live-ledger edit was used
+  to manufacture a recovery opportunity.
+
 ### Packaged runtime replacement (2026-09-23)
 
 - The prior detached host was stopped through its authenticated control socket and its GUI
