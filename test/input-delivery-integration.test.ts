@@ -1,6 +1,9 @@
 import { GOAL_MARKER_INSTRUCTION } from '../src/shared/goal-templates.js';
 import { currentCoreInstructions } from '../src/main/mcp/instructions.js';
 import { prependUserPrompt, userPromptText } from '../src/shared/user-prompt.js';
+import { workSequence } from '../src/shared/session.js';
+import * as deliveryStore from '../src/main/session/store.js';
+import { sweepStaleSwarm } from '../src/main/bridge.js';
 import { finishInstruction } from '../src/shared/finish.js';
 import { initSkillsPath } from '../src/main/skills.js';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -125,6 +128,63 @@ it('keeps automatic Continue attached to the native question after injected corr
     expect(row.recovery?.questionId).toBe(questionId);
     expect((await input.pendingBrowserInputs()).find(item => item.id === row.id)?.recovery?.questionId).toBe(questionId);
     expect(await input.claimBrowserInput(row.id, 'replacement-document', conversationId, true)).not.toBeNull();
+  } finally { clock.mockRestore(); }
+});
+
+it.each([false, true])('keeps wrapped opening Continue after historic outbox replay, rejecting new question: %s', async freshQuestion => {
+  let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+  try {
+    const conversationId = randomUUID(), openingId = randomUUID(), turnId = randomUUID();
+    const config = defaultConfig();
+    await saveConfig({ ...config, mcp: { ...config.mcp, instructions: 'Keep the original request in scope.' } });
+    const opening = await input.enqueueInput({ ...message(null, 'off'), text: 'Complete the original work', mode: 'auto' });
+    const claim = await input.claimBrowserInput(opening.id, 'opening-page', null, true);
+    expect(claim?.text).not.toBe(opening.text);
+    expect(userPromptText(claim!.text)).toBe(opening.text);
+    const renderedText = claim!.text.replace(/\n/g, '');
+    expect(await input.authorizeBrowserInput(opening.id, 'opening-page', null)).toBe(true);
+    expect((await post('/input/ack', { id: opening.id, owner: 'opening-page', conversationId, messageId: openingId })).body.ok).toBe(true);
+    const delivered = (await input.listInputs()).find(row => row.id === opening.id)!;
+    expect(delivered).toMatchObject({ state: 'sent', deliveryText: claim!.text, messageId: openingId });
+    const session = await deliveryStore.findSessionByConversation(conversationId, { requireUnique: true });
+    expect(session).not.toBeNull();
+    await post('/events', { conversationId, events: [
+      { kind: 'model_selection', model: 'gpt-5.6-sol', time: now },
+      { kind: 'user_message', messageId: openingId, text: renderedText, authoredNow: false, time: ++now },
+      { kind: 'turn_start', turnId, time: ++now }
+    ] });
+    expect((await deliveryStore.readLatestUserMessage(session!.id))?.message.text).toBe(renderedText);
+    await attributedMcp(conversationId);
+    now += 120_001;
+    await sweepStaleSwarm(now);
+    const repair = (await post('/status', { openConversations: [conversationId] })).body.repairs.find((item: { conversationId: string }) => item.conversationId === conversationId);
+    expect(repair?.reason).toBe('silence');
+    expect((await post('/repairs/claim', { token: repair.token })).body.allowed).toBe(true);
+    await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
+    const continuation = (await input.listInputs()).find(row => row.sessionId === session!.id && row.recovery)!;
+    expect(continuation).toMatchObject({ state: 'queued', recovery: { questionId: openingId } });
+    const workStamp = continuation.silenceBoundary!.workSeq;
+    input.resetInputForTests();
+    const restored = (await input.listInputs()).find(row => row.id === continuation.id)!;
+    expect(restored).toMatchObject({ state: 'queued', recovery: { questionId: openingId }, silenceBoundary: { workSeq: workStamp } });
+    expect((await deliveryStore.readLatestUserMessage(session!.id))?.messageId).toBe(openingId);
+    const [restoredWork] = await deliveryStore.readRecentEvents(session!.id, 1, { kinds: ['user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start'] });
+    expect(workSequence(restoredWork!)).toBe(workStamp);
+    expect((await input.pendingBrowserInputs()).find(row => row.id === continuation.id)?.recovery?.questionId).toBe(openingId);
+    expect((await input.claimBrowserInput(continuation.id, 'restored-page', conversationId, true))?.text).toBe(continuation.text);
+    if (freshQuestion) {
+      const nextQuestion = randomUUID();
+      await post('/events', { conversationId, events: [
+        { kind: 'user_message', messageId: nextQuestion, text: 'Start a different task', authoredNow: true, time: ++now }
+      ] });
+      expect((await deliveryStore.readLatestUserMessage(session!.id))?.messageId).toBe(nextQuestion);
+      const [newWork] = await deliveryStore.readRecentEvents(session!.id, 1, { kinds: ['user_message', 'assistant_message', 'tool_call', 'page_tool', 'turn_start'] });
+      expect(workSequence(newWork!)).toBeGreaterThan(workStamp);
+      expect(await input.authorizeBrowserInput(continuation.id, 'restored-page', conversationId)).toBe(false);
+      expect((await input.listInputs()).find(row => row.id === continuation.id)?.state).toBe('cancelled');
+    } else {
+      expect(await input.authorizeBrowserInput(continuation.id, 'restored-page', conversationId)).toBe(true);
+    }
   } finally { clock.mockRestore(); }
 });
 
@@ -1209,6 +1269,73 @@ afterAll(async () => {
 });
 const message = (sessionId: string | null, automation: 'off' | 'goal' | 'loop') => ({
   id: randomUUID(), sessionId, automation, text: 'Complete this request', mode: 'auto', dueAt: Date.now(), model: null, reasoningEffort: null
+});
+
+it('restores exact helper origins before the first sidebar page', async () => {
+  const source = await createSession({ title: 'Original work', conversationId: randomUUID() });
+  const helper = await createSession({ title: 'Unrestored helper', conversationId: randomUUID() });
+  await writeDurableNow('session-input', [{
+    id: randomUUID(), sessionId: null, text: 'Decision context', mode: 'after-turn', dueAt: Date.now(),
+    model: null, reasoningEffort: null, purpose: 'decision', decisionSourceSessionId: source.id,
+    state: 'sent', owner: 'helper-tab', createdAt: Date.now(), conversationId: helper.conversationId
+  }]);
+  input.resetInputForTests();
+  input.configureInputDelivery({
+    changed: () => undefined,
+    applyAutomation: async () => undefined,
+    bindHelper: async () => { throw new Error('Origin store unavailable'); }
+  });
+  try {
+    const failed = await handlers.get('sessions:list')!(null, {});
+    expect(failed.ok).toBe(false);
+  } finally {
+    registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never);
+  }
+  const response = await handlers.get('sessions:list')!(null, {});
+  expect(response.ok).toBe(true);
+  expect(response.data.sessions.some((row: { id: string }) => row.id === source.id)).toBe(true);
+  expect(response.data.sessions.some((row: { id: string }) => row.id === helper.id)).toBe(false);
+  expect((await getSession(helper.id))?.origin).toMatchObject({ kind: 'helper', fromSessionId: source.id });
+});
+
+it('lists a newly recorded chat while an already-restored input prepares its exact claim', async () => {
+  const conversationId = randomUUID();
+  const original = await createSession({ title: 'Preparing input', conversationId });
+  const row = await input.enqueueInput({ ...message(original.id, 'off'), mode: 'auto' });
+  // Enqueue already completed the initial durable load before the GUI's first sidebar request.
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  input.configureInputDelivery({
+    changed: () => undefined,
+    applyAutomation: async () => undefined,
+    prepareText: async (entry) => { entered.resolve(); await release.promise; return entry.text; }
+  });
+  const claim = input.claimBrowserInput(row.id, 'held-claim', conversationId, true);
+  try {
+    await entered.promise;
+    const latest = await createSession({ title: 'Visible despite preparation', conversationId: randomUUID() });
+    vi.useFakeTimers({ toFake: ['setTimeout'] });
+    try {
+      const deadline = Promise.withResolvers<{ kind: 'blocked' }>();
+      const timer = setTimeout(() => deadline.resolve({ kind: 'blocked' }), 100);
+      const listing = handlers.get('sessions:list')!(null, {}).then(response => ({ kind: 'listed' as const, response }));
+      await vi.advanceTimersByTimeAsync(100);
+      const first = await Promise.race([listing, deadline.promise]);
+      clearTimeout(timer);
+      expect(first.kind).toBe('listed');
+      if (first.kind === 'listed') {
+        expect(first.response.ok).toBe(true);
+        expect(first.response.data.sessions.some((item: { id: string }) => item.id === latest.id)).toBe(true);
+      }
+    } finally { vi.useRealTimers(); }
+  } finally {
+    release.resolve();
+    await claim;
+    registerIpc(() => ({ isDestroyed: () => false, webContents: { send: pushed } }) as never);
+  }
+  expect((await input.listInputs()).filter(item => item.id === row.id)).toMatchObject([{ owner: 'held-claim', state: 'browser' }]);
+  expect(await input.authorizeBrowserInput(row.id, 'another-owner', conversationId)).toBe(false);
+  expect(await input.authorizeBrowserInput(row.id, 'held-claim', conversationId)).toBe(true);
 });
 
 it('bounds an explicit next-tool delivery to four recorded images', async () => {

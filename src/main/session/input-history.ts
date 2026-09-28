@@ -42,7 +42,10 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
   };
   // Delivery and its chronology do not depend on optional preview storage. This
   // stable row survives a quota failure; retry only enriches the same origin.
-  const committed = await upsertMessageEvent(sessionId, message);
+  // Replaying a receipt may restore frozen text over a native rendering. Preserve
+  // that existing question's work stamp; the store still counts a new message id
+  // as new work. History repair must not cancel an unfinished response's Continue.
+  const committed = await upsertMessageEvent(sessionId, message, { work: false });
   anchorCommitted?.(positionOf(committed.event));
   if (images.length) {
     await validateInputImages(images);
@@ -50,7 +53,7 @@ export async function recordDeliveredInput(entry: Readonly<InputEntry>, anchorCo
     for (const image of images) {
       assets.push(await writeAsset(sessionId, Buffer.from(image.dataUrl.split(',')[1]!, 'base64'), 'image/webp'));
     }
-    await upsertMessageEvent(sessionId, { ...message, assets });
+    await upsertMessageEvent(sessionId, { ...message, assets }, { work: false });
   }
   return true;
 }

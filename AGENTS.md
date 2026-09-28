@@ -288,6 +288,10 @@ profile under `<data>/desktop-client` and never opens config, secrets, sessions 
 stores. Closing or quitting the GUI leaves the backend running. Setup exposes PID/data
 directory plus explicit Start and Stop; Stop uses authenticated host control and the
 backend shutdown owner. Source client launch: `npm run daemon:client -- --data-dir <dir>`.
+After GUI control readiness, a macOS activation received by the resident backend opens the
+same GUI client. An ordinary second-instance relaunch does likewise; an explicit host-only
+launch does not. Early ordinary relaunches coalesce until readiness, and shutdown revokes
+them. The backend itself remains windowless and reopening preserves its data directory.
 
 `--background` selects that backend too, without creating a GUI profile/window. Both runtime
 roles acquire `data-dir-lock.ts`'s shared `daemon.lock` before opening stores. Only ESRCH
@@ -1456,6 +1460,12 @@ Continuous recording serves the local transcript, exact identity and continuatio
 There is no model-facing session lookup tool. `update_plan` remains recording-backed; historical
 lookup tool calls remain displayable in existing transcripts.
 
+Desktop session lists wait for the outbox's one-time helper-origin restoration, not subsequent
+delivery preparation, history retries or claims. Restoration completed by an earlier outbox
+operation also satisfies that barrier. Concurrent initial readers share restoration; a failed
+initial restore clears its partial cache before retry rather than exposing an unstamped helper.
+A newly recorded session can therefore appear while an
+unrelated input is still preparing; delivery ownership and Send authorization remain serialized.
 Desktop session lists use stable `(updatedAt,id)` pagination. Each session selection loads a
 recent tail and opens at the bottom after its current load renders, including A -> B -> A;
 the previous chat's viewport does not decide the new chat's position. Timeline
@@ -2024,6 +2034,10 @@ observed it as newly authored. Its text and history cursor still update. A diffe
 message identity remains new work. Historical text changes cannot cancel a pending Continue
 or consume its Stop deadline. The outbox retains the actual cancellation reason and logs
 the committed transition once; a cancelled card is not a delivery receipt.
+Delivered-input history replay uses the same non-working revision rule, including startup
+restoration of wrapped text and later image enrichment. `input-history.ts` asks the canonical
+store to preserve an existing message's work stamp; a first publication with a new message id
+still counts as new work. Restoring frozen delivery bytes must not cancel a pending Continue.
 
 The existing repair's stable `progressId` is the Continue episode identity stored on its outbox
 row. Rehydration, cancellation and canonical revisions cannot mint a replacement for that same

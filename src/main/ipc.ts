@@ -19,7 +19,7 @@ import { stageInputAttachment, type AttachmentSource } from './session/input-att
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
 import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { usageOverview } from './session/usage.js';
-import { inputArgs, listInputs, editQueuedInput, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
+import { inputArgs, listInputs, restoreInputs, editQueuedInput, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
 import { draftOpeningMessage, onGoalChange, nativeGoalFailure } from './goal.js';
 import { cancelTaskRequest, runTaskRequest } from './task-request.js';
 import { randomUUID } from 'node:crypto';
@@ -860,7 +860,7 @@ export function registerIpc(
       })
       .parse(payload ?? {});
     const config = getConfig();
-    await listInputs(); // Restore exact helper origins before the first sidebar page.
+    await restoreInputs(); // Restore exact helper origins before the first sidebar page.
     const page = await listSessionPage({ cursor, limit: limit ?? 60 });
     // Older recordings omitted worker origins' parent IDs. The broker's exact
     // retained owner can repair that presentation without reviving a worker or

@@ -261,6 +261,9 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
 }
 let entries: InputEntry[] | null = null;
 let chain: Promise<unknown> = Promise.resolve();
+let initialRestored = false;
+let restorePromise: Promise<void> | null = null;
+let initialLoadPromise: Promise<InputEntry[]> | null = null;
 // A timestamp written before the claim commit cannot prove that its response was
 // available. Restart discards this evidence and repeats the stable message id.
 const offered = new Map<string, number>();
@@ -346,7 +349,15 @@ async function migrateLegacyOpeningOwners(current: InputEntry[]): Promise<boolea
 }
 
 async function load(): Promise<InputEntry[]> {
-  if (entries) return expireQueued(entries);
+  if (initialRestored) return expireQueued(entries!);
+  if (initialLoadPromise) return initialLoadPromise;
+  const pending = loadInitial();
+  initialLoadPromise = pending;
+  try { return await pending; }
+  catch (error) { entries = null; throw error; }
+  finally { if (initialLoadPromise === pending) initialLoadPromise = null; }
+}
+async function loadInitial(): Promise<InputEntry[]> {
   const raw = await readDurable<unknown>(STATE);
   const parsed = z.array(entrySchema).safeParse(raw ?? []);
   if (!parsed.success) throw new Error('The message outbox could not be read safely');
@@ -398,7 +409,18 @@ async function load(): Promise<InputEntry[]> {
     try { await commit(recovered); }
     catch (error) { entries = null; throw error; }
   }
-  return expireQueued(entries);
+  const current = await expireQueued(entries);
+  initialRestored = true;
+  return current;
+}
+/** The sidebar needs the initial origin repair, not every subsequent outbox mutation. */
+export function restoreInputs(): Promise<void> {
+  if (initialRestored) return Promise.resolve();
+  if (restorePromise) return restorePromise;
+  const pending = serial(async () => { await load(); });
+  restorePromise = pending;
+  void pending.catch(() => { if (restorePromise === pending) restorePromise = null; });
+  return pending;
 }
 /** The outbox retains delivery proof until its exact history owner is removed.
  * Run under its existing serial queue, before origin repair or checkpoint publication.
@@ -1581,7 +1603,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
   });
 }
 
-export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); offered.clear(); decisionWaiters.clear(); }
+export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); initialRestored = false; restorePromise = null; initialLoadPromise = null; offered.clear(); decisionWaiters.clear(); }
 
 export async function pausedBrowserHelpers(): Promise<Array<{ id: string; sourceSessionId: string }>> {
   return (await listInputs()).filter(row => row.purpose === 'decision' && row.state === 'cancelled' && !row.conversationId && row.decisionSourceSessionId)

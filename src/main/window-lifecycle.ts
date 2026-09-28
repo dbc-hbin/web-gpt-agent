@@ -54,6 +54,36 @@ export function createWindowActivationGate(showWindow: () => void): {
   };
 }
 
+/** A windowless host may receive an explicit relaunch before its GUI control socket exists. */
+export function createBackendActivationGate(openClient: () => void): {
+  request: (argv?: readonly string[]) => void;
+  enable: () => void;
+  disable: () => void;
+} {
+  let ready = false;
+  let pending = false;
+  let disabled = false;
+  return {
+    request: argv => {
+      if (disabled || argv?.includes('--background') || argv?.includes('--daemon-host')) return;
+      if (ready) openClient();
+      else pending = true;
+    },
+    enable: () => {
+      if (disabled) return;
+      ready = true;
+      if (pending) {
+        pending = false;
+        openClient();
+      }
+    },
+    disable: () => {
+      disabled = true;
+      pending = false;
+    }
+  };
+}
+
 /**
  * Closing the last ordinary window is not an application quit on macOS. The app stays in the
  * Dock/menu bar until the user explicitly quits (Cmd+Q / application menu / tray menu), and a

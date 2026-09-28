@@ -8,6 +8,70 @@ behavior, observed verification results, and remaining work.
 
 ## Implemented architecture
 
+### Resident backend activation (2026-09-28)
+
+- A resident macOS backend had no activation handler after its GUI exited. It now routes
+  native activation and ordinary second-instance launches through the existing GUI entry,
+  retaining the data directory. Host-only launches remain headless; early relaunches coalesce
+  until control readiness, and quit revokes pending activation. Notification session targeting
+  keeps its existing path.
+- The 12 lifecycle tests passed, followed by the production build. An isolated Electron
+  backend started with no window or GUI profile. Inspector-injected host-only relaunches
+  retained that state; activation created a visible GUI, verified through native accessibility.
+  A second ordinary relaunch retained the same GUI window and backend process. This exercised
+  real Electron event handlers, not a physical Dock/LaunchServices click. Temporary processes
+  and data were removed; the installed app and its data were not replaced.
+
+### Sidebar input dependency and recovery investigation (2026-09-28)
+
+- `sessions:list` used the full serialized `listInputs()` on every refresh, solely to recover
+  initial helper origins. It now waits on `restoreInputs()` instead. Actual completed initial
+  loading satisfies that barrier even before the first sidebar request. Ongoing input
+  preparation cannot hold a newly recorded session out of the sidebar; claims and native
+  Send authorization retain their existing serialized owner.
+- Focused regressions preserve initial helper hiding and show a newly created session while
+  another input's preparation is held. This removes a proved display dependency; it does not
+  establish that browser observation itself was slow.
+- The earlier automatic Continue wait remains unconfirmed at its originating operation.
+  Before an external backend restart, controls/outbox reads exceeded their 15/30-second
+  probe bounds. The restart erased the pending operation. Matching production input code and
+  a valid 599,406-byte recovery-history fixture completed ticket creation, outbox reading and
+  browser-offer lookup in 23–49 ms. Inspected input/store paths yielded no reproduced cycle.
+  No timeout override, forced resend or speculative recovery-policy change was added.
+- `npm run verify` passed: 213 test files, 5,878 tests, and six separate shutdown tests;
+  83 tests were skipped. Privacy, notices and typecheck passed. The production Electron,
+  CLI and daemon builds passed. After hardening failed initial restoration to discard its
+  partial cache and retry, ten input suites passed all 668 tests and typecheck passed again.
+  The final production build passed.
+- The isolated API smoke exercised production IPC handlers, input and real session storage:
+  a held preparation did not delay the new-session list, and release preserved one durable
+  claim owner and exact Send authorization. Its headless native Electron harness did not
+  reach readiness, so this smoke used a throwaway Electron transport stub; it does not prove
+  cross-process GUI transport or signed-in ChatGPT delivery. Temporary fixtures were removed.
+
+### Automatic Continue survives delivered-input history replay (2026-09-28)
+
+- Restart reprojects wrapped outbox receipts into canonical history. When the native page
+  had reserialized that same message, restoring its frozen delivery text advanced the old
+  question's work stamp and cancelled an otherwise eligible Continue as new work.
+- `recordDeliveredInput` now publishes both text and later image enrichment as non-working
+  revisions. The store preserves an existing message's work stamp while a new message identity
+  still advances work. Recovery eligibility, source comparisons and Send custody are unchanged.
+- The integration regression failed before the fix because the restored Continue was cancelled.
+  A separate-process smoke using production history/storage modules and temporary disk state
+  preserved question work sequence 1 and current work sequence 4 after cold replay, restored
+  the frozen text and chronology, then advanced a genuinely new delivered input to sequence 6.
+  It used no browser or Electron mocks; it did not replace the installed runtime or exercise
+  signed-in provider recovery after the fix.
+- Adjacent input-history, retention, session-input, session-store and managed-outbox suites
+  passed all 389 tests.
+- The two new integration cases pass after the fix: replay remains send-authorizable,
+  while a new native question revokes the old claim before Send. The complete input-delivery
+  integration suite passed all 257 tests.
+- `npm run verify` passed privacy, license/native-source notices, typecheck, 5,880 tests
+  in 213 passing files and six separate shutdown tests; 83 tests were skipped. No package
+  installation or live-ledger repair was performed.
+
 ### Packaged runtime replacement (2026-09-23)
 
 - The prior detached host was stopped through its authenticated control socket and its GUI

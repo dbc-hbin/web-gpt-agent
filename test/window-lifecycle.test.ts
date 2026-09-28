@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   applyLoginStartup,
   supportsLoginStartup,
+  createBackendActivationGate,
   createWindowActivationGate,
   ownsAppRuntime,
   registerNativeWindowActivation,
@@ -10,10 +11,36 @@ import {
 } from '../src/main/window-lifecycle.js';
 
 describe('native window activation', () => {
-  ;
+  it('holds an early explicit host relaunch until GUI control is ready, then refuses teardown resurrection', () => {
+    const open = vi.fn();
+    const background = createBackendActivationGate(open);
+    background.request(['app', '--background']);
+    background.request(['app', '--daemon-host']);
+    background.enable();
+    expect(open).not.toHaveBeenCalled();
 
-  ;
-  ;
+    const gate = createBackendActivationGate(open);
+    gate.request(['app']);
+    gate.request(['app']);
+    expect(open).not.toHaveBeenCalled();
+    gate.enable();
+    expect(open).toHaveBeenCalledTimes(1);
+    gate.request(['app', '--background']);
+    gate.request(['app', '--daemon-host']);
+    expect(open).toHaveBeenCalledTimes(1);
+    gate.request();
+    expect(open).toHaveBeenCalledTimes(2);
+    gate.disable();
+    gate.request();
+    gate.enable();
+    expect(open).toHaveBeenCalledTimes(2);
+
+    const shuttingDown = createBackendActivationGate(open);
+    shuttingDown.request();
+    shuttingDown.disable();
+    shuttingDown.enable();
+    expect(open).toHaveBeenCalledTimes(2);
+  });
   it('never bootstraps shared state from a secondary or already-quitting process', () => {
     expect(ownsAppRuntime(true)).toBe(true);
     expect(ownsAppRuntime(false)).toBe(false);

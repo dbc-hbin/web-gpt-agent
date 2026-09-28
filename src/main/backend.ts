@@ -79,7 +79,7 @@ import {
 import { runShutdownSequence } from './shutdown.js';
 import { shutdownCodeModeRuntime } from './mcp/code-mode-runtime.js';
 import { openInPreferredBrowser } from './browser.js';
-import { applyLoginStartup, ownsAppRuntime, shouldBeginAppBootstrap } from './window-lifecycle.js';
+import { applyLoginStartup, createBackendActivationGate, ownsAppRuntime, registerNativeWindowActivation, shouldBeginAppBootstrap } from './window-lifecycle.js';
 import {
   createWorktreeActivityProbe,
   drainWorkRuntime,
@@ -143,11 +143,13 @@ const remoteIpcSubscribers = new Set<RemoteIpcPush>();
 let guiVisible = false;
 
 /** Opens the isolated GUI client without ever re-entering the persistent host role. */
-function openDesktopClient(sessionId: string): void {
+function openDesktopClient(sessionId?: string): void {
   const root = app.isPackaged ? null : process.env.WGPT_REPO_ROOT?.trim() || path.resolve(__dirname, '../..');
   const env = { ...process.env };
   delete env.ELECTRON_RUN_AS_NODE;
-  const child = spawn(process.execPath, [...(root ? [root] : []), '--data-dir', dataDir, `--open-session=${sessionId}`], {
+  const child = spawn(process.execPath, [
+    ...(root ? [root] : []), '--data-dir', dataDir, ...(sessionId ? [`--open-session=${sessionId}`] : [])
+  ], {
     detached: true,
     stdio: 'ignore',
     env
@@ -210,20 +212,14 @@ if (!hasSingleInstanceLock) {
   app.quit();
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+// A fresh app launch can be delivered to the resident host instead of starting a GUI. Do not
+// mistake a second *host* launch (login/startHost) for an invitation to show a window. The gate
+// retains a genuine early relaunch until the GUI control surface has finished bootstrapping.
+const activation = createBackendActivationGate(() => openDesktopClient());
+app.on('second-instance', (_event, argv) => {
+  if (!hasSingleInstanceLock || quitting) return;
+  activation.request(argv);
+});
 
 void app.whenReady().then(async () => {
   // This guard is intentionally before even app.getPath/init* calls. A secondary instance, or a
@@ -480,6 +476,13 @@ void app.whenReady().then(async () => {
   }
   // The backend has no Electron web contents. Renderer CSP, permissions, windows, menus and
   // tray belong exclusively to the separate desktop-client process.
+  // macOS also emits `activate` while booting a background/host process. Installing the native
+  // handler only now prevents that boot event from spawning a GUI, while subsequent Dock opens
+  // reuse the same launch path as notification clicks.
+  if (!quitting) {
+    registerNativeWindowActivation(app, () => activation.request());
+    activation.enable();
+  }
 
   logInfo('app started');
 
@@ -513,6 +516,7 @@ void app.whenReady().then(async () => {
 app.on('before-quit', () => {
   if (!ownsAppRuntime(hasSingleInstanceLock)) return;
   quitting = true;
+  activation.disable();
   usageWarmup.abort();
 });
 
