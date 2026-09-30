@@ -475,6 +475,8 @@ describe('control socket publishing', () => {
     intruder.on('data', (chunk: Buffer) => {
       intruderData += chunk.toString('utf8');
     });
+    // Armed before anything can drop it: the drop may land before the host promise settles.
+    const intruderClosed = new Promise<void>((resolve) => intruder.once('close', () => resolve()));
     await new Promise<void>((resolve, reject) => {
       intruder.once('connect', () => resolve());
       intruder.once('error', reject);
@@ -488,7 +490,7 @@ describe('control socket publishing', () => {
     expect(host.transport).toBe('pipe');
 
     // The pre-restriction connection was closed without an answer of any kind.
-    await new Promise<void>((resolve) => intruder.once('close', () => resolve()));
+    await intruderClosed;
     expect(intruderData).toBe('');
 
     // And the pipe is usable: the descriptor is published only now, and a client that connects

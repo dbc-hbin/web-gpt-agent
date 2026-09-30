@@ -29,17 +29,31 @@ it.runIf(process.env.COS_PLUGIN_LIVE_TEST === '1')('routes upstream Memory throu
     client = new Client({ name: 'CoS live acceptance', version: '1.0.0' });
     await client.connect(new StreamableHTTPClientTransport(new URL(endpoint.urls.plugins), { requestInit: { headers: { 'x-request-id': requestId } } }));
     const tools = (await client.listTools()).tools;
-    expect(tools.some(tool => tool.name === name)).toBe(true);
-    const mutation = await client.callTool({ name, arguments: { entities: [{ name: 'CoS proxy acceptance', entityType: 'test', observations: ['Local disposable fixture'] }] } });
-    expect(mutation.isError).not.toBe(true);
+    // Plugins publishes only code mode; each upstream tool keeps its exposed name inside `exec`.
+    expect(tools.map(tool => tool.name).sort()).toEqual(['exec', 'tools_search', 'wait']);
+    const exec = async (code: string) => {
+      const reply = await client!.callTool({ name: 'exec', arguments: { code } });
+      const text = (reply.content as Array<{ type: string; text?: string }>).filter(part => part.type === 'text').map(part => part.text).join('\n');
+      return { reply, text };
+    };
+    const invoke = (tool: string, args: unknown) =>
+      `text(JSON.stringify(await tools[${JSON.stringify(tool)}]({ arguments: ${JSON.stringify(args)} })));`;
+    const mutation = await exec(invoke(name, { entities: [{ name: 'CoS proxy acceptance', entityType: 'test', observations: ['Local disposable fixture'] }] }));
+    expect(mutation.reply.isError).not.toBe(true);
+    expect(JSON.parse(mutation.text).isError).not.toBe(true);
     const read = installed.tools.find(tool => tool.name === 'read_graph')!.exposedName;
-    expect(JSON.stringify(await client.callTool({ name: read, arguments: {} }))).toContain('CoS proxy acceptance');
+    expect((await exec(invoke(read, {}))).text).toContain('CoS proxy acceptance');
     await pluginManager.setToolEnabled(installed.id, 'create_entities', false);
-    expect((await client.callTool({ name, arguments: { entities: [] } })).isError).toBe(true);
+    const refused = await exec(`try { ${invoke(name, { entities: [] })} } catch (error) { text("refused: " + error.message); }`);
+    expect(refused.text).toMatch(/refused:|"isError":true/);
     await flushRecorder();
-    const calls = (await readEvents(session.id)).filter(event => event.kind === 'tool_call');
-    expect(calls.length).toBe(3);
-    expect(calls.every(event => event.kind === 'tool_call' && event.call.attributionMethod === 'request_id')).toBe(true);
+    const recorded = (await readEvents(session.id)).flatMap(event => event.kind === 'tool_call' ? [event.call] : []);
+    // Two dispatched children plus three outer `exec` calls. The disabled call is refused before
+    // dispatch, so it never becomes a child record; the refusal belongs to its outer call only.
+    expect(recorded.map(call => call.tool)).toEqual(['create_entities', 'exec', 'read_graph', 'exec', 'exec']);
+    expect(recorded.every(call => call.attributionMethod === 'request_id')).toBe(true);
+    const calls = recorded.filter(call => call.tool !== 'exec');
+    expect(calls.length).toBe(2);
     expect(JSON.stringify(calls)).toContain('CoS proxy acceptance');
   } finally {
     await client?.close();

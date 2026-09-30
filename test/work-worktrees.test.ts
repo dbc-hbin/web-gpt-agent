@@ -1298,7 +1298,8 @@ describe('successor baselines', () => {
       baselineCommit: baseline.baselineCommit,
       agentId: second.primeId
     });
-    expect(git(assignment.path, ['rev-parse', '--show-toplevel']).trim()).toBe(assignment.path);
+    // Git for Windows prints the toplevel with forward slashes; the product resolves it natively.
+    expect(path.resolve(git(assignment.path, ['rev-parse', '--show-toplevel']).trim())).toBe(path.resolve(assignment.path));
     expect(git(assignment.path, ['ls-tree', '-r', '--name-only', 'HEAD']).trim()).toContain('result.txt');
   });
 

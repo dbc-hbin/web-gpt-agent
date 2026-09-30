@@ -181,6 +181,9 @@ export async function assertControlTransport(
 
 /** Bounded concurrent clients: a stuck CLI must not be able to exhaust the host's fds. */
 const MAX_CLIENTS = 16;
+/** Random bytes in the ACL-window sentinel's nonce, and its bounded arrival deadline. */
+const SEAL_NONCE_BYTES = 16;
+const SEAL_TIMEOUT_MS = 5_000;
 export const CONTROL_METHODS = [
   'host.status',
   'host.stop',
@@ -877,6 +880,35 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
    * still carrying the default descriptor; see the connection handler below.
    */
   let restricted = transport === 'unix';
+  /** Set only while sealing the Windows ACL window; see `sealPipeWindow`. */
+  let sealNonce: string | null = null;
+  let sealArrived: (() => void) | null = null;
+  /**
+   * Proves every connection accepted before the ACL landed has reached the tracking handler.
+   *
+   * A named pipe hands out server instances in connection order, so a sentinel client opened
+   * after the ACL is accepted after every earlier peer. When the server reads the sentinel's
+   * random nonce, every pre-ACL accept has already been tracked in `sockets`. Bounded: a pipe
+   * whose own owner cannot reach it within the deadline fails closed.
+   */
+  const sealPipeWindow = async (): Promise<void> => {
+    const nonce = randomBytes(SEAL_NONCE_BYTES).toString('hex');
+    const arrived = Promise.withResolvers<void>();
+    sealNonce = nonce;
+    sealArrived = () => arrived.resolve();
+    const sentinel = net.connect(socketPath);
+    const timer = setTimeout(() => arrived.reject(new Error('the sentinel connection did not arrive')), SEAL_TIMEOUT_MS);
+    try {
+      sentinel.once('error', error => arrived.reject(error));
+      sentinel.once('connect', () => sentinel.write(`${nonce}\n`));
+      await arrived.promise;
+    } finally {
+      clearTimeout(timer);
+      sealNonce = null;
+      sealArrived = null;
+      sentinel.destroy();
+    }
+  };
 
   const server = net.createServer((socket) => {
     const order = ++connectionOrder;
@@ -900,6 +932,14 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
       sockets.add(socket);
       socket.on('error', () => socket.destroy());
       socket.on('close', () => sockets.delete(socket));
+      // Only the local sentinel knows the nonce; nothing a peer sends is otherwise read.
+      if (sealNonce) {
+        let seen = '';
+        socket.on('data', (chunk: Buffer) => {
+          seen = (seen + chunk.toString('utf8')).slice(-SEAL_NONCE_BYTES * 4);
+          if (sealNonce && seen.includes(sealNonce)) sealArrived?.();
+        });
+      }
       return;
     }
     if (sockets.size >= MAX_CLIENTS) {
@@ -1188,10 +1228,21 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
     // Anything that connected while the default descriptor was still in force never reached
     // the protocol and is dropped now that the pipe is this user's alone. The socket the ACL
     // script itself opened is one of these. A peer can finish opening the pipe before the ACL
-    // lands while libuv delivers its server-side accept only on the next loop pass; one
-    // event-loop turn lets every accept the kernel already completed reach the handler above
-    // while `restricted` is still false, so admission follows arrival rather than dispatch.
-    await new Promise<void>((resolve) => setImmediate(resolve));
+    // lands while the server-side accept is still queued, so dispatch order cannot decide
+    // admission. Seal causally instead: a sentinel opened *after* the ACL is accepted after every
+    // earlier peer, so once its nonce reaches the server every pre-ACL accept has been tracked.
+    // Drop what is already tracked first, so pre-ACL peers cannot hold every slot the sentinel
+    // needs; stragglers accepted before the sentinel are tracked again and dropped below.
+    for (const socket of sockets) socket.destroy();
+    sockets.clear();
+    try {
+      await sealPipeWindow();
+    } catch (error) {
+      for (const socket of sockets) socket.destroy();
+      sockets.clear();
+      await new Promise<void>((resolve) => server.close(() => resolve())).catch(() => undefined);
+      throw new ControlSocketError(`the control pipe window could not be sealed: ${errorText(error)}`, 'INTERNAL');
+    }
     for (const socket of sockets) socket.destroy();
     sockets.clear();
     restricted = true;
