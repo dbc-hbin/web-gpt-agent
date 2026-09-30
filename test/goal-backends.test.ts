@@ -129,7 +129,14 @@ async function recording(conversationId: string, text: string): Promise<string> 
   return session.id;
 }
 async function settled(id: string) {
-  await vi.waitFor(() => expect(goal.goalViewFor(id)?.stage).not.toMatch(/^(sending|answering)$/));
+  // The draft publishes every stage change through onGoalChange; wait for that fact instead of
+  // a wall-clock poll whose default one-second bound a loaded CI runner can outlast.
+  const pending = () => /^(sending|answering)$/.test(goal.goalViewFor(id)?.stage ?? '');
+  if (pending()) {
+    const { promise, resolve } = Promise.withResolvers<void>();
+    const stop = goal.onGoalChange(() => { if (!pending()) resolve(); });
+    try { await promise; } finally { stop(); }
+  }
   return goal.goalViewFor(id)!;
 }
 describe('Goal decision backends', () => {
