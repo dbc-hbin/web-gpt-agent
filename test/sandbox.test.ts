@@ -10,6 +10,7 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import type { Root } from '../src/shared/types.js';
 import {
   SandboxError,
+  approvedRootContaining,
   isContained,
   normaliseRootName,
   resolvePath,
@@ -148,8 +149,19 @@ describe('resolvePath — happy path', () => {
   });
 
   it('accepts redundant separators', async () => {
+    const resolved = await resolvePath(roots, '/project///sub//nested.txt');
+    expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  // A doubled *leading* separator is only redundant on POSIX. On Windows `//host/share` is a UNC
+  // spelling, which the sandbox refuses before any lookup even when `host` matches a root name.
+  it.runIf(!IS_WINDOWS)('accepts a doubled leading separator', async () => {
     const resolved = await resolvePath(roots, '//project///sub//nested.txt');
     expect(resolved.virtual).toBe('/project/sub/nested.txt');
+  });
+
+  it.runIf(IS_WINDOWS)('treats a doubled leading separator as a refused UNC path', async () => {
+    await expect(resolvePath(roots, '//project///sub//nested.txt')).rejects.toThrow(/not inside an approved folder/);
   });
 
   it('matches the root name case-insensitively', async () => {
@@ -456,6 +468,16 @@ describe('validateNewRoot', () => {
 
   it('accepts a sibling folder', async () => {
     expect(await validateNewRoot(outside, [{ name: 'project', path: approved }])).toBe(outside);
+  });
+});
+
+describe('approvedRootContaining', () => {
+  it('reads a native path natively even when a root alias equals its first segment', async () => {
+    // Linux CI: os.tmpdir() is /tmp and a root approved there is named "tmp", so a virtual
+    // reading of "/tmp/..." would look for "..." inside that root instead.
+    const alias = { name: approved.split(/[/\\]/).find(Boolean)!.toLowerCase(), path: approved };
+    expect(await approvedRootContaining([alias], path.join(approved, 'sub'))).toBe(alias);
+    expect(await approvedRootContaining([alias], outside)).toBeNull();
   });
 });
 

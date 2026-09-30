@@ -442,6 +442,21 @@ export async function resolveRoot(roots: readonly Root[], name: string): Promise
 }
 
 /**
+ * The approved root whose canonical tree contains an existing native directory, if any.
+ *
+ * For host-owned native paths only. `resolvePath` would read `/tmp/...` as the virtual root
+ * `/tmp` whenever a root is named `tmp`, so a native spelling must never go through it.
+ */
+export async function approvedRootContaining(roots: readonly Root[], nativePath: string): Promise<Root | null> {
+  const real = await canonicalRealpath(nativePath);
+  for (const root of roots) {
+    const rootReal = await realRoot(root).catch(() => null);
+    if (rootReal && isContained(rootReal, real)) return root;
+  }
+  return null;
+}
+
+/**
  * Validates a folder the user picked in the UI before it becomes a root.
  * Rejects network paths and roots that would nest inside an existing one.
  */

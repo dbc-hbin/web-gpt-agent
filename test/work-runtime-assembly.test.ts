@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -7,6 +7,7 @@ import { WORK_BLOCKER_CODES, WORK_ERROR_CODES } from '../src/shared/work.js';
 import { makeTempDir, removeTempDir, writeTree, SAMPLE_BRIEF } from './helpers.js';
 import { defaultConfig, initConfigPath, saveConfig, getConfig } from '../src/main/config.js';
 import { flushDurable, initDurableStore, resetDurableForTests } from '../src/main/durable.js';
+import { closeCorrelationStore } from '../src/main/session/correlation.js';
 import { createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { attachSummary, beginContinuationSourceSendNow, claimContinuationNow, commitContinuationResult, continuationForSession, continuationByToken, dispatchContinuationSourceSendNow, openContinuationNow, resetContinuationsForTests } from '../src/main/session/continuation.js';
 import { createWorkStore, type WorkStore } from '../src/main/work/store.js';
@@ -95,6 +96,9 @@ afterAll(async () => {
   await flushDurable();
   resetSessionStoreForTests();
   resetDurableForTests();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await removeTempDir(root);
 });
 
@@ -286,7 +290,11 @@ it('starts a work, creates real worktrees, fences pause/resume/cancel and reconc
   const integration = receipt.integration_worktree!;
   await waitForEvent(store, receipt.work_id, ['worktree_assigned']);
   // `worktree_assigned` is committed after the baseline, so the checkout is already populated.
-  expect(await fs.readFile(path.join(integration, 'src/a.txt'), 'utf8')).toBe('a\n');
+  // Git's own checkout of the baseline blob, so a host that converts line endings on checkout
+  // (`core.autocrlf=true` on Windows) is compared against the bytes Git itself would write.
+  const readGit = (args: string[]): string => execFileSync('git', args, { cwd: integration, encoding: 'utf8' });
+  expect(readGit(['show', 'HEAD:src/a.txt'])).toBe('a\n');
+  expect(await fs.readFile(path.join(integration, 'src/a.txt'), 'utf8')).toBe(readGit(['cat-file', '--filters', 'HEAD:src/a.txt']));
   const work = store.getWork(receipt.work_id)!;
   expect(work.base_commit).toMatch(/^[0-9a-f]{40}$/);
   // The assigned folder must resolve through the sandbox.
@@ -504,6 +512,7 @@ it('starts a work, creates real worktrees, fences pause/resume/cancel and reconc
   expect(store.getWork(unknown.work_id)!.blocker?.code).toBe('OPERATION_OUTCOME_UNKNOWN');
 
   detach();
+  store.close();
 });
 
 it('does not bind an ordinary broker worker into a managed row with the same local id', async () => {
@@ -958,6 +967,7 @@ it('never lets a stage or watcher that was already in flight overwrite a stop', 
     expect(store.getAgent(prime.agent_id)!.conversation_id).toBeNull();
     await drainWorkRuntime();
     resetWorkRuntimeForTests();
+    store.close();
   } finally {
     setWatcherDelayForTests(null);
   }
@@ -1013,6 +1023,7 @@ it('a watcher whose prime was dispatched cannot resurrect a cancelled work', asy
       .some(event => event.kind === 'work_started')).toBe(false);
     await drainWorkRuntime();
     resetWorkRuntimeForTests();
+    store.close();
   } finally {
     setWatcherDelayForTests(null);
   }

@@ -104,7 +104,9 @@ export function defaultUserDataDir(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env
 ): string {
-  return path.join(appDataRoot(env, platform), NPM_NAME);
+  // Joined in the grammar of the platform asked about, not this host's: a darwin path resolved on
+  // a Windows host must not come back with backslashes.
+  return (platform === 'win32' ? path.win32 : path.posix).join(appDataRoot(env, platform), NPM_NAME);
 }
 
 /**

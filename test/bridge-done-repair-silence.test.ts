@@ -32,6 +32,7 @@ const {
   sweepStaleSwarm
 } = await import('../src/main/bridge.js');
 const { flushDurable, initDurableStore, writeDurableSoon } = await import('../src/main/durable.js');
+const { closeCorrelationStore } = await import('../src/main/session/correlation.js');
 const {
   findSessionByConversation,
   initSessionStore,
@@ -154,6 +155,9 @@ beforeAll(async () => {
 afterAll(async () => {
   await shutdownBridge();
   resetSessionStoreForTests();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await removeTempDir(dir);
 });
 

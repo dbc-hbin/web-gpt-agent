@@ -6,7 +6,7 @@ import { beforeAll, afterAll, afterEach, expect, it, vi } from 'vitest';
 import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import { initSessionStore, createSession, getSession, readSessionPlan, readEvents, readOverflowText, rebindSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder, recordChatObservations } from '../src/main/session/recorder.js';
 import { cancelInput, enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
 import { setChatBlocked, resetBlockedChatsForTests } from '../src/main/session/blocked-chats.js';
@@ -291,7 +291,7 @@ afterEach(async () => {
   await saveConfig({ ...config, multiAgent: { ...config.multiAgent, allowUnattributedCalls: true } });
 });
 afterAll(async () => {
-  await endpoint.stop(); await unifiedExecManager.terminateAllProcesses(); await flushRecorder(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
+  await endpoint.stop(); await unifiedExecManager.terminateAllProcesses(); await flushRecorder(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); closeCorrelationStore(); await removeTempDir(directory);
 });
 
 it.each([

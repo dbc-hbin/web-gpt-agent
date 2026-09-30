@@ -255,7 +255,11 @@ describe('baseline capture', () => {
     expect(entries.get('f.txt')?.hash).toBe(git(root, ['hash-object', '--path=f.txt', '--', 'f.txt']).trim());
     expect(entries.get('untracked/nested.txt')?.mode).toBe('100644');
     expect(entries.get('link.txt')?.mode).toBe('120000');
-    expect(entries.get('exec.sh')?.mode).toBe('100755');
+    // A working-tree chmod is only a mode change where Git honours the executable bit. Git for
+    // Windows initializes repositories with `core.fileMode=false`, and there the bit is not a fact
+    // Git records, so the recorded `100644` is what a faithful capture must keep.
+    const honorsFileMode = git(root, ['config', '--bool', 'core.fileMode']).trim() !== 'false';
+    expect(entries.get('exec.sh')?.mode).toBe(honorsFileMode ? '100755' : '100644');
     expect(entries.has('ignored.txt')).toBe(false);
     // The manifest the caller sees agrees with the commit it produced.
     expect(baseline.manifest.find((entry) => entry.path === 'link.txt')?.hash).toBe(entries.get('link.txt')?.hash);
@@ -270,6 +274,28 @@ describe('baseline capture', () => {
     // The only ref it adds is its own.
     expect(git(root, ['rev-parse', baseline.baseRef ?? '']).trim()).toBe(baseline.baselineCommit);
     expect(git(root, ['for-each-ref', '--format=%(refname)', 'refs/web-gpt-agent']).trim()).toBe(`refs/web-gpt-agent/${workId}/base`);
+  });
+
+  it('keeps a recorded executable mode when the repository ignores the filesystem bit', async () => {
+    // `core.fileMode=false` is Git for Windows' default: the index, not `stat`, owns the mode.
+    const root = await repository({ 'tool.sh': '#!/bin/sh\n', 'plain.txt': 'plain\n' });
+    git(root, ['config', 'core.fileMode', 'false']);
+    git(root, ['update-index', '--chmod=+x', 'tool.sh']);
+    git(root, ['commit', '-qm', 'recorded executable']);
+    // Neither the filesystem bit of a recorded script nor that of a new file is a mode change here.
+    chmodSync(path.join(root, 'tool.sh'), 0o644);
+    write(root, 'new.sh', '#!/bin/sh\n');
+    chmodSync(path.join(root, 'new.sh'), 0o755);
+
+    const { store, dir } = await ledger();
+    const { workId } = seed(store);
+    const baseline = await manager(store, dir).captureBaseline({ projectPath: root, workId });
+
+    const modes = new Map(baseline.manifest.map((entry) => [entry.path, entry.mode]));
+    expect(modes.get('tool.sh')).toBe('100755');
+    expect(modes.get('plain.txt')).toBe('100644');
+    expect(modes.get('new.sh')).toBe('100644');
+    expect(git(root, ['ls-tree', baseline.baselineCommit, 'tool.sh']).split(' ')[0]).toBe('100755');
   });
 
   it('captures an unborn repository from an empty tree and leaves HEAD unborn', async () => {
@@ -544,7 +570,10 @@ describe('worktrees and integration', () => {
     const aborted = await engine.abortIntegration({ workId });
     expect(aborted.state).toBe('aborted');
     expect(git(integration.path, ['status', '--porcelain'])).toBe('');
-    expect(await fs.readFile(path.join(integration.path, 'f.txt'), 'utf8')).toBe('l1\nPRIME\nl3\n');
+    // The abort restores the prime's committed line, and the file on disk is exactly Git's checkout
+    // of it — including the host's line-ending conversion (`core.autocrlf=true` on Windows runners).
+    expect(git(integration.path, ['show', 'HEAD:f.txt'])).toBe('l1\nPRIME\nl3\n');
+    expect(await fs.readFile(path.join(integration.path, 'f.txt'), 'utf8')).toBe(git(integration.path, ['cat-file', '--filters', 'HEAD:f.txt']));
     expect(store.getIntegrationIntent(workId)?.status).toBe('aborted');
   });
 
@@ -1243,7 +1272,8 @@ describe('successor baselines', () => {
     const main = await repository({ 'f.txt': 'l1\nl2\nl3\n' });
     const linked = path.join(await makeTempDir('wgpt-wt-linked-'), 'feature');
     git(main, ['worktree', 'add', '-q', '-b', 'feature', linked]);
-    expect(git(linked, ['rev-parse', '--show-toplevel']).trim()).toBe(linked);
+    // Git for Windows prints `C:/…`; the product resolves it (`path.resolve`) before comparing.
+    expect(path.resolve(git(linked, ['rev-parse', '--show-toplevel']).trim())).toBe(linked);
     expect(git(linked, ['rev-parse', '--git-common-dir']).trim()).not.toBe(path.join(linked, '.git'));
 
     const { store, dir } = await ledger();

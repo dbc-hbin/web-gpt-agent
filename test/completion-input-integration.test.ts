@@ -22,6 +22,7 @@ vi.mock('../src/main/browser.js', () => ({ openInPreferredBrowser: async () => '
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath } = await import('../src/main/secrets.js');
 const { initDurableStore, flushDurable, resetDurableForTests, writeDurableNow } = await import('../src/main/durable.js');
+const { closeCorrelationStore } = await import('../src/main/session/correlation.js');
 const { initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { registerIpc } = await import('../src/main/ipc.js');
 const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge.js');
@@ -64,6 +65,9 @@ beforeEach(async () => {
 });
 afterAll(async () => {
   await stopBridge(); await flushDurable(); resetSessionStoreForTests(); resetDurableForTests();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await removeTempDir(directory);
 });
 

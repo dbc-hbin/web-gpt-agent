@@ -439,6 +439,14 @@ export interface WorkStore {
    */
   releaseCommand(requestId: string, restore: Pick<WorkCommandRow, 'delivery_state' | 'attempts' | 'last_error'>): WorkCommandRow;
   /**
+   * Moves never-leased rows to the back of the pump's rotation in one silent commit.
+   *
+   * The same effect a `releaseCommand` of a deferred attempt has on `updated_at`, for rows the pump
+   * held without attempting because their work already answered `deferred` for the whole work. No
+   * state, attempt, revision or event changes.
+   */
+  rotateCommands(requestIds: readonly string[]): void;
+  /**
    * Records a real delivery transition. A patch that would leave every column unchanged is a
    * no-op: it writes nothing, bumps no revision and appends no event.
    */
@@ -1794,6 +1802,15 @@ export function createWorkStore(options: WorkStoreOptions): WorkStore {
         // no outcome is not a fact about the work. `updated_at` moves only so the pump's rotation
         // can advance without re-reading the same rows first every time.
         return store.getCommand(requestId)!;
+      });
+    },
+
+    rotateCommands(requestIds) {
+      if (requestIds.length === 0) return;
+      const at = now();
+      const touch = database.prepare('UPDATE work_commands SET updated_at = ? WHERE request_id = ?');
+      transaction(() => {
+        for (const requestId of requestIds) touch.run(at, requestId);
       });
     },
 

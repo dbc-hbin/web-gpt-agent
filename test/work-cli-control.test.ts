@@ -63,6 +63,7 @@ import {
   type WorkServiceHandle
 } from '../src/main/work/service.js';
 import { createWorkStore, type WorkStore } from '../src/main/work/store.js';
+import { defaultUserDataDir } from '../src/main/identity.js';
 
 vi.mock('electron', () => ({
   safeStorage: {
@@ -837,10 +838,15 @@ describe('wgpt argument and failure contract', () => {
   });
 
   it('names the work directory the CLI will use when none is given', async () => {
-    const result = await invoke(['work', 'list', '--json'], { ...process.env, HOME: os.tmpdir() });
+    // Point every per-OS data root at the temp directory so the default can never be the
+    // developer's or runner's real one (hosted Linux runners export XDG_CONFIG_HOME).
+    const env = { ...process.env, HOME: os.tmpdir(), XDG_CONFIG_HOME: undefined, APPDATA: undefined };
+    const result = await invoke(['work', 'list', '--json'], env);
     expect(result.code).toBe(EXIT_HOST_UNAVAILABLE);
     const error = (jsonLines(result.out)[0] as { error: { message: string } }).error;
-    expect(error.message).toContain(path.join(os.tmpdir(), 'Library', 'Application Support', 'web-gpt-agent'));
+    const expected = defaultUserDataDir(process.platform, env);
+    expect(expected.startsWith(os.tmpdir())).toBe(true);
+    expect(error.message).toContain(expected);
   });
 });
 

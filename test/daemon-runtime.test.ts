@@ -27,7 +27,10 @@ import { makeTempDir, removeTempDir } from './helpers.js';
 
 const cleanups: Array<() => Promise<void>> = [];
 afterEach(async () => {
-  for (const cleanup of cleanups.splice(0)) await cleanup().catch(() => undefined);
+  // Last acquired, first released: a daemon started over a fixture must stop (and close its
+  // SQLite ledgers) before that fixture's directory is removed. Windows refuses to unlink a file
+  // a live handle still holds, so FIFO order turned every cleanup into EBUSY retries.
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup().catch(() => undefined);
 });
 
 /** A data directory with one approved root and every coding permission granted. */

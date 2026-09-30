@@ -35,7 +35,7 @@ import { createWorkStore, type WorkRow, type WorkStore } from '../src/main/work/
 import type { WorkControllerSnapshot } from '../src/shared/work-continuity.js';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { flushDurable, initDurableStore, resetDurableForTests } from '../src/main/durable.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import {
   appendEvent,
   upsertMessageEvent,
@@ -93,11 +93,14 @@ function work(over: Partial<WorkRow> = {}): WorkRow {
   };
 }
 
-/** The browserless half of the runtime port: this fixture is about the ledger, not a browser. */
+/**
+ * The browserless half of the runtime port: this fixture is about the ledger, not a browser.
+ * "No browser" is an answer about the work, never one row, exactly like production's unbound prime.
+ */
 function browserlessRuntime(): WorkRuntimePort {
   return {
     async beginStart() { /* the fixture drives its own stages */ },
-    async deliver() { return { state: 'deferred', detail: 'no browser in this fixture' }; },
+    async deliver() { return { state: 'deferred', detail: 'no browser in this fixture', scope: 'work' }; },
     async control(input) { return { status: input.action === 'cancel' ? 'cancelled' : 'paused' }; },
     async reconcile() { /* the ledger is already the source of truth */ }
   };
@@ -275,6 +278,9 @@ afterEach(async () => {
   resetSessionStoreForTests();
   resetDurableForTests();
   await flushDurable();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await fs.rm(directory, { recursive: true, force: true });
 });
 

@@ -4,7 +4,7 @@ import { codeModeCall, codeModeResult } from './code-mode-helpers.js';
 import { externalSchemaHash } from '../src/main/plugins/external-declaration.js';
 import { randomUUID } from 'node:crypto';
 import { createSession } from '../src/main/session/store.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import type { CallToolResult } from '@modelcontextprotocol/server';
 import { initConfigPath, loadConfig, getConfig, updateConfig, effectiveCapabilities } from '../src/main/config.js';
 import { initSessionStore, listSessions, readEvents } from '../src/main/session/store.js';
@@ -61,7 +61,7 @@ beforeAll(async () => {
 });
 beforeEach(async () => { plugin.enabled = true; plugin.call.mockClear(); plugin.redactResult.mockClear(); await updateConfig(config => ({ ...config, readOnly: false })); });
 afterEach(() => { vi.restoreAllMocks(); });
-afterAll(async () => { await endpoint?.stop(); await flushRecorder(); resetDurableForTests(); await removeTempDir(directory); });
+afterAll(async () => { await endpoint?.stop(); await flushRecorder(); resetDurableForTests(); closeCorrelationStore(); await removeTempDir(directory); });
 
 async function invokePlugin(name: string, args: unknown = {}, requestId?: string) {
   const reply = await rpc('plugins', 'tools/call', codeModeCall(name, { arguments: args }), requestId);

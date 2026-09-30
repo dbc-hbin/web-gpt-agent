@@ -29,7 +29,7 @@ vi.mock('../src/main/secrets.js', () => ({
 import { initConfigPath, defaultConfig, getConfig, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { createSession, initSessionStore, resetSessionStoreForTests } from '../src/main/session/store.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
 import { createRegistrar, setManagedToolGate, type ToolResult } from '../src/main/mcp/kernel.js';
 import { withInboundRequestId } from '../src/main/mcp/inbound.js';
@@ -108,6 +108,14 @@ const REVISED_SCHEMA = {
   inputSchema: { type: 'object', properties: { value: { type: 'string', minLength: 1 }, mode: { type: 'string' } }, required: ['value', 'mode'], additionalProperties: false }
 };
 
+/**
+ * Models a host that ships the native driver (macOS/Windows). The gateway gates on both the
+ * platform verdict and the platform capability projection, which masks native clipboard on Linux.
+ */
+function supportedDesktopHost(): void {
+  vi.spyOn(platform, 'desktopAutomationSupported').mockReturnValue(true);
+  vi.spyOn(platform, 'capabilitiesForPlatform').mockImplementation(capabilities => capabilities);
+}
 
 /**
  * The first text block of a result.
@@ -241,6 +249,9 @@ afterAll(async () => {
   await flushRecorder();
   resetSessionStoreForTests();
   resetDurableForTests();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   if (dir) await removeTempDir(dir);
 });
 
@@ -499,6 +510,7 @@ it('requires a fresh observation for snapshot-bound actions and invalidates it o
 });
 
 it('routes the host-native Core server without an installed plugin and protects managed callers', async () => {
+  supportedDesktopHost();
   const config = getConfig();
   await saveConfig({ ...config, capabilities: { ...config.capabilities, screen: true, control: true } });
   const tools = projectCuaCatalog([
@@ -557,7 +569,7 @@ it('routes the host-native Core server without an installed plugin and protects 
 });
 
 it('filters native discovery, exact schemas, receipts and dispatch by each live capability', async () => {
-  vi.spyOn(platform, 'desktopAutomationSupported').mockReturnValue(true);
+  supportedDesktopHost();
   const tools = projectCuaCatalog(['list_windows', 'launch_app', 'clipboard_read', 'clipboard_write'].map(name =>
     ({ name, inputSchema: { type: 'object', properties: {}, additionalProperties: false } })) as Tool[]);
   vi.spyOn(nativeRuntime, 'embeddedCuaCatalog').mockReturnValue({ generation: 4, tools });
@@ -592,7 +604,7 @@ it('filters native discovery, exact schemas, receipts and dispatch by each live 
 });
 
 it('refuses native dispatch after an awaited admission is revoked', async () => {
-  vi.spyOn(platform, 'desktopAutomationSupported').mockReturnValue(true);
+  supportedDesktopHost();
   vi.spyOn(nativeRuntime, 'embeddedCuaCatalog').mockReturnValue({ generation: 4, tools: projectCuaCatalog([
     { name: 'clipboard_write', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }
   ] as Tool[]) });
@@ -622,7 +634,7 @@ it('refuses native dispatch after an awaited admission is revoked', async () => 
 });
 
 it('withholds native replies and driver errors after revocation, marking possible write effects uncertain', async () => {
-  vi.spyOn(platform, 'desktopAutomationSupported').mockReturnValue(true);
+  supportedDesktopHost();
   vi.spyOn(nativeRuntime, 'embeddedCuaCatalog').mockReturnValue({ generation: 4, tools: projectCuaCatalog([
     { name: 'list_windows', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'clipboard_write', inputSchema: { type: 'object', properties: {}, additionalProperties: false } }

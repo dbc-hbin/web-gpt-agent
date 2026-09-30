@@ -139,12 +139,16 @@ export interface WorkRuntimeDelivery {
  * the message. `queued` means the outbox accepted it and it is still waiting for its turn, and
  * `unknown` means the hand-off was attempted and its outcome cannot be established — both are
  * recorded as such and reconciled later, never reported as a delivery that happened.
+ *
+ * A `deferred` with `scope: 'work'` asserts that the answer depends only on the work (its prime
+ * binding, its browser), never on the row: every other unlinked row of the same work would be
+ * deferred identically until the work itself changes.
  */
 export type WorkRuntimeDeliveryResult =
   | { state: 'delivered' }
   | { state: 'queued'; detail?: string }
   | { state: 'unknown'; error: string }
-  | { state: 'deferred'; detail?: string }
+  | { state: 'deferred'; detail?: string; scope?: 'work' }
   | { state: 'failed'; error: string }
   | { state: 'cancelled' };
 
@@ -800,6 +804,12 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
     let reconcileLater = false;
     let advanced = false;
     let examined = 0;
+    // Works that answered a work-scoped `deferred` this pass, keyed to the revision observed then.
+    // Their other unlinked rows would get the identical answer, so they are held without a lease
+    // or a release (two synchronous commits each) until the work itself changes. Only the rotation
+    // those releases performed is kept, in one commit, so FIFO order is exactly what it was.
+    const heldWorks = new Map<string, number>();
+    const held: string[] = [];
     try {
       // Fresh commands first, then the ones that are only waiting to be reconciled. The split is
       // what keeps a slow chat from starving a new instruction out of the batch: a never-attempted
@@ -825,6 +835,13 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
         const stopped = work.status === 'paused' || work.status === 'cancelled' || work.desired_state !== null;
         if (stopped && command.delivery_state === 'pending' && command.attempts === 0 &&
             command.outbox_input_id === command.request_id) continue;
+        // A crash-left `delivering` row is still attempted: its release is what re-arms it.
+        if (!stopped && command.delivery_state !== 'delivering' && command.outbox_input_id === command.request_id &&
+            heldWorks.get(work.work_id) === work.revision) {
+          held.push(command.request_id);
+          reconcileLater = true;
+          continue;
+        }
         const previousState = command.delivery_state;
         const attempt = command.attempts + 1;
         // The lease is silent: it exists so a crash between here and the outcome leaves a row the
@@ -888,6 +905,10 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
             attempts: command.attempts,
             last_error: command.last_error
           });
+          if (result.scope === 'work' && command.outbox_input_id === command.request_id) {
+            const current = store.getWork(command.work_id);
+            if (current) heldWorks.set(current.work_id, current.revision);
+          }
           reconcileLater = true;
           continue;
         }
@@ -950,6 +971,7 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
         }
         store.updateCommand(command.request_id, { delivery_state: 'pending', last_error: error });
       }
+      if (alive()) store.rotateCommands(held);
     } finally {
       pumping = false;
     }

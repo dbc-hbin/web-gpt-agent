@@ -13,7 +13,7 @@
 
 import nodePath from 'node:path';
 
-import { createDirectory, getMetadata, invalidInput, readFileText, remove, writeFile } from '../filesystem.js';
+import { createDirectory, getMetadata, invalidInput, readFileText, remove, writeFile, type FileMetadata } from '../filesystem.js';
 import { ApplyPatchError, PatchParseError } from './errors.js';
 import { deriveNewContentsFromChunks } from './file-update.js';
 import { hunkPath, type Hunk } from './hunk.js';
@@ -45,16 +45,22 @@ export type PatchPathResolver = (spelledPath: string, cwd: string) => string;
 /** Patch matching holds old and reconstructed text together, so it needs its own budget. */
 export const MAX_PATCH_SOURCE_BYTES = 16 * 1024 * 1024;
 
-async function ensurePatchSourceWithinBudget(path: string, allowMissing = false): Promise<void> {
+/**
+ * One metadata read serves both questions the applier asks about a hunk's own path: whether it
+ * is small enough to patch, and whether a regular file there can be described exactly by the delta.
+ */
+async function inspectPatchSource(path: string, delta: AppliedPatchDelta, allowMissing = false): Promise<void> {
+  let metadata: FileMetadata;
   try {
-    const metadata = await getMetadata(path);
-    if (metadata.isFile && metadata.size > MAX_PATCH_SOURCE_BYTES) {
-      throw invalidInput(`file is too large to patch safely: limit is ${MAX_PATCH_SOURCE_BYTES} bytes`);
-    }
+    metadata = await getMetadata(path);
   } catch (error) {
     if (allowMissing && errorCode(error) === 'ENOENT') return;
     throw error;
   }
+  if (metadata.isFile && metadata.size > MAX_PATCH_SOURCE_BYTES) {
+    throw invalidInput(`file is too large to patch safely: limit is ${MAX_PATCH_SOURCE_BYTES} bytes`);
+  }
+  if (!(metadata.isFile && !metadata.isSymlink)) delta.exact = false;
 }
 
 /**
@@ -259,8 +265,8 @@ async function applyHunksToFiles(
     const resolved = resolveHunkPath(hunk, cwd, resolvePath);
 
     if (hunk.kind === 'add_file') {
-      await ensurePatchSourceWithinBudget(resolved, true);
-      const overwrittenContent = await readOptionalFileTextForDelta(resolved, delta);
+      await inspectPatchSource(resolved, delta, true);
+      const overwrittenContent = await readOptionalFileText(resolved, delta);
       await tryWrite(writeFileWithMissingParentRetry(resolved, hunk.contents));
       delta.changes.push({
         path: resolved,
@@ -271,8 +277,7 @@ async function applyHunksToFiles(
     }
 
     if (hunk.kind === 'delete_file') {
-      await ensurePatchSourceWithinBudget(resolved);
-      await noteExistingPathDeltaSupport(resolved, delta);
+      await inspectPatchSource(resolved, delta);
       let deletedContent: string | null = null;
       try {
         deletedContent = await readFileText(resolved);
@@ -297,8 +302,7 @@ async function applyHunksToFiles(
       continue;
     }
 
-    await ensurePatchSourceWithinBudget(resolved);
-    await noteExistingPathDeltaSupport(resolved, delta);
+    await inspectPatchSource(resolved, delta);
     const { originalContents, newContents } = await deriveNewContentsFromChunks(
       resolved,
       hunk.chunks,
@@ -307,7 +311,8 @@ async function applyHunksToFiles(
 
     if (hunk.movePath !== null) {
       const destination = resolvePath(hunk.movePath, cwd);
-      const overwrittenMoveContent = await readOptionalFileTextForDelta(destination, delta);
+      await noteExistingPathDeltaSupport(destination, delta);
+      const overwrittenMoveContent = await readOptionalFileText(destination, delta);
       await tryWrite(writeFileWithMissingParentRetry(destination, newContents));
       const destinationChangeIndex = delta.changes.length;
       delta.changes.push({
@@ -411,8 +416,8 @@ async function removeFailureWasSideEffectFree(
   }
 }
 
-async function readOptionalFileTextForDelta(path: string, delta: AppliedPatchDelta): Promise<string | null> {
-  await noteExistingPathDeltaSupport(path, delta);
+/** Reads a path whose metadata the caller already noted; a missing file has no preimage. */
+async function readOptionalFileText(path: string, delta: AppliedPatchDelta): Promise<string | null> {
   try {
     return await readFileText(path);
   } catch (error) {

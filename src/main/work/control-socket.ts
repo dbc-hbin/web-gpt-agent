@@ -1187,7 +1187,11 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
     }
     // Anything that connected while the default descriptor was still in force never reached
     // the protocol and is dropped now that the pipe is this user's alone. The socket the ACL
-    // script itself opened is one of these.
+    // script itself opened is one of these. A peer can finish opening the pipe before the ACL
+    // lands while libuv delivers its server-side accept only on the next loop pass; one
+    // event-loop turn lets every accept the kernel already completed reach the handler above
+    // while `restricted` is still false, so admission follows arrival rather than dispatch.
+    await new Promise<void>((resolve) => setImmediate(resolve));
     for (const socket of sockets) socket.destroy();
     sockets.clear();
     restricted = true;

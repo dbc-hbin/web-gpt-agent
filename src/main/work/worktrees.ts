@@ -699,10 +699,18 @@ export function createWorktreeManager(deps: WorktreeManagerDeps): WorktreeManage
     // An untracked embedded Git repository is reported as `dir/` while its tree entry is
     // `dir`; normalizing here is what lets the manifest and the captured tree be compared.
     const paths = splitNul(listed.stdout).map((entry) => (entry.endsWith('/') ? entry.slice(0, -1) : entry)).filter((entry) => entry !== '');
-    // With `core.fileMode=false` Git records every regular file as `100644` regardless of the
-    // executable bit, so a manifest built from the filesystem has to do the same or the two
-    // sides can never agree on a repository that made that choice.
+    // With `core.fileMode=false` (the Windows default) Git ignores the filesystem's executable bit:
+    // a regular file keeps the mode its index entry already has, and a new one is `100644`. The
+    // capture's index is seeded from HEAD, so HEAD's recorded mode is exactly what `add -A` keeps —
+    // a tracked `100755` script stays executable. Reading the bit from `stat` here instead made
+    // every such project look like it changed during the snapshot.
     const honorsFileMode = (await git(cwd, ['config', '--bool', 'core.fileMode'])).stdout.trim() !== 'false';
+    const recordedExecutable = new Set<string>();
+    if (!honorsFileMode && (await headCommit(cwd)) !== null) {
+      for (const entry of parseTreeZ((await gitOk(cwd, ['ls-tree', '-r', '-z', 'HEAD'])).stdout)) {
+        if (entry.mode === fileMode(true)) recordedExecutable.add(entry.path);
+      }
+    }
     const staged = parseStageZ((await gitOk(cwd, ['ls-files', '--stage', '-z'])).stdout);
     const gitlinks = new Map<string, string>();
     for (const entry of staged) {
@@ -733,7 +741,8 @@ export function createWorktreeManager(deps: WorktreeManagerDeps): WorktreeManage
         if (hash !== null) entries.push({ path: relative, mode: GITLINK_MODE, hash });
         continue;
       }
-      entries.push({ path: relative, mode: fileMode(honorsFileMode && (stat.mode & 0o111) !== 0), hash: '' });
+      const executable = honorsFileMode ? (stat.mode & 0o111) !== 0 : recordedExecutable.has(relative);
+      entries.push({ path: relative, mode: fileMode(executable), hash: '' });
       batchable.push(relative);
     }
 

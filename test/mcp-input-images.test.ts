@@ -6,7 +6,7 @@ import { expect, it } from 'vitest';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import { initSessionStore, createSession, appendEvent, observeSessionModel, resetSessionStoreForTests } from '../src/main/session/store.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { enqueueInput, listInputs, resetInputForTests } from '../src/main/session/input.js';
 import { validateInputImages } from '../src/main/session/input-images.js';
 import { stageInputAttachment } from '../src/main/session/input-attachments.js';
@@ -104,6 +104,6 @@ it.each([1, 7])('carries %s validated images through an exact-session MCP result
     expect((await listInputs()).find(row => row.id === stageTwo.id)?.state).toBe('sent');
   } finally {
     setFinishNotifier(null);
-    await endpoint.stop(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
+    await endpoint.stop(); await flushDurable(); resetInputForTests(); resetSessionStoreForTests(); resetDurableForTests(); closeCorrelationStore(); await removeTempDir(directory);
   }
 });

@@ -1874,14 +1874,51 @@ interface PatchResolution {
   displayRewrites: Map<string, string>;
 }
 
+/**
+ * Rewrites every native spelling in patch output to its model-visible path in one left-to-right
+ * pass, preferring the longest spelling that starts at each position.
+ *
+ * A patch names one spelling per hunk, and its output names most of them again. Searching the
+ * whole output once per spelling was O(hunks × output): a 4000-file patch spent most of its CPU
+ * time here scanning a summary that, on success, contains no native path at all.
+ */
 function safePatchOutput(text: string, resolution: PatchResolution): string {
-  let safe = text;
-  const rewrites = [...resolution.displayRewrites].sort(([a], [b]) => b.length - a.length);
-  for (const [from, to] of rewrites) {
-    if (from === '' || from === to || !safe.includes(from)) continue;
-    safe = safe.split(from).join(to);
+  const byLength = new Map<number, Map<string, string>>();
+  // Every spelling of one patch normally shares its root's native prefix, so `indexOf(prefix)`
+  // visits only real candidates and a summary without native paths costs one linear search.
+  let prefix: string | null = null;
+  for (const [from, to] of resolution.displayRewrites) {
+    if (from === '' || from === to) continue;
+    let bucket = byLength.get(from.length);
+    if (bucket === undefined) byLength.set(from.length, (bucket = new Map()));
+    bucket.set(from, to);
+    if (prefix === null) {
+      prefix = from;
+    } else {
+      let shared = 0;
+      while (shared < prefix.length && shared < from.length && prefix[shared] === from[shared]) shared++;
+      prefix = prefix.slice(0, shared);
+    }
   }
-  return safe;
+  if (prefix === null) return text;
+  const lengths = [...byLength.keys()].sort((a, b) => b - a);
+  let safe = '';
+  let copied = 0;
+  let index = text.indexOf(prefix);
+  scan: while (index !== -1 && index < text.length) {
+    for (const length of lengths) {
+      if (index + length > text.length) continue;
+      const to = byLength.get(length)!.get(text.slice(index, index + length));
+      if (to === undefined) continue;
+      safe += text.slice(copied, index) + to;
+      index += length;
+      copied = index;
+      index = text.indexOf(prefix, index);
+      continue scan;
+    }
+    index = text.indexOf(prefix, index + 1);
+  }
+  return copied === 0 ? text : safe + text.slice(copied);
 }
 
 /**

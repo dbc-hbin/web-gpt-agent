@@ -5,7 +5,7 @@ import { defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/mai
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import { initSessionStore, createSession, getSession, rebindSession, resetSessionStoreForTests } from '../src/main/session/store.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { startMcpServer } from '../src/main/mcp/server.js';
 import type { ToolContext } from '../src/main/mcp/kernel.js';
 import { emptyEvidence, type CallContext } from '../src/main/mcp/call-context.js';
@@ -55,7 +55,7 @@ beforeAll(async () => {
 afterEach(() => vi.restoreAllMocks());
 afterAll(async () => {
   vi.restoreAllMocks();
-  await flushRecorder(); await flushDurable(); resetSessionStoreForTests(); resetDurableForTests(); await removeTempDir(directory);
+  await flushRecorder(); await flushDurable(); resetSessionStoreForTests(); resetDurableForTests(); closeCorrelationStore(); await removeTempDir(directory);
 });
 
 it('keeps native schemas, binds exact chat sessions and refuses cross-chat, browser, foreground and paths', async () => {

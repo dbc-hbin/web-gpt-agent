@@ -1,5 +1,6 @@
 import { spawn } from 'node:child_process';
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 if (process.platform !== 'darwin') {
@@ -19,7 +20,11 @@ const executable = path.resolve(
 );
 if (!existsSync(executable)) throw new Error(`Could not find unpacked macOS ${arch} app executable`);
 
-const child = spawn(executable, [], {
+// Like the Linux package smokes, launch against a throwaway profile. A resident desktop
+// backend on the host would otherwise take the launch, and this smoke must prove a cold start.
+const smokeRoot = mkdtempSync(path.join(tmpdir(), 'wga-mac-gui-'));
+const dataDir = path.join(smokeRoot, 'data');
+const child = spawn(executable, ['--data-dir', dataDir], {
   stdio: ['ignore', 'pipe', 'pipe'],
   env: { ...process.env, CLF_DEBUG: '1' }
 });
@@ -101,15 +106,34 @@ async function terminateChild() {
   return exited;
 }
 
+// The GUI starts a detached desktop backend for this throwaway profile. Stop that exact owner
+// (named by its runtime descriptor) so no Electron process outlives the smoke.
+async function terminateBackend() {
+  let pid = null;
+  try { pid = JSON.parse(readFileSync(path.join(dataDir, 'runtime.json'), 'utf8')).pid; } catch { return true; }
+  if (!Number.isInteger(pid) || pid <= 0) return true;
+  const alive = () => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  for (const signal of ['SIGTERM', 'SIGKILL']) {
+    if (!alive()) return true;
+    try { process.kill(pid, signal); } catch { return !alive(); }
+    for (let waited = 0; waited < 5_000 && alive(); waited += 100) await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return !alive();
+}
+
 // Whether startup passed or failed, never leave an Electron child behind on the hosted runner.
 // This tests launch readiness, not the application's own quit flow.
 const exited = await terminateChild();
+const backendExited = await terminateBackend();
+rmSync(smokeRoot, { recursive: true, force: true });
 process.stdout.write(output);
 if (startupError) {
   if (!exited) startupError.message += '; child also resisted SIGTERM/SIGKILL';
+  if (!backendExited) startupError.message += '; its backend also resisted SIGTERM/SIGKILL';
   throw startupError;
 }
 if (!exited) throw new Error('macOS GUI process did not terminate after SIGTERM/SIGKILL');
+if (!backendExited) throw new Error('macOS desktop backend did not terminate after SIGTERM/SIGKILL');
 process.stdout.write(
   `macos-gui-startup-ok arch=${arch} exit=${exitResult?.code ?? 'null'} signal=${exitResult?.signal ?? 'null'}\n`
 );

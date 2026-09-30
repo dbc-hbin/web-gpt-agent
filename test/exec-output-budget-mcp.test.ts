@@ -15,6 +15,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { z } from 'zod';
+import { DEFAULT_MAX_OUTPUT_TOKENS } from '../src/main/codex/unified-exec-constants.js';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { flushDurable, initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
@@ -172,7 +173,10 @@ it('honours the default and an explicit smaller terminal output budget through M
 
 it('honours larger and smaller budgets for intercepted patch results without losing file receipts', async () => {
   endpoint = await serve();
-  const names = Array.from({ length: 4000 }, (_, index) => `${String(index).padStart(4, '0')}-${'p'.repeat(72)}.txt`);
+  // The boundary is output bytes, not file count: the full summary must exceed the default
+  // 65_536-token budget (so only the explicit larger request can retain it) yet stay under that
+  // request. Longer names reach it with 2400 files while native paths stay well inside Windows' MAX_PATH.
+  const names = Array.from({ length: 2400 }, (_, index) => `${String(index).padStart(4, '0')}-${'p'.repeat(121)}.txt`);
 
   const outputs: string[] = [];
   for (const maxOutputTokens of [100_000, 1024]) {
@@ -182,7 +186,7 @@ it('honours larger and smaller budgets for intercepted patch results without los
       body: JSON.stringify({
         jsonrpc: '2.0', id: 1, method: 'tools/call',
         params: { name: 'exec', arguments: { code:
-          `const patch='*** Begin Patch\\n'+Array.from({length:4000},(_,i)=>'*** Add File: files/'+String(i).padStart(4,'0')+'-'+ 'p'.repeat(72)+'.txt\\n+x\\n').join('')+'*** End Patch';text(await tools.exec_command({cmd:"apply_patch <<'PATCH'\\n"+patch+"\\nPATCH",workdir:'/probe',login:false,max_output_tokens:${maxOutputTokens}}));`
+          `const patch='*** Begin Patch\\n'+Array.from({length:2400},(_,i)=>'*** Add File: files/'+String(i).padStart(4,'0')+'-'+ 'p'.repeat(121)+'.txt\\n+x\\n').join('')+'*** End Patch';text(await tools.exec_command({cmd:"apply_patch <<'PATCH'\\n"+patch+"\\nPATCH",workdir:'/probe',login:false,max_output_tokens:${maxOutputTokens}}));`
         } }
       })
     });
@@ -197,10 +201,11 @@ it('honours larger and smaller budgets for intercepted patch results without los
   }
   const [full, bounded] = outputs;
   expect(full).toContain(names.map(name => `A files/${name}\n`).join(''));
+  expect(Buffer.byteLength(full!)).toBeGreaterThan(DEFAULT_MAX_OUTPUT_TOKENS * 4);
   expect(Buffer.byteLength(full!)).toBeLessThan(400_000);
   expect(Buffer.byteLength(bounded!)).toBeLessThan(5000);
   expect(bounded).toContain(names[0]);
   expect(bounded).toContain(names.at(-1));
-  expect(bounded).not.toContain(names[2000]);
-  expect(await fs.readFile(path.join(dir, 'files', names[2000]!), 'utf8')).toBe('x\n');
+  expect(bounded).not.toContain(names[1200]);
+  expect(await fs.readFile(path.join(dir, 'files', names[1200]!), 'utf8')).toBe('x\n');
 }, 30_000);

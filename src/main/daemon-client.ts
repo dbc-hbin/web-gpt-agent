@@ -1,7 +1,7 @@
 import path from 'node:path';
 import { existsSync } from 'node:fs';
 import { cp, mkdtemp, rename, rm, writeFile } from 'node:fs/promises';
-import { spawn } from 'node:child_process';
+import { spawn, type StdioOptions } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { app, dialog, ipcMain } from 'electron';
 import type { AppState } from '../shared/types.js';
@@ -92,7 +92,10 @@ async function startHost(): Promise<DesktopDaemonStatus> {
   const before = await hostStatus();
   if (before.running) return before;
   const launch = hostLaunch();
-  const child = spawn(launch.executable, launch.args, { detached: true, stdio: 'ignore', env: launch.env });
+  // CLF_DEBUG is the opt-in startup trace native package smokes read from the launched GUI.
+  // The backend owns `app started`/`renderer state ready`, so share this process's output then.
+  const stdio: StdioOptions = process.env.CLF_DEBUG === '1' ? ['ignore', 'inherit', 'inherit'] : 'ignore';
+  const child = spawn(launch.executable, launch.args, { detached: true, stdio, env: launch.env });
   let launchError: Error | undefined;
   child.on('error', error => { launchError = error; });
   child.unref();

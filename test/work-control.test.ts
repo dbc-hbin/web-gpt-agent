@@ -136,6 +136,12 @@ interface Harness {
 }
 
 let dirs: string[] = [];
+/**
+ * Every ledger a case opened, closed before its directory is removed. Windows refuses to unlink
+ * a SQLite file (and its -wal/-shm) that a live connection still holds, so a handle left open
+ * here fails the cleanup with EBUSY instead of letting the next case start.
+ */
+let opened: Array<{ close(): void }> = [];
 
 async function harness(options: {
   runtime?: RecordedRuntime;
@@ -147,6 +153,7 @@ async function harness(options: {
   const dir = await makeTempDir('wgpt-work-');
   dirs.push(dir);
   const store = options.store ?? createWorkStore({ dataDir: dir, ...(options.fileName ? { fileName: options.fileName } : {}) });
+  opened.push(store);
   const runtime = options.runtime ?? makeRuntime();
   const service = createWorkService({
     store,
@@ -156,6 +163,7 @@ async function harness(options: {
     worktreesRoot: path.join(dir, 'worktrees'),
     maxDeliveryAttempts: 3
   });
+  opened.push(service);
   return { store, service, runtime, dir };
 }
 
@@ -221,6 +229,8 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.useRealTimers();
+  // Services first so no pump touches a ledger that is already closed.
+  for (const handle of opened.splice(0).reverse()) handle.close();
   const pending = dirs;
   dirs = [];
   for (const dir of pending) await removeTempDir(dir);
@@ -1447,6 +1457,61 @@ describe('delivery acknowledgement', () => {
     expect(await events()).toBe(pausedEvents);
     expect(store.getCommand(requestId)).toMatchObject({ delivery_state: 'pending', attempts: 0 });
     expect(runtime.deliveries.length).toBeGreaterThan(0);
+  });
+
+  it('asks a work whose prime is unbound once per pass, keeps its FIFO order, and still delivers another work', async () => {
+    const unbound = makeRuntime();
+    let blockedWorkId = '';
+    const blockedAsked: string[] = [];
+    unbound.port.deliver = async input => {
+      unbound.deliveries.push(input);
+      if (input.workId !== blockedWorkId) return { state: 'delivered' };
+      blockedAsked.push(input.requestId);
+      return { state: 'deferred', detail: 'the prime conversation is not bound yet', scope: 'work' };
+    };
+    const { service, store } = await harness({ runtime: unbound });
+    const blocked = await service.start(startInput());
+    blockedWorkId = blocked.work_id;
+    const backlog: string[] = [];
+    for (let index = 0; index < 12; index += 1) {
+      const requestId = randomUUID();
+      backlog.push(requestId);
+      await service.instruct({ request_id: requestId, work_id: blocked.work_id, text: `step ${index}` });
+      vi.setSystemTime(Date.now() + 1);
+    }
+    const ready = await service.start(startInput());
+    const readyRequest = randomUUID();
+    await service.instruct({ request_id: readyRequest, work_id: ready.work_id, text: 'For the bound chat.' });
+    await vi.advanceTimersByTimeAsync(0);
+    blockedAsked.length = 0;
+    const revision = store.getWork(blocked.work_id)!.revision;
+
+    const exec = vi.spyOn(DatabaseSync.prototype, 'exec');
+    try {
+      await service.pumpNow();
+      // One question for the whole work, and a constant number of commits for its twelve rows: the
+      // attempted row's lease/release plus one rotation, never a lease/release per waiting row.
+      expect(blockedAsked).toEqual([backlog[0]]);
+      expect(exec.mock.calls.filter(([sql]) => sql === 'BEGIN IMMEDIATE').length).toBeLessThanOrEqual(2);
+    } finally {
+      exec.mockRestore();
+    }
+    // The other work in the same pass was not held behind it.
+    expect(store.getCommand(readyRequest)?.delivery_state).toBe('delivered');
+    // Nothing about the waiting rows changed except their place in the rotation.
+    for (const requestId of backlog) expect(store.getCommand(requestId)).toMatchObject({ delivery_state: 'pending', attempts: 0 });
+    expect(store.getWork(blocked.work_id)!.revision).toBe(revision);
+
+    // Once the work changes, its rows are asked again, oldest first.
+    blockedAsked.length = 0;
+    unbound.port.deliver = async input => {
+      unbound.deliveries.push(input);
+      blockedAsked.push(input.requestId);
+      return { state: 'delivered' };
+    };
+    store.setWorkStatus(blocked.work_id, 'running', 'work_running');
+    await service.pumpNow();
+    expect(blockedAsked).toEqual(backlog);
   });
 
   it('still reconciles a queued instruction of a stopped work and does not let stopped works starve a runnable one', async () => {

@@ -1,4 +1,4 @@
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterAll, beforeEach, expect, it, vi } from 'vitest';
 import type { Tool } from '@modelcontextprotocol/client';
 import { externalSchemaHash } from '../src/main/plugins/external-declaration.js';
 
@@ -63,7 +63,14 @@ vi.mock('@modelcontextprotocol/client', () => ({
   }
 }));
 
+const hostPlatform = process.platform;
+afterAll(() => { Object.defineProperty(process, 'platform', { value: hostPlatform, configurable: true }); });
+
 beforeEach(() => {
+  // The fixture is the macOS driver contract: bundle identity via health_report and TCC state via
+  // check_permissions. The runtime reads process.platform live, so model that host on every CI
+  // OS (Linux ships no embedded driver; Windows publishes no TCC status).
+  Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
   // The production runtime is a process singleton. A fresh module models a new backend for each
   // lifecycle transition without adding a test-only reset hook to production code.
   vi.resetModules();

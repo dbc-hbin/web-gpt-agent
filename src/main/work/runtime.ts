@@ -28,7 +28,7 @@ import { promises as fs } from 'node:fs';
 import { z } from 'zod';
 
 import { getConfig, updateConfig } from '../config.js';
-import { resolvePath, validateNewRoot } from '../sandbox.js';
+import { approvedRootContaining, resolvePath, validateNewRoot } from '../sandbox.js';
 import { listProjects } from '../projects.js';
 import { getChatModels } from '../chat-models.js';
 import { logInfo, logWarn } from '../logger.js';
@@ -1800,8 +1800,7 @@ async function approveWorktreeRoot(worktreePath: string): Promise<string> {
     await fs.mkdir(root, { recursive: true, mode: 0o700 });
     // A root already inside an approved folder is reachable as it stands; adding a nested root
     // would be redundant, and the sandbox would reject it as overlapping the existing one.
-    const covered = await resolvePath(getConfig().roots, root).catch(() => null);
-    if (covered) return path.basename(root);
+    if (await approvedRootContaining(getConfig().roots, root)) return path.basename(root);
     const real = await validateNewRoot(root, getConfig().roots);
     let name = '';
     await updateConfig(config => {
@@ -1924,7 +1923,9 @@ async function deliverCommand(active: WorkRuntimeHandle, input: WorkRuntimeDeliv
   }
   const prime = work.prime_agent_id ? active.store.getAgent(work.prime_agent_id) : active.store.getPrimeAgent(input.workId);
   if (!prime?.session_id) {
-    return { state: 'deferred', detail: 'the prime conversation is not bound yet' };
+    // Work-scoped: nothing about this row decides it, so the pump may hold the work's other
+    // unlinked rows for the rest of its pass instead of asking the same question per row.
+    return { state: 'deferred', detail: 'the prime conversation is not bound yet', scope: 'work' };
   }
   const result = await deliverOutbox(active, {
     id: input.outboxInputId,
@@ -2993,6 +2994,10 @@ export async function drainWorkRuntime(): Promise<void> {
   runtime = null;
   runtimePromise = null;
   if (active) await active.drain().catch(error => logWarn(`work runtime drain failed: ${(error as Error).message}`));
+  // Watchers sleeping between polls belong to the drained runtime. `shuttingDown` is cleared
+  // below for a later restart, so revoke their ownership here; otherwise one wakes after the
+  // store it holds was closed and reads through a finalized statement.
+  bindingWatchers.clear();
   clearBrokerHooks();
   detachChanges?.();
   detachChanges = null;
@@ -3073,6 +3078,7 @@ export function resetWorkRuntimeForTests(): void {
   // The coalescing set is process-local by design: a restart must re-prove from the ledger, which
   // is exactly what this clears the way for.
   recordedNativeExecutions.clear();
+  bindingWatchers.clear();
   runtime = null;
   runtimePromise = null;
   shuttingDown = false;

@@ -4,6 +4,7 @@ import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme, window
 import { browserWindowIconPath } from './window-icon.js';
 import { editContextMenuTemplate } from './edit-context-menu.js';
 import { trayGuidArgsForPlatform, trayImageSpec } from './tray-image.js';
+import { logError, logInfo } from './logger.js';
 
 /** The GUI-only presentation contract. Backend state arrives only through `AppState`. */
 export interface DesktopWindowOptions {
@@ -179,7 +180,16 @@ export function createDesktopWindow(options: DesktopWindowOptions): DesktopWindo
     next.webContents.on('destroyed', () => options.rendererClosed?.());
     next.webContents.on('render-process-gone', () => options.rendererClosed?.());
     next.webContents.on('did-finish-load', () => {
+      // Native package smokes read this from the launched GUI process under CLF_DEBUG.
+      logInfo('window loaded');
       if (window === next && !next.isDestroyed()) options.rendererReady?.();
+    });
+    // A renderer that fails to load leaves a blank window with no other clue.
+    next.webContents.on('did-fail-load', (_event, code, description) =>
+      logError(`window failed to load (${code}): ${description}`));
+    // Only renderer error text, never page data.
+    next.webContents.on('console-message', details => {
+      if (details.level === 'error') logError(`renderer: ${details.message}`);
     });
     next.once('ready-to-show', () => {
       if (!presented) {

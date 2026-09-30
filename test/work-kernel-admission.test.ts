@@ -6,7 +6,7 @@ import { z } from 'zod';
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { flushDurable, initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { createSession, initSessionStore, resetSessionStoreForTests } from '../src/main/session/store.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
 import { currentCall } from '../src/main/mcp/call-context.js';
 import { createRegistrar, dispatch, ok, setManagedToolGate } from '../src/main/mcp/kernel.js';
@@ -42,6 +42,9 @@ afterAll(async () => {
   await flushDurable();
   resetSessionStoreForTests();
   resetDurableForTests();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await removeTempDir(directory);
 });
 

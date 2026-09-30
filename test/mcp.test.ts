@@ -38,7 +38,7 @@ import {
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import type { ToolOutcome } from '../src/shared/session.js';
 import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
 import {
@@ -331,6 +331,9 @@ afterAll(async () => {
   // the fixture from leaked shells while production sessions were completely untouched.
   await unifiedExecManager.terminateAllProcesses();
   await flushDurable();
+  // The request-ownership ledger is a process-wide SQLite handle under this directory; Windows
+  // refuses to delete a file a live connection still holds.
+  closeCorrelationStore();
   await removeTempDir(base);
 });
 
@@ -2069,7 +2072,8 @@ describe('exec_command and write_stdin', () => {
       yield_time_ms: 5_000
     });
     expect(failed(rg), textOf(rg)).toBe(false);
-    expect(textOf(rg).toLowerCase()).toContain(bundled.toLowerCase());
+    // The process output itself, not its JSON text: a Windows path's backslashes are escaped there.
+    expect(String(terminalOf(rg).output).toLowerCase()).toContain(bundled.toLowerCase());
   });
 
   it.runIf(IS_WINDOWS)('binds bare PowerShell rg to the bundled binary instead of a shadowing function', async () => {
@@ -2140,7 +2144,8 @@ describe('exec_command and write_stdin', () => {
       yield_time_ms: 5_000
     });
     expect(failed(quote), textOf(quote)).toBe(false);
-    expect(textOf(quote)).toContain('from "fsops.js"');
+    // The process output itself, not its JSON text, where the matched quotes are escaped.
+    expect(String(terminalOf(quote).output)).toContain('from "fsops.js"');
     expect(textOf(quote)).not.toContain('regex parse error');
   });
 
@@ -2406,9 +2411,9 @@ describe('exec_command and write_stdin', () => {
       yield_time_ms: 8_000
     });
     expect(reply.body.result?.isError).not.toBe(true);
-    expect(textOf(reply)).toContain('Output:');
-    expect(textOf(reply)).toContain('#< CLIXML');
-    expect(textOf(reply)).toContain('_x000D__x000A_');
+    // A code-mode caller receives the structured result, whose `output` is the raw merged stream:
+    // the CLIXML envelope arrives byte for byte, never rewritten into prose.
+    expect(String(terminalOf(reply).output)).toContain(payload);
   });
 });
 
@@ -2487,8 +2492,9 @@ describe('conversation-independent working directory', () => {
       yield_time_ms: 5_000
     });
     expect(failed(defaulted), textOf(defaulted)).toBe(false);
-    expect(textOf(defaulted)).toContain(approved);
-    expect(textOf(defaulted)).not.toContain(projectDir);
+    // The process output itself, not its JSON text: a Windows path's backslashes are escaped there.
+    expect(String(terminalOf(defaulted).output)).toContain(approved);
+    expect(String(terminalOf(defaulted).output)).not.toContain(projectDir);
 
     expect(prove('wfr_project_explicit', 'exec_command')).toBe('stored');
     const explicit = await asSession('wfr_project_explicit', 'exec_command', {
@@ -2497,7 +2503,7 @@ describe('conversation-independent working directory', () => {
       yield_time_ms: 5_000
     });
     expect(failed(explicit), textOf(explicit)).toBe(false);
-    expect(textOf(explicit)).toContain(projectDir);
+    expect(String(terminalOf(explicit).output)).toContain(projectDir);
   });
 });
 
