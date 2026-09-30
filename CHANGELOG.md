@@ -17,6 +17,7 @@ Forked from the MIT-licensed Chat On Steroids project by [@totec448-spec](https:
 - Approve managed-work worktrees whose native path begins with the same segment as an approved root's name (for example `/tmp/...` beside a root named `tmp`); the check no longer reads the native path as a virtual one and blocks the prime launch.
 - Keep a committed executable file's mode when the repository sets `core.fileMode=false` (the Git for Windows default), so managed snapshots no longer report the project as changed.
 - Stop a work whose prime is not yet bound from re-leasing its whole instruction backlog on every delivery pass; each pass now asks that work once, which removes thousands of synchronous commits on Windows.
+- Commit a controller conversation's relayed backlog once per ordered chunk of 32 messages instead of four times per message. Each message's instruction receipt and its `accepted` state still commit together before anything is published, and a refused message rolls back only itself.
 - Admit a Windows control-pipe connection by when it arrived, not when libuv dispatched it, so a peer that connected before the pipe ACL is never served.
 - Remove a per-path full-output scan from patch results, which made large multi-file patches quadratic, and read each hunk's file status once.
 - Log GUI window loading and renderer errors from the desktop client again, and forward its backend's startup trace under `CLF_DEBUG`, so packaged GUI smoke tests can prove a cold start.

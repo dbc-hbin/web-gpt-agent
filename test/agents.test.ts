@@ -3226,12 +3226,14 @@ describe('through the MCP endpoint', () => {
         ? "Start-Sleep -Milliseconds 750; Write-Output 'held-call-done'"
         : "sleep 1; printf '%s\\n' held-call-done";
     const pending = post(
+      // The child's `yield_time_ms` bounds only exec_command; the outer cell sets its own window so
+      // a slow shell start (cold Windows PowerShell) completes in this reply instead of yielding.
       { jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: codeModeCall('exec_command', {
         cmd: heldCommand,
         workdir: dir,
         shell,
         yield_time_ms: 30_000
-      }) },
+      }, { yield_time_ms: 30_000 }) },
       { 'x-request-id': `${requestId}/relay` }
     );
     await waitForRunningToolCall();

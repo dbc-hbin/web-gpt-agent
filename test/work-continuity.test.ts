@@ -262,10 +262,12 @@ beforeEach(async () => {
     worktreesRoot: path.join(directory, 'worktrees'),
     now: () => clock
   });
-  const real = service.instruct.bind(service);
-  service.instruct = async input => {
+  // Relayed routing admits through the synchronous core inside its chunk's transaction, and
+  // `instruct` delegates to the same core, so this sees every admission exactly once.
+  const real = service.admitInstruction.bind(service);
+  service.admitInstruction = input => {
     instructed.push({ workId: input.work_id, text: input.text, requestId: input.request_id });
-    return await real(input);
+    return real(input);
   };
   manager = await build();
 });
@@ -692,6 +694,37 @@ it('relays a backlog longer than the process evidence bound, in provider order',
   expect(instructed.map(entry => entry.text)).toEqual(backlog.map(entry => entry.text));
 });
 
+it('rejects one failed admission without undoing the rest of its chunk', async () => {
+  const target = work();
+  store.insertWork(target);
+  bind(target.work_id);
+  const branch = Array.from({ length: 5 }, (_, index) => ({
+    messageId: `msg-chunk-${index}`,
+    text: `chunk ${index}`,
+    authoredAt: clock + index
+  }));
+  // The whole branch commits as one chunk. The middle admission fails after the dispatch was frozen
+  // in its savepoint, so its freeze must roll back with it while its neighbours stay admitted.
+  const real = service.admitInstruction.bind(service);
+  service.admitInstruction = input => {
+    if (input.text === 'chunk 2') throw new Error('refused by the service');
+    return real(input);
+  };
+  await manager.snapshot(snapshot({ messages: branch }));
+  await tick();
+
+  const failed = store.getControllerMessage(SESSION, 'msg-chunk-2')!;
+  expect(failed.state).toBe('rejected');
+  expect(failed.dispatch_text).toBeNull();
+  expect(store.getCommand(failed.request_id)).toBeNull();
+  for (const index of [0, 1, 3, 4]) {
+    const row = store.getControllerMessage(SESSION, `msg-chunk-${index}`)!;
+    expect(row.state).toBe('accepted');
+    expect(store.getCommand(row.request_id)?.text).toBe(`chunk ${index}`);
+  }
+  expect(instructed.map(entry => entry.text)).toEqual(['chunk 0', 'chunk 1', 'chunk 3', 'chunk 4']);
+});
+
 it('applies nothing until every transport page of one read has arrived', async () => {
   const target = work();
   store.insertWork(target);
@@ -1080,16 +1113,16 @@ it('does not move the binding onto a successor when the authority changed mid-ad
   store.insertWork(target);
   store.insertWork(unrelated);
   bind(target.work_id);
-  // The service is what creates the successor, and the rebind happens while its call is in flight —
-  // exactly the window the old code moved the binding in.
+  // The service is what creates the successor, and the rebind lands between the admission and the
+  // binding move — exactly the window the old code moved the binding in.
   const successor = work({ predecessor_work_id: target.work_id });
-  const real = service.instruct.bind(service);
-  service.instruct = async input => {
-    const receipt = await real(input);
+  const real = service.admitInstruction.bind(service);
+  service.admitInstruction = input => {
+    const admission = real(input);
     clock += 1_000;
     bindWorkController({ sessionId: SESSION, conversationId: CONVERSATION, workId: unrelated.work_id });
     store.insertWork(successor);
-    return { ...receipt, work_id: successor.work_id };
+    return { ...admission, receipt: { ...admission.receipt, work_id: successor.work_id } };
   };
 
   manager.snapshot(snapshot({ messages: [{ messageId: 'msg-move', text: 'run it', authoredAt: clock }] }));

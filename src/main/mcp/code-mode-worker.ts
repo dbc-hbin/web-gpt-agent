@@ -19,13 +19,21 @@ async function run(QuickJS, workerData) {
   runtime.setMemoryLimit(workerData.limits.memoryBytes);
   runtime.setMaxStackSize(512 * 1024);
   const vm = runtime.newContext();
-  let usedCpu = 0, sliceStart = 0, fatal = null, nextCallId = 0, emitted = 0, outputBytes = 0;
+  let usedCpu = 0, sliceStart = null, fatal = null, nextCallId = 0, emitted = 0, outputBytes = 0;
   const pending = new Map(), timerHandles = new Map();
   const channel = workerData.stateBuffer
     ? { control: new Int32Array(workerData.stateBuffer, 0, 4), payload: new Uint8Array(workerData.stateBuffer, 16) }
     : null;
-  runtime.setInterruptHandler(() => usedCpu + performance.now() - sliceStart > workerData.limits.cpuMs);
-  const enter = fn => { sliceStart = performance.now(); try { return fn(); } finally { usedCpu += performance.now() - sliceStart; } };
+  // The budget meters CPU this interpreter thread spends, so a loaded machine preempting it does not
+  // charge the guest. Windows advances thread times only on scheduler ticks (~15.6 ms), coarser than
+  // the budget itself, so it keeps the monotonic clock there, as does a runtime without the API.
+  const clock = process.platform === 'win32' || typeof process.threadCpuUsage !== 'function'
+    ? () => performance.now()
+    : () => { const { user, system } = process.threadCpuUsage(); return (user + system) / 1000; };
+  // Only guest slices are metered. Trusted bootstrap and host bookkeeping run with no open slice, so
+  // they can neither spend the guest budget nor be interrupted by it.
+  runtime.setInterruptHandler(() => sliceStart !== null && usedCpu + clock() - sliceStart > workerData.limits.cpuMs);
+  const enter = fn => { sliceStart = clock(); try { return fn(); } finally { usedCpu += clock() - sliceStart; sliceStart = null; } };
   // The interpreter thread blocks here while the host answers, so state access is atomic with respect
   // to every other cell and nothing is mirrored inside the isolate. The host returns a bounded JSON
   // envelope, so a refused or failed request comes back as data and never as a host-level throw.
@@ -36,12 +44,12 @@ async function run(QuickJS, workerData) {
     channel.payload.set(bytes);
     Atomics.store(channel.control, 1, bytes.length);
     Atomics.store(channel.control, 0, 1);
-    const waitingStartedAt = performance.now();
+    const waitingStartedAt = clock();
     send({ type: 'state' });
     const waiting = Atomics.wait(channel.control, 0, 1, 30_000) === 'timed-out';
     // Time spent blocked on the host is not guest CPU time. The current slice simply started later,
     // so advancing sliceStart excludes the wait without touching the already-accumulated total.
-    sliceStart += performance.now() - waitingStartedAt;
+    sliceStart += clock() - waitingStartedAt;
     if (waiting) {
       Atomics.store(channel.control, 0, 0);
       return JSON.stringify({ ok: false, error: 'State request timed out.' });
@@ -104,7 +112,7 @@ async function run(QuickJS, workerData) {
     return vm.undefined;
   });
   vm.setProp(vm.global, '__timers', timerRegistry); timerRegistry.dispose();
-  const setup = enter(() => vm.evalCode('(() => { ' +
+  const setup = vm.evalCode('(() => { ' +
     'const bridge = globalThis.__bridge, timers = globalThis.__timers; delete globalThis.__bridge; delete globalThis.__timers; ' +
     'const stringify = JSON.stringify, parse = JSON.parse, String_ = String; ' +
     'const tools = Object.create(null), guestTimers = new Map(); let nextTimer = 0; ' +
@@ -127,7 +135,7 @@ async function run(QuickJS, workerData) {
       'yield_control:{value:()=>{ if (!' + JSON.stringify(workerData.allowYield) + ') needsOwner(); bridge("yield","null"); }}, ' +
       'exit:{value:()=>{bridge("exit","null");throw undefined;}}' +
     '}); ' +
-    'return id => { const callback = guestTimers.get(id); if (!callback) return; guestTimers.delete(id); callback(); }; })()'));
+    'return id => { const callback = guestTimers.get(id); if (!callback) return; guestTimers.delete(id); callback(); }; })()');
   if (setup.error) { setup.error.dispose(); finish('RUNTIME_ERROR'); return; }
   const runTimer = setup.value;
   let execution;

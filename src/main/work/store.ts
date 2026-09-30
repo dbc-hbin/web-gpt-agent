@@ -910,6 +910,9 @@ export function createWorkStore(options: WorkStoreOptions): WorkStore {
       const savepoint = `sp_${depth}`;
       database.exec(`SAVEPOINT ${savepoint}`);
       depth += 1;
+      // Notifications queued by this savepoint belong to it: a rolled-back savepoint must not
+      // publish a change the enclosing commit no longer contains.
+      const mark = queued.length;
       try {
         const result = run();
         depth -= 1;
@@ -917,6 +920,7 @@ export function createWorkStore(options: WorkStoreOptions): WorkStore {
         return result;
       } catch (error) {
         depth -= 1;
+        queued.length = mark;
         try {
           database.exec(`ROLLBACK TO ${savepoint}`);
           database.exec(`RELEASE ${savepoint}`);

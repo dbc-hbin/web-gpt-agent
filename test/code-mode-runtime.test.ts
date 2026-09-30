@@ -136,17 +136,21 @@ it('excludes synchronous host state resolution from the guest CPU budget', async
     { ...limits, cpuMs: 10 }, {
       owner: 'core:cpu-wait',
       resolveOwner: owner => {
+        // Resolution 1 is admission, before the worker starts. Resolution 2 is the canonical-owner
+        // lookup that opens the first state request, which runs while the worker is blocked in
+        // Atomics.wait; later ones (other owners' buckets, the load) depend on global store state.
         if (++resolutions === 2) {
-          // This runs on the host while the worker is blocked in Atomics.wait. Fixed work avoids a
-          // real timer while still exceeding the guest budget by a wide margin on the broken path.
+          // Fixed work avoids a real timer while still exceeding the guest budget by a wide margin
+          // on the broken path.
           for (let index = 0; index < 100_000_000; index++) checksum = (checksum + index) | 0;
         }
         return owner;
       }
     });
-  expect(checksum).not.toBe(0);
-  expect(output.isError).not.toBe(true);
+  // Content first: a cell that died before its first state request reports why here.
   expect(output.content).toEqual([{ type: 'text', text: '1' }]);
+  expect(output.isError).not.toBe(true);
+  expect(checksum).not.toBe(0);
 });
 
 it('rejects circular or oversized host results without leaking them or hanging', async () => {

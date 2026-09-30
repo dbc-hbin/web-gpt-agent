@@ -18,9 +18,14 @@ const nativeSchema = z.looseObject({ __thrown: z.string() });
  * arrives as a thrown `Error` rather than a returned `isError` envelope. The wrapper therefore
  * reports a thrown failure as `{__thrown}` so tests can distinguish "the tool refused" from "the
  * script failed", and leaves every other value exactly as the runtime produced it.
+ *
+ * `pragma` sets the outer cell's own `// @exec:` header. A nested `yield_time_ms` only bounds the
+ * child tool; the cell itself still yields after its default observation window, so a caller that
+ * must see a slow child's completion in this one reply sets the outer window here.
  */
-export function codeModeCall(name: string, args: unknown) {
+export function codeModeCall(name: string, args: unknown, pragma?: { yield_time_ms?: number; max_output_tokens?: number }) {
   return { name: 'exec', arguments: { code:
+    (pragma ? `// @exec: ${JSON.stringify(pragma)}\n` : '') +
     `let r;try{r=await tools[${JSON.stringify(name)}](${JSON.stringify(args)});}` +
     'catch(e){r={__thrown:String((e&&e.message)||e)};}' +
     'text(JSON.stringify(r));'

@@ -494,8 +494,11 @@ page's answer and ends the walk there — the branch is never handed over with a
 a hole looks exactly like a message that was edited away. Admission itself is asynchronous and
 ordered: only messages on that conversation's active branch are considered, oldest first, each
 keyed by its provider message id so a retry cannot queue it twice, and a message that outlived the
-host process must be re-proved by a fresh authenticated snapshot before it may execute. Bridge
-protocol `16` is the fence for both directions.
+host process must be re-proved by a fresh authenticated snapshot before it may execute. A read
+commits its admissions, and then its routed work receipts, once per ordered chunk of 32 messages
+rather than once per message: each message's frozen dispatch, work command and `accepted` state
+land in the same commit, and nothing of the chunk is published until that commit succeeds.
+Bridge protocol `16` is the fence for both directions.
 
 The relay is not a second connector, endpoint or tunnel: it uses the same synced ChatGPT thread
 the user already has, which is why the desktop companion has to be reachable and why a native

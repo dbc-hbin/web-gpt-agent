@@ -707,44 +707,57 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
         if (superseded()) return;
         const chunk = messages.slice(index, index + SNAPSHOT_ROUTE_CHUNK);
         const admitted: string[] = [];
-        for (const message of chunk) {
-          if (message.authoredAt <= binding.bound_at) continue;
-          const key = evidenceKey(binding.session_id, message.messageId);
-          // Each message carries its OWN predecessor quotation: a backlog of plan1/go1/plan2/go2
-          // must never attach the newest plan to the earlier instruction.
-          rememberEvidence(key, {
-            onBranch: true,
-            settled: read.settled,
-            generation,
-            context: message.context ?? null,
-            contextAssistantId: message.precedingAssistantId ?? null,
-            requestId: message.requestId ?? null
+        const remembered: Array<[string, Evidence]> = [];
+        // The chunk's admissions are one commit: a crash before it leaves none of them, and the
+        // next read admits them again from the same authenticated evidence. Evidence is only
+        // remembered once that commit succeeded, so no route can act on a row that never landed.
+        try {
+          store.runInTransaction(() => {
+            for (const message of chunk) {
+              if (message.authoredAt <= binding.bound_at) continue;
+              const key = evidenceKey(binding.session_id, message.messageId);
+              // Each message carries its OWN predecessor quotation: a backlog of plan1/go1/plan2/go2
+              // must never attach the newest plan to the earlier instruction.
+              remembered.push([key, {
+                onBranch: true,
+                settled: read.settled,
+                generation,
+                context: message.context ?? null,
+                contextAssistantId: message.precedingAssistantId ?? null,
+                requestId: message.requestId ?? null
+              }]);
+              const existing = readOne(() => store.getControllerMessage(binding.session_id, message.messageId));
+              if (existing) {
+                if (existing.state === 'pending') admitted.push(existing.message_id);
+                continue;
+              }
+              // A message the host never observed is admitted here, in order, from authenticated
+              // evidence — the same shape an observation would have produced. The store's own write is
+              // a savepoint here, so one refused row does not undo the rest of the chunk.
+              try {
+                store.putControllerMessage({
+                  session_id: binding.session_id,
+                  conversation_id: read.conversationId,
+                  message_id: message.messageId,
+                  request_id: controllerRequestId(binding.session_id, message.messageId),
+                  text: message.text,
+                  authored_at: message.authoredAt,
+                  state: 'pending',
+                  work_id: null,
+                  error: null,
+                  created_at: now()
+                });
+                admitted.push(message.messageId);
+              } catch (error) {
+                logWarn(`continuity could not admit snapshot message ${message.messageId}: ${(error as Error).message}`);
+              }
+            }
           });
-          const existing = readOne(() => store.getControllerMessage(binding.session_id, message.messageId));
-          if (existing) {
-            if (existing.state === 'pending') admitted.push(existing.message_id);
-            continue;
-          }
-          // A message the host never observed is admitted here, in order, from authenticated
-          // evidence — the same shape an observation would have produced.
-          try {
-            store.putControllerMessage({
-              session_id: binding.session_id,
-              conversation_id: read.conversationId,
-              message_id: message.messageId,
-              request_id: controllerRequestId(binding.session_id, message.messageId),
-              text: message.text,
-              authored_at: message.authoredAt,
-              state: 'pending',
-              work_id: null,
-              error: null,
-              created_at: now()
-            });
-            admitted.push(message.messageId);
-          } catch (error) {
-            logWarn(`continuity could not admit snapshot message ${message.messageId}: ${(error as Error).message}`);
-          }
+        } catch (error) {
+          logWarn(`continuity could not commit snapshot admissions: ${(error as Error).message}`);
+          return;
         }
+        for (const [key, value] of remembered) rememberEvidence(key, value);
         if (read.complete && admitted.length > 0) {
           await routeMessages(binding.session_id, admitted, generation)
             .catch(error => logWarn(`continuity routing failed: ${(error as Error).message}`));
@@ -892,36 +905,105 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
     const binding = bindingFor(sessionId);
     if (!binding || !binding.enabled) return;
     await serialize(queues, `${binding.session_id}\u0000${binding.conversation_id}`, async () => {
-      for (const messageId of messageIds) {
-        if (!alive()) return;
-        // A route proven under a superseded branch authority may not admit anything, however long it
-        // waited behind another pass: the branch it was proven against is no longer the branch.
-        if (branchGeneration(sessionId) !== generation) return;
-        const row = readOne(() => store.getControllerMessage(sessionId, messageId));
-        if (!row || row.state !== 'pending') continue;
-        const live = bindingFor(sessionId);
-        if (!live || !live.enabled) return;
-        await routeOne(live, row, generation);
+      let remaining = messageIds;
+      while (remaining.length > 0) {
+        // Every await of a message's routing happens here, in provider order, before anything is
+        // written. The admissions are then decided and committed together, synchronously.
+        const prepared: PreparedRoute[] = [];
+        for (const messageId of remaining) {
+          if (!alive()) return;
+          // A route proven under a superseded branch authority may not admit anything, however long
+          // it waited behind another pass: the branch it was proven against is no longer the branch.
+          if (branchGeneration(sessionId) !== generation) return;
+          const row = readOne(() => store.getControllerMessage(sessionId, messageId));
+          if (!row || row.state !== 'pending') continue;
+          const live = bindingFor(sessionId);
+          if (!live || !live.enabled) return;
+          const route = await prepareRoute(live, row, generation);
+          if (route) prepared.push(route);
+        }
+        if (prepared.length === 0) return;
+        const moved = commitRoutes(prepared, generation);
+        if (moved === null) return;
+        // An admission continued the work into a successor and moved the binding with it. Later
+        // messages were prepared against the predecessor, so they are prepared again against the
+        // binding as it is now, exactly as if each had been routed after the one before it.
+        remaining = remaining.slice(remaining.indexOf(moved) + 1);
       }
     });
   }
 
+  /** One message's routing inputs, gathered across every await and not yet validated. */
+  interface PreparedRoute {
+    binding: WorkControllerBinding;
+    row: WorkControllerMessage;
+    relation: 'executed' | 'live' | 'unproven';
+    policySettled: boolean;
+    context: string | null;
+    contextAssistantId: string | null;
+  }
+
   /**
-   * Admits one pending message, or leaves it pending with the reason it cannot run yet.
+   * Decides and commits one ordered chunk of prepared routes in a single transaction.
+   *
+   * Every row's acknowledgement (`accepted`) is written in the same commit as its work receipt,
+   * so neither exists without the other, and a crash before the commit leaves the whole chunk
+   * pending for the next read to route again under the same request ids. Nothing is published —
+   * no change notification, no successor start, no pump wake, no log — until that commit
+   * succeeded. Returns the message id whose admission moved the binding onto a successor, which
+   * ends the chunk there, or null.
+   */
+  function commitRoutes(prepared: readonly PreparedRoute[], generation: number): string | null {
+    const published: Array<() => void> = [];
+    let moved: string | null = null;
+    try {
+      store.runInTransaction(() => {
+        for (const route of prepared) {
+          // Each route is its own savepoint. A route that throws stops the chunk exactly where
+          // routing one message at a time would have stopped, keeping the admissions before it;
+          // its own effects are only published when its savepoint survived.
+          const effects: Array<() => void> = [];
+          let advanced: boolean;
+          try {
+            advanced = store.runInTransaction(() => commitRoute(route, generation, effects));
+          } catch (error) {
+            logWarn(`continuity routing failed: ${(error as Error).message}`);
+            return;
+          }
+          published.push(...effects);
+          if (advanced) {
+            moved = route.row.message_id;
+            return;
+          }
+        }
+      });
+    } catch (error) {
+      // The chunk's COMMIT itself failed: nothing of it is durable, so nothing is published and
+      // every row is still pending under its own request id for the next read to route.
+      logWarn(`continuity could not commit a routed chunk: ${(error as Error).message}`);
+      return null;
+    }
+    for (const publish of published) publish();
+    return moved;
+  }
+
+  /**
+   * Gathers one pending message's routing inputs, or returns null when it cannot run yet.
    *
    * A message is never injected while the controller's own turn is live: the relay waits for a
    * settled boundary, which is also what stops it from interrupting the model that may be about
    * to drive the work itself.
    *
-   * Every await above the admission is a window in which the world can change — a fresh snapshot
-   * may reject this row as off-branch, the controller's own model call may claim it, or the UI may
-   * disable the binding. So the binding, the row's pending state, and the branch evidence are all
-   * re-read immediately before `instruct`, and any disagreement abandons the row rather than
-   * admitting an instruction nobody still owns.
+   * Every await of routing is here, and every await is a window in which the world can change — a
+   * fresh snapshot may reject this row as off-branch, the controller's own model call may claim it,
+   * or the UI may disable the binding. So nothing here admits anything: `commitRoute` re-reads the
+   * binding, the row's pending state and the branch evidence synchronously at the moment of
+   * admission, and any disagreement abandons the row rather than admitting an instruction nobody
+   * still owns.
    */
-  async function routeOne(binding: WorkControllerBinding, row: WorkControllerMessage, generation: number): Promise<void> {
+  async function prepareRoute(binding: WorkControllerBinding, row: WorkControllerMessage, generation: number): Promise<PreparedRoute | null> {
     const current = bindingFor(binding.session_id);
-    if (!current || !current.enabled || current.conversation_id !== binding.conversation_id) return;
+    if (!current || !current.enabled || current.conversation_id !== binding.conversation_id) return null;
     const key = evidenceKey(row.session_id, row.message_id);
     // Positive evidence only, and only from the newest branch authority. A row the host has not seen
     // on the conversation's active branch in *this* process — including every row recovered from
@@ -929,16 +1011,16 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
     // proof produced under a branch authority a newer snapshot has replaced is not proof about this
     // branch at all.
     const opening = evidence.get(key);
-    if (opening?.onBranch !== true || opening.generation !== generation) return;
+    if (opening?.onBranch !== true || opening.generation !== generation) return null;
     // A generated report is app output echoed back by the page. It is never an instruction, and
     // it is rejected here even though the observer claimed it was user-authored.
     const origin = await deps.messageOrigin({ sessionId: row.session_id, messageId: row.message_id, text: row.text })
       .catch((): WorkMessageOrigin => 'unknown');
     if (origin === 'generated') {
       rejectRow(row, 'this message was generated by the host as a work report, so it is not an instruction');
-      return;
+      return null;
     }
-    if (origin === 'unknown') return;
+    if (origin === 'unknown') return null;
     const policySettled = await deps.conversationSettled({ sessionId: row.session_id, conversationId: row.conversation_id })
       .catch(() => false);
     // Whether the controller's own conversation already executed this exact message is resolved
@@ -957,28 +1039,39 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
     const observed = evidence.get(key);
     const context = observed?.context ?? null;
     const contextAssistantId = observed?.context ? observed.contextAssistantId : null;
-    // Every await is behind us now. Everything below is one synchronous validation against the
-    // durable state as it is *at the moment of admission*, so a disable, a rebind, a claim by the
-    // controller's own model call, or a snapshot that proved a new native turn cannot land in
-    // between and still be admitted past.
-    if (!alive()) return;
-    if (branchGeneration(row.session_id) !== generation) return;
+    return { binding, row, relation, policySettled, context, contextAssistantId };
+  }
+
+  /**
+   * Admits one prepared message inside the chunk's transaction, or leaves it pending.
+   *
+   * Everything here is one synchronous validation against the durable state as it is *at the
+   * moment of admission*, so a disable, a rebind, a claim by the controller's own model call, or a
+   * snapshot that proved a new native turn cannot land in between and still be admitted past.
+   * Post-commit effects are appended to `published`. Returns true when the admission moved the
+   * binding onto a successor, which invalidates every later route prepared in this chunk.
+   */
+  function commitRoute(route: PreparedRoute, generation: number, published: Array<() => void>): boolean {
+    const { binding, row, relation, policySettled, context, contextAssistantId } = route;
+    const key = evidenceKey(row.session_id, row.message_id);
+    if (!alive()) return false;
+    if (branchGeneration(row.session_id) !== generation) return false;
     const live = bindingFor(binding.session_id);
     if (!live || !live.enabled || live.conversation_id !== binding.conversation_id ||
-        live.bound_at !== binding.bound_at || live.work_id !== binding.work_id) return;
+        live.bound_at !== binding.bound_at || live.work_id !== binding.work_id) return false;
     const held = readOne(() => store.getControllerMessage(row.session_id, row.message_id));
-    if (!held || held.state !== 'pending') return;
+    if (!held || held.state !== 'pending') return false;
     if (held.authored_at <= live.bound_at) {
       rejectRow(held, 'this message predates the controller\'s current boundary, so it was not executed');
-      return;
+      return false;
     }
     const proof = evidence.get(key);
-    if (proof?.onBranch !== true || proof.generation !== generation) return;
+    if (proof?.onBranch !== true || proof.generation !== generation) return false;
     // The in-process observation is the freshest authenticated proof there is, and it can only ever
     // *refuse*: a snapshot that landed after the policy check and said the controller is generating
     // again is the current answer, so an older policy "settled" cannot override it.
-    if (proof.settled === false) return;
-    if (!proof.settled && !policySettled) return;
+    if (proof.settled === false) return false;
+    if (!proof.settled && !policySettled) return false;
     // A proven MCP call from this same controller turn may already have admitted this exact
     // message: both paths share one durable request id, so an existing receipt means the admission
     // happened and this row is a receipt, not a second instruction.
@@ -989,7 +1082,7 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
         work_id: admitted,
         error: 'admitted by the controller conversation itself'
       });
-      return;
+      return false;
     }
     // A native call has *claimed* this row and has not finished: the claim is the row's in-flight
     // marker, and only its own receipt clears it. Dispatching here would race that call — the relay
@@ -1000,17 +1093,17 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
     //
     // The marker is deliberately not `work_id`: a native `start` names no work yet, so its claim has
     // `work_id === null` while it is very much in flight.
-    if (held.claimed_at !== null) return;
+    if (held.claimed_at !== null) return false;
     const service = deps.service();
-    if (!service) return;
+    if (!service) return false;
     const work = readOne(() => store.getWork(live.work_id));
     if (!work) {
       rejectRow(held, `the bound work ${live.work_id} no longer exists in the ledger`);
-      return;
+      return false;
     }
     if (work.status === 'cancelled') {
       rejectRow(held, 'the bound work was cancelled. Cancellation is terminal; start a new work instead.');
-      return;
+      return false;
     }
     // The controller *is* the prime conversation, so its own turn may already handle the message.
     // "Handled" is decided by that message's own execution lineage, never by the work's current
@@ -1026,7 +1119,7 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
     //
     // A recorded turn that has not ended is the third case: the controller's own model may be
     // driving this work right now, so the row is left pending rather than injected underneath it.
-    if (relation === 'live') return;
+    if (relation === 'live') return false;
     if (relation === 'executed') {
       try {
         store.updateControllerMessage(held.session_id, held.message_id, {
@@ -1037,13 +1130,13 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
       } catch (error) {
         logWarn(`continuity could not record the native-handled receipt: ${(error as Error).message}`);
       }
-      return;
+      return false;
     }
-    // The dispatch is frozen durably *before* the service side effect. The service hashes the
+    // The dispatch is frozen in the same commit as the service admission. The service hashes the
     // instruction it is handed, so a replay that recomposed from a recorder that has since recorded
     // more would present a *different* command under the same request id and be refused as a
-    // conflict instead of joining the admission that already happened. Frozen here, the replay
-    // reuses exactly these bytes and exactly this hash.
+    // conflict instead of joining the admission that already happened. Frozen with the receipt, the
+    // replay reuses exactly these bytes and exactly this hash.
     const dispatch = held.dispatch_text ?? relayText(held.text, context);
     if (held.dispatch_text === null) {
       // The whole instruction and the whole quotation, or nothing: a plan shortened to fit executes
@@ -1056,50 +1149,57 @@ export function createWorkContinuity(deps: WorkContinuityDeps): WorkContinuityHa
         } catch (error) {
           logWarn(`continuity could not record an oversized dispatch: ${(error as Error).message}`);
         }
-        return;
-      }
-      try {
-        store.updateControllerMessage(held.session_id, held.message_id, {
-          dispatch_text: dispatch,
-          context_assistant_id: contextAssistantId
-        });
-      } catch (error) {
-        logWarn(`continuity could not freeze the dispatch for ${held.message_id}: ${(error as Error).message}`);
-        return;
+        return false;
       }
     }
+    // One savepoint per message inside the chunk's transaction: a refused admission rolls back
+    // only this message's freeze and receipt, and is recorded as that message's rejection.
+    let receipt: WorkReceipt;
     try {
-      const receipt = await service.instruct({
-        request_id: held.request_id,
-        work_id: work.work_id,
-        text: dispatch
-      });
-      store.updateControllerMessage(held.session_id, held.message_id, { state: 'accepted', work_id: receipt.work_id, error: null });
-      // The instruction may have landed on a successor. The controller keeps its own session and
-      // conversation; only the work it drives moves forward.
-      //
-      // The binding is only moved when it is still the *same authority* this admission ran under:
-      // the same conversation, the same boundary, the same account and the same work it started
-      // from. This `instruct` awaited, and a person can rebind that same session to an unrelated
-      // work while it ran — moving the binding then would silently retarget their new work onto this
-      // chain, and even preserve this chain's epoch over theirs. When the authority changed, the
-      // admission is recorded as the receipt it is and the binding is left exactly as the user made
-      // it.
-      if (receipt.work_id !== live.work_id) {
-        const after = bindingFor(held.session_id);
-        if (after && after.enabled && after.conversation_id === live.conversation_id &&
-            after.bound_at === live.bound_at && after.work_id === live.work_id) {
-          // The chain moves forward without changing who the controller is: the epoch, the account
-          // and the conversation are preserved exactly, so the successor's reports answer to the
-          // same authority the predecessor's did.
-          store.putControllerBinding({ ...after, work_id: receipt.work_id, event_cursor: 0, updated_at: now() });
+      receipt = store.runInTransaction(() => {
+        if (held.dispatch_text === null) {
+          store.updateControllerMessage(held.session_id, held.message_id, {
+            dispatch_text: dispatch,
+            context_assistant_id: contextAssistantId
+          });
         }
-        lastReportAt.delete(held.session_id);
-      }
-      logInfo(`continuity routed controller message ${held.message_id} to work ${receipt.work_id.slice(0, 8)}`);
+        const admission = service.admitInstruction({
+          request_id: held.request_id,
+          work_id: work.work_id,
+          text: dispatch
+        });
+        store.updateControllerMessage(held.session_id, held.message_id, { state: 'accepted', work_id: admission.receipt.work_id, error: null });
+        published.push(admission.publish);
+        return admission.receipt;
+      });
     } catch (error) {
       rejectRow(held, (error as Error).message);
+      return false;
     }
+    published.push(() => logInfo(`continuity routed controller message ${held.message_id} to work ${receipt.work_id.slice(0, 8)}`));
+    if (receipt.work_id === live.work_id) return false;
+    // The instruction landed on a successor. The controller keeps its own session and
+    // conversation; only the work it drives moves forward.
+    //
+    // The binding is only moved when it is still the *same authority* this admission ran under:
+    // the same conversation, the same boundary, the same account and the same work it started
+    // from. A person can rebind that same session to an unrelated work at any point — moving the
+    // binding then would silently retarget their new work onto this chain, and even preserve this
+    // chain's epoch over theirs. When the authority changed, the admission is recorded as the
+    // receipt it is and the binding is left exactly as the user made it.
+    const after = bindingFor(held.session_id);
+    const sessionId = held.session_id;
+    published.push(() => lastReportAt.delete(sessionId));
+    if (after && after.enabled && after.conversation_id === live.conversation_id &&
+        after.bound_at === live.bound_at && after.work_id === live.work_id) {
+      // The chain moves forward without changing who the controller is: the epoch, the account
+      // and the conversation are preserved exactly, so the successor's reports answer to the
+      // same authority the predecessor's did.
+      store.putControllerBinding({ ...after, work_id: receipt.work_id, event_cursor: 0, updated_at: now() });
+    }
+    // Either way the binding no longer names the work every later route in this chunk was
+    // prepared against.
+    return true;
   }
 
   /**

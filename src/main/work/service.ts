@@ -208,7 +208,21 @@ export interface WorkServiceDependencies {
   maxDeliveryAttempts?: number;
 }
 
+/** A committed-or-pending `instruct` admission and the side effects owed after its commit. */
+export interface WorkInstructionAdmission {
+  receipt: WorkReceipt;
+  /** Successor start and pump wake. Runs once, only after the enclosing transaction committed. */
+  publish(): void;
+}
+
 export interface WorkServiceHandle extends WorkService {
+  /**
+   * The synchronous admission core of `instruct`, for a caller that commits several admissions
+   * in one enclosing `store.runInTransaction`. The receipt is durable only once that enclosing
+   * transaction commits, so `publish` must run after that commit and never inside it. Called
+   * outside a transaction it commits on its own, exactly like `instruct`.
+   */
+  admitInstruction(input: WorkInstruction): WorkInstructionAdmission;
   /** Startup: reconcile durable rows, then start the delivery pump. */
   reconcile(): Promise<void>;
   /** Runs the pump once; tests use this instead of waiting for a timer. */
@@ -1248,6 +1262,14 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
     },
 
     async instruct(input: WorkInstruction): Promise<WorkReceipt> {
+      // Standalone, the admission commits its own transaction, so publishing right away is
+      // publishing after the commit.
+      const admission = service.admitInstruction(input);
+      admission.publish();
+      return admission.receipt;
+    },
+
+    admitInstruction(input: WorkInstruction): WorkInstructionAdmission {
       const parsed = workInstructionSchema.parse(input);
       const requested = requireWork(parsed.work_id);
       if (isFenced(requested)) {
@@ -1266,7 +1288,8 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
       const existing = store.getCommand(parsed.request_id);
       if (existing) {
         if (existing.input_hash !== hash) conflict(parsed.request_id);
-        return priorReceipt(existing) ?? receiptOf(requireWork(existing.work_id), parsed.request_id);
+        const replay = priorReceipt(existing) ?? receiptOf(requireWork(existing.work_id), parsed.request_id);
+        return { receipt: replay, publish: () => undefined };
       }
 
       // Everything below is one transaction, and it re-reads the chain inside it: two
@@ -1365,13 +1388,18 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
 
       // The successor's admission runs after the commit, exactly like `start`: the caller already
       // holds a durable receipt, and a missing login or browser becomes a retained blocker on an
-      // admitted work rather than a lost instruction.
-      if (outcome.started) {
-        const started = outcome.started;
-        void runtime.beginStart(started).catch((error: unknown) => markStartFailure(started.workId, error));
-      }
-      schedulePump();
-      return outcome.receipt;
+      // admitted work rather than a lost instruction. Inside an enclosing transaction "after the
+      // commit" is the caller's commit, which is why this is handed back rather than run here.
+      return {
+        receipt: outcome.receipt,
+        publish: () => {
+          if (outcome.started) {
+            const started = outcome.started;
+            void runtime.beginStart(started).catch((error: unknown) => markStartFailure(started.workId, error));
+          }
+          schedulePump();
+        }
+      };
     },
 
     async control(input: WorkControl): Promise<WorkReceipt> {
