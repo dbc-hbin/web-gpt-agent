@@ -693,6 +693,21 @@ describe('wgpt daemon start', () => {
     expect([await exists(bundledRan), await exists(pathRan), await exists(entryRan)]).toEqual([false, false, false]);
   });
 
+  it('preserves CLI arguments through the cross-platform Node launcher', async () => {
+    const dir = await makeTempDir('wgpt-launcher-');
+    track(() => removeTempDir(dir));
+    const entry = path.join(dir, 'entry.mjs');
+    await fs.writeFile(entry, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), node: process.env.WGPT_NODE_EXECUTABLE }))');
+    const launched = spawnSync(process.execPath, [path.resolve('bin/wgpt.mjs'), 'daemon', 'start', '--data-dir', path.join(dir, 'with spaces')], {
+      encoding: 'utf8',
+      env: { ...process.env, WGPT_CLI_ENTRY: entry, WGPT_NODE_EXECUTABLE: '' }
+    });
+    expect(JSON.parse(launched.stdout)).toEqual({
+      argv: ['daemon', 'start', '--data-dir', path.join(dir, 'with spaces')],
+      node: process.execPath
+    });
+  });
+
   it('refuses when there is no daemon entry to launch', async () => {
     expect(() => daemonLaunchSpec({ ...process.env, WGPT_DAEMON_ENTRY: '' }, '/opt/app/main/index.js')).toThrow(
       /cannot locate the daemon entry/

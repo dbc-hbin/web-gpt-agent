@@ -80,8 +80,13 @@ function hostLaunch(): { executable: string; args: string[]; env: NodeJS.Process
   // when the GUI exits, and the AppImage launcher's sandbox decision (`--no-sandbox` where user
   // namespaces are unavailable) applied only to the process it started. Relaunching the
   // `.AppImage` itself gives the persistent backend its own mount and the same launcher decision.
+  // The runtime exports APPIMAGE/APPDIR to every descendant, so a DEB launched from another
+  // AppImage's terminal inherits foreign values: use them only when this executable is inside APPDIR.
   const appImage = app.isPackaged && process.platform === 'linux' ? process.env.APPIMAGE?.trim() : undefined;
-  const executable = process.env.WGPT_APP_EXECUTABLE?.trim() || appImage || process.execPath;
+  const appDir = process.env.APPDIR?.trim();
+  const inside = appDir ? path.relative(appDir, process.execPath) : '..';
+  const ownAppImage = appImage && !inside.startsWith('..') && !path.isAbsolute(inside) ? appImage : undefined;
+  const executable = process.env.WGPT_APP_EXECUTABLE?.trim() || ownAppImage || process.execPath;
   const root = process.env.WGPT_REPO_ROOT?.trim() || (app.isPackaged ? '' : path.resolve(__dirname, '../..'));
   const args = [...(root ? [root] : []), '--daemon-host', '--data-dir', dataDir];
   const env = { ...process.env };

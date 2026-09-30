@@ -1883,40 +1883,36 @@ interface PatchResolution {
  * time here scanning a summary that, on success, contains no native path at all.
  */
 function safePatchOutput(text: string, resolution: PatchResolution): string {
-  const byLength = new Map<number, Map<string, string>>();
-  // Every spelling of one patch normally shares its root's native prefix, so `indexOf(prefix)`
-  // visits only real candidates and a summary without native paths costs one linear search.
-  let prefix: string | null = null;
-  for (const [from, to] of resolution.displayRewrites) {
-    if (from === '' || from === to) continue;
-    let bucket = byLength.get(from.length);
-    if (bucket === undefined) byLength.set(from.length, (bucket = new Map()));
-    bucket.set(from, to);
-    if (prefix === null) {
-      prefix = from;
-    } else {
-      let shared = 0;
-      while (shared < prefix.length && shared < from.length && prefix[shared] === from[shared]) shared++;
-      prefix = prefix.slice(0, shared);
-    }
+  const spellings = new Map<string, string>();
+  for (const [from, to] of resolution.displayRewrites) if (from !== '' && from !== to) spellings.set(from, to);
+  if (spellings.size === 0) return text;
+  // One patch's spellings share few distinct short heads (its roots' drive/prefix spellings), so one
+  // search over those heads visits only real candidates, even when two spellings share no prefix
+  // at all (`C:\` and `c:/` on Windows). Each hit checks only its own head's lengths, longest first.
+  let headLength = 4;
+  for (const from of spellings.keys()) headLength = Math.min(headLength, from.length);
+  const lengthsByHead = new Map<string, number[]>();
+  for (const from of spellings.keys()) {
+    const head = from.slice(0, headLength);
+    const lengths = lengthsByHead.get(head) ?? [];
+    if (!lengths.includes(from.length)) lengths.push(from.length);
+    lengthsByHead.set(head, lengths);
   }
-  if (prefix === null) return text;
-  const lengths = [...byLength.keys()].sort((a, b) => b - a);
+  for (const lengths of lengthsByHead.values()) lengths.sort((a, b) => b - a);
+  const heads = new RegExp([...lengthsByHead.keys()].map(head => head.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|'), 'g');
   let safe = '';
   let copied = 0;
-  let index = text.indexOf(prefix);
-  scan: while (index !== -1 && index < text.length) {
-    for (const length of lengths) {
-      if (index + length > text.length) continue;
-      const to = byLength.get(length)!.get(text.slice(index, index + length));
+  for (let match = heads.exec(text); match !== null; match = heads.exec(text)) {
+    const index = match.index;
+    for (const length of lengthsByHead.get(match[0])!) {
+      const to = index + length <= text.length ? spellings.get(text.slice(index, index + length)) : undefined;
       if (to === undefined) continue;
       safe += text.slice(copied, index) + to;
-      index += length;
-      copied = index;
-      index = text.indexOf(prefix, index);
-      continue scan;
+      copied = index + length;
+      heads.lastIndex = copied;
+      break;
     }
-    index = text.indexOf(prefix, index + 1);
+    if (copied <= index) heads.lastIndex = index + 1;
   }
   return copied === 0 ? text : safe + text.slice(copied);
 }

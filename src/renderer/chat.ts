@@ -14,7 +14,7 @@ import { messageReaction, withoutMessageReaction } from '../shared/message-react
 import { goalErrorMessage } from '../shared/goal-errors.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
 import { renderGoalReasoning } from './goal-reasoning.js';
-import { preserveTimelineViewport } from './timeline-scroll.js';
+import { preserveTimelineViewport, timelineKeyedRows } from './timeline-scroll.js';
 import { createSidebarOrder } from './sidebar-order.js';
 import { toolResultText } from './tool-result.js';
 import { chatErrorPresentation, duplicateChatErrors } from './chat-error.js';
@@ -943,7 +943,8 @@ function paintDeliveryControls(): void {
   send.classList.toggle('is-plan-ready', !!preparedPlan && !stop);
   ui(send, 'title', () => stop && !working && pending ? t("Cancel delivery") : preparedPlan && !stop ? planAction : planMode && !stop ? t("Click to generate plan") : '');
   send.classList.toggle('is-stop', stop);
-  for (const button of $('sendOptions').querySelectorAll<HTMLElement>('[data-delivery]')) {
+  for (const button of $('sendOptions').querySelectorAll<HTMLElement>('button')) {
+    if (!button.dataset.delivery) continue;
     button.setAttribute('aria-checked', String(button.dataset.delivery === (nativeFiles && working && $<HTMLSelectElement>('sendMode').value !== 'tool' ? 'after-turn' : $<HTMLSelectElement>('sendMode').value)));
   }
 }
@@ -1117,7 +1118,7 @@ function paintTaskActions(): void {
   const save = $<HTMLButtonElement>('saveSessionObjective');
   const off = $<HTMLSelectElement>('chatAutomation').value === 'off';
   objective.hidden = off;
-  document.querySelector<HTMLLabelElement>('label[for="sessionObjective"]')!.hidden = off;
+  $('sessionObjectiveLabel').hidden = off;
   save.hidden = off;
   const saved = objective.dataset.saved === objective.value && !!objective.value.trim();
   save.disabled = objective.disabled || !objective.value.trim() || save.dataset.busy === 'true' || saved;
@@ -1147,13 +1148,14 @@ function paintAutomationSwitch(): void {
   paintGoalProgress();
   paintActiveGoal();
   const select = $<HTMLSelectElement>('chatAutomation');
-  for (const button of $('automationSwitch').querySelectorAll<HTMLButtonElement>('[data-mode]')) {
+  for (const button of $('automationSwitch').querySelectorAll<HTMLButtonElement>('button')) {
+    if (!button.dataset.mode) continue;
     button.setAttribute('aria-checked', String(button.dataset.mode === select.value));
     button.disabled = select.disabled;
   }
   $<HTMLSelectElement>('sessionObjectiveMode').value = select.value === 'loop' ? 'loop' : 'goal';
   const loop = select.value === 'loop';
-  ui(document.querySelector('label[for="sessionObjective"]')!, 'textContent', () => loop ? t("Loop instructions") : t("Goal"));
+  ui($('sessionObjectiveLabel'), 'textContent', () => loop ? t("Loop instructions") : t("Goal"));
   ui($<HTMLTextAreaElement>('sessionObjective'), 'placeholder', () => loop ? t("What should each continuation focus on?") : t("What should this chat achieve?"));
   paintTaskActions();
 }
@@ -2072,13 +2074,13 @@ function retainTimelinePage(source: SessionEvent[], direction: 'older' | 'newer'
   const pane = $('chatBody');
   const edge = pane.getBoundingClientRect().top;
   const protectedKeys = new Set<string>();
-  for (const row of $('timeline').querySelectorAll<HTMLElement>('[data-timeline-key]')) {
+  for (const row of timelineKeyedRows($('timeline'))) {
     const rect = row.getBoundingClientRect();
     if (rect.height <= 0 || rect.bottom <= edge - pane.clientHeight) continue;
     if (rect.top >= edge + 2 * pane.clientHeight) break;
     protectedKeys.add(row.dataset.timelineKey!);
-    if (row.matches('.tool-group:not([open])')) {
-      for (const child of row.querySelectorAll<HTMLElement>('[data-timeline-key]')) protectedKeys.add(child.dataset.timelineKey!);
+    if (row.classList.contains('tool-group') && !row.hasAttribute('open')) {
+      for (const child of timelineKeyedRows(row)) protectedKeys.add(child.dataset.timelineKey!);
     }
   }
   const protectedSeqs = new Set<number>();
@@ -2438,15 +2440,21 @@ function reconcileChildren(parent: Element, children: HTMLElement[]): void {
 }
 function groupToolRows(rows: HTMLElement[], scope = selectedId, groups = toolGroups): HTMLElement[] {
   const grouped: HTMLElement[] = [], retained = new Set<string>();
+  const activity = (row: HTMLElement) => row.classList.contains('ev-tool_call') || row.classList.contains('ev-page_tool') || row.classList.contains('ev-agent_message');
   for (let i = 0; i < rows.length;) {
-    if (!rows[i]!.matches('.ev-tool_call, .ev-page_tool, .ev-agent_message')) { grouped.push(rows[i++]!); continue; }
+    if (!activity(rows[i]!)) { grouped.push(rows[i++]!); continue; }
     let end = i + 1;
-    while (end < rows.length && rows[end]!.matches('.ev-tool_call, .ev-page_tool, .ev-agent_message') && rows[end]!.dataset.activityBoundary === rows[i]!.dataset.activityBoundary) end++;
+    while (end < rows.length && activity(rows[end]!) && rows[end]!.dataset.activityBoundary === rows[i]!.dataset.activityBoundary) end++;
     if (end - i === 1) { grouped.push(rows[i++]!); continue; }
     // Paging can extend or trim the beginning of an activity group. Its first
-    // member is therefore not a new disclosure/viewport identity.
-    const previous = rows.slice(i, end).map(row => row.closest<HTMLElement>('.tool-group'))
-      .find(group => group?.dataset.timelineKey && groups.get(group.dataset.timelineKey) === group && !retained.has(group.dataset.timelineKey));
+    // member is therefore not a new disclosure/viewport identity. Members sit in the
+    // group's body, so check that exact parent instead of an ancestor search per row.
+    let previous: HTMLElement | undefined;
+    for (let j = i; j < end && !previous; j++) {
+      const candidate = rows[j]!.parentElement?.parentElement;
+      const key = candidate?.classList.contains('tool-group') ? candidate.dataset.timelineKey : undefined;
+      if (key && groups.get(key) === candidate && !retained.has(key)) previous = candidate;
+    }
     const key = previous?.dataset.timelineKey ?? `group:${scope}:${rows[i]!.dataset.timelineKey}`;
     retained.add(key);
     let group = groups.get(key);

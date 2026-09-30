@@ -298,6 +298,30 @@ describe('baseline capture', () => {
     expect(git(root, ['ls-tree', baseline.baselineCommit, 'tool.sh']).split(' ')[0]).toBe('100755');
   });
 
+  it('carries staged mode changes when the repository ignores the filesystem bit', async () => {
+    const root = await repository({ 'up.sh': '#!/bin/sh\n', 'down.sh': '#!/bin/sh\n' });
+    git(root, ['config', 'core.fileMode', 'false']);
+    git(root, ['update-index', '--chmod=+x', 'down.sh']);
+    git(root, ['commit', '-qm', 'down.sh executable']);
+    // Staged only: the filesystem bit cannot express either change under core.fileMode=false.
+    git(root, ['update-index', '--chmod=+x', 'up.sh']);
+    git(root, ['update-index', '--chmod=-x', 'down.sh']);
+    write(root, 'added.sh', '#!/bin/sh\n');
+    git(root, ['add', 'added.sh']);
+    git(root, ['update-index', '--chmod=+x', 'added.sh']);
+    const indexBefore = git(root, ['ls-files', '--stage']);
+
+    const { store, dir } = await ledger();
+    const { workId } = seed(store);
+    const baseline = await manager(store, dir).captureBaseline({ projectPath: root, workId });
+
+    const recorded = (file: string) => git(root, ['ls-tree', baseline.baselineCommit, file]).split(' ')[0];
+    expect(recorded('up.sh')).toBe('100755');
+    expect(recorded('down.sh')).toBe('100644');
+    expect(recorded('added.sh')).toBe('100755');
+    expect(git(root, ['ls-files', '--stage'])).toBe(indexBefore);
+  });
+
   it('captures an unborn repository from an empty tree and leaves HEAD unborn', async () => {
     const root = await makeTempDir('wgpt-wt-unborn-');
     directories.push(root);

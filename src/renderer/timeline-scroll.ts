@@ -1,3 +1,21 @@
+/** Every `[data-timeline-key]` element under `root`, in document order. Paging
+ * calls this several times per stage, so it walks only the row structure: keyed
+ * rows own their content and never nest another keyed row, while an activity
+ * disclosure (`.tool-group`) and unkeyed wrappers (image galleries) contain them.
+ * A selector-engine scan of every resident node dominated each stage's cost. */
+export function timelineKeyedRows(root: Element): HTMLElement[] {
+  const rows: HTMLElement[] = [];
+  let node = root.firstElementChild;
+  while (node) {
+    const keyed = node.hasAttribute('data-timeline-key');
+    if (keyed) rows.push(node as HTMLElement);
+    if (node.firstElementChild && (!keyed || node.classList.contains('tool-group'))) { node = node.firstElementChild; continue; }
+    while (node && node !== root && !node.nextElementSibling) node = node.parentElement;
+    node = node && node !== root ? node.nextElementSibling : null;
+  }
+  return rows;
+}
+
 /** Capture the visible logical row for one synchronous reconciliation. No retained
  * state: selection changes and user scrolling naturally get a fresh anchor. */
 export function preserveTimelineViewport(pane: HTMLElement, timeline: HTMLElement, followBottom = true): () => void {
@@ -6,8 +24,8 @@ export function preserveTimelineViewport(pane: HTMLElement, timeline: HTMLElemen
   const previousReserve = Number.parseFloat(timeline.style.getPropertyValue('--timeline-scroll-reserve')) || 0;
   const previousContentHeight = timeline.getBoundingClientRect().height - previousReserve;
   const edge = pane.getBoundingClientRect().top;
-  const rows = () => [...timeline.querySelectorAll<HTMLElement>('[data-timeline-key]')]
-    .filter(row => !row.matches('.tool-group[open]'));
+  const rows = () => timelineKeyedRows(timeline)
+    .filter(row => !(row.classList.contains('tool-group') && row.hasAttribute('open')));
   const anchors: Array<{ key: string | undefined; offset: number }> = [];
   if (!following) for (const row of rows()) {
     const rect = row.getBoundingClientRect();

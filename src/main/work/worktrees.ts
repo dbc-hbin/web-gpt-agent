@@ -701,19 +701,15 @@ export function createWorktreeManager(deps: WorktreeManagerDeps): WorktreeManage
     const paths = splitNul(listed.stdout).map((entry) => (entry.endsWith('/') ? entry.slice(0, -1) : entry)).filter((entry) => entry !== '');
     // With `core.fileMode=false` (the Windows default) Git ignores the filesystem's executable bit:
     // a regular file keeps the mode its index entry already has, and a new one is `100644`. The
-    // capture's index is seeded from HEAD, so HEAD's recorded mode is exactly what `add -A` keeps —
-    // a tracked `100755` script stays executable. Reading the bit from `stat` here instead made
-    // every such project look like it changed during the snapshot.
+    // capture's index is a copy of this index, so the staged mode is exactly what `add -A` keeps —
+    // a tracked `100755` script stays executable and a staged `chmod +x` is carried. Reading the
+    // bit from `stat` here instead made every such project look like it changed during the snapshot.
     const honorsFileMode = (await git(cwd, ['config', '--bool', 'core.fileMode'])).stdout.trim() !== 'false';
-    const recordedExecutable = new Set<string>();
-    if (!honorsFileMode && (await headCommit(cwd)) !== null) {
-      for (const entry of parseTreeZ((await gitOk(cwd, ['ls-tree', '-r', '-z', 'HEAD'])).stdout)) {
-        if (entry.mode === fileMode(true)) recordedExecutable.add(entry.path);
-      }
-    }
     const staged = parseStageZ((await gitOk(cwd, ['ls-files', '--stage', '-z'])).stdout);
+    const recordedExecutable = new Set<string>();
     const gitlinks = new Map<string, string>();
     for (const entry of staged) {
+      if (entry.mode === fileMode(true)) recordedExecutable.add(entry.path);
       if (entry.mode === GITLINK_MODE) gitlinks.set(entry.path, entry.hash);
     }
 
@@ -827,12 +823,23 @@ export function createWorktreeManager(deps: WorktreeManagerDeps): WorktreeManage
     }
   }
 
-  /** Runs `read-tree`/`add -A`/`write-tree`/`commit-tree` through an alternate index file. */
+  /**
+   * Runs `add -A`/`write-tree`/`commit-tree` through an alternate index file seeded from `cwd`'s
+   * own index, so staged state — including a staged mode change that `core.fileMode=false`
+   * cannot read back from the filesystem — is what the capture records.
+   */
   async function captureTree(cwd: string, options: { unborn: boolean; message: string; parent: string | null }): Promise<{ tree: string; commit: string }> {
     const indexPath = path.join(tmpdir(), `wgpt-idx-${randomUUID()}`);
     const env = { GIT_INDEX_FILE: indexPath };
+    const sourceIndex = (await gitOk(cwd, ['rev-parse', '--path-format=absolute', '--git-path', 'index'])).stdout.trim();
     try {
-      await gitOk(cwd, options.unborn ? ['read-tree', '--empty'] : ['read-tree', 'HEAD'], { env });
+      try {
+        await fs.copyFile(sourceIndex, indexPath);
+      } catch (error) {
+        // A repository that has never staged anything has no index file yet.
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+        await gitOk(cwd, options.unborn ? ['read-tree', '--empty'] : ['read-tree', 'HEAD'], { env });
+      }
       await gitOk(cwd, ['add', '-A'], { env });
       const tree = (await gitOk(cwd, ['write-tree'], { env })).stdout.trim();
       const args = options.parent === null ? ['commit-tree', tree, '-m', options.message] : ['commit-tree', tree, '-p', options.parent, '-m', options.message];
