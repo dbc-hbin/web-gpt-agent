@@ -4,7 +4,7 @@ import { initConfigPath, loadConfig, getConfig, updateConfig, effectiveCapabilit
 import { initDurableStore, flushDurable, resetDurableForTests } from '../src/main/durable.js';
 import { initSessionStore, createSession, readEvents, flushSessions } from '../src/main/session/store.js';
 import { flushRecorder } from '../src/main/session/recorder.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { closeCorrelationStore, observeRequestCorrelation } from '../src/main/session/correlation.js';
 import { startMcpServer, type McpEndpoint } from '../src/main/mcp/server.js';
 import { pluginManager } from '../src/main/plugins/manager.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -60,6 +60,9 @@ it.runIf(process.env.COS_PLUGIN_LIVE_TEST === '1')('routes upstream Memory throu
     await endpoint?.stop();
     await pluginManager.close();
     await flushRecorder(); await flushSessions(); await flushDurable(); resetDurableForTests();
+    // The process-wide request-ownership ledger lives under this directory; Windows refuses to
+    // delete a SQLite file a live connection still holds.
+    closeCorrelationStore();
     await removeTempDir(directory);
   }
 }, 180_000);
