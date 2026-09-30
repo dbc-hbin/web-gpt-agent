@@ -76,7 +76,12 @@ async function hostStatus(): Promise<DesktopDaemonStatus> {
 }
 
 function hostLaunch(): { executable: string; args: string[]; env: NodeJS.ProcessEnv } {
-  const executable = process.env.WGPT_APP_EXECUTABLE?.trim() || process.execPath;
+  // Inside an AppImage, `process.execPath` lives in this process's temporary mount, which ends
+  // when the GUI exits, and the AppImage launcher's sandbox decision (`--no-sandbox` where user
+  // namespaces are unavailable) applied only to the process it started. Relaunching the
+  // `.AppImage` itself gives the persistent backend its own mount and the same launcher decision.
+  const appImage = app.isPackaged && process.platform === 'linux' ? process.env.APPIMAGE?.trim() : undefined;
+  const executable = process.env.WGPT_APP_EXECUTABLE?.trim() || appImage || process.execPath;
   const root = process.env.WGPT_REPO_ROOT?.trim() || (app.isPackaged ? '' : path.resolve(__dirname, '../..'));
   const args = [...(root ? [root] : []), '--daemon-host', '--data-dir', dataDir];
   const env = { ...process.env };
