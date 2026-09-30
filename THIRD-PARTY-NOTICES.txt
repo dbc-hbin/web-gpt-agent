@@ -12519,7 +12519,7 @@ Upstream build/source projects:
 
 The current dependency set uses sharp 0.35.4 / libvips 8.18.6. The release pipeline
 places `Web-GPT-Agent-Native-Sources.tar.gz` beside the matching installers at:
-https://github.com/totec448-spec/chat-on-steroids/releases
+https://github.com/dbc-hbin/web-gpt-agent/releases
 Use the source archive and checksums from the same release as your installer.
 
 It contains original component archives, locked Rust dependency sources, build repositories,

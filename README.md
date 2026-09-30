@@ -94,18 +94,23 @@ Web GPT Agent publishes three logical MCP connector surfaces. For standard codin
 
 Manage backends and durable tasks from the terminal using the bundled `wgpt` executable:
 
+For the agent workflow and receipt interpretation, see the [wgpt CLI-to-web skill](.agents/skills/wgpt-cli-web/SKILL.md).
+
+The public `bin/wgpt.mjs` launcher discovers the app executable only when `WGPT_APP_EXECUTABLE` is unset or empty. A nonempty override selects that exact path or command on `PATH`; an unusable override fails instead of launching a different app.
+
 ### 1. Host & Daemon Control
 ```sh
 # Electron desktop backend (serves GUI and local workspace)
 wgpt host start
 wgpt host status
-wgpt host stop
 
 # Headless Node.js daemon (no GUI, minimal resource usage)
 wgpt daemon start --data-dir /path/to/data
 wgpt daemon status --data-dir /path/to/data
 wgpt daemon stop --data-dir /path/to/data
 ```
+
+The daemon requires an explicit data directory; managed browser delivery also requires a connected browser path (`daemon start --browser` opts into its browser transport). `host` exposes `start` and `status`, not `stop`. A work receipt records admission, not confirmed ChatGPT delivery.
 
 ### 2. Work Management
 ```sh

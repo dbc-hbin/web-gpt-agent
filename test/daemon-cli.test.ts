@@ -20,7 +20,7 @@
  *   - a malformed command is exit 2, a missing daemon is exit 3, and a refusal is exit 4.
  */
 
-import { execFileSync, spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { promises as fs, writeFileSync } from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
@@ -616,19 +616,81 @@ describe('wgpt daemon start', () => {
     ).toThrow(/plain Node/);
   });
 
-  it('preserves CLI arguments through the cross-platform Node launcher', async () => {
-    const dir = await makeTempDir('wgpt-launcher-');
+  // A POSIX app stand-in: records that it ran, then acts as the Node host the launcher expects.
+  async function makeAppFixture(file: string, marker: string): Promise<void> {
+    await fs.mkdir(path.dirname(file), { recursive: true });
+    await fs.writeFile(file, `#!/bin/sh\nprintf ran > ${JSON.stringify(marker)}\nexec ${JSON.stringify(process.execPath)} "$@"\n`, { mode: 0o755 });
+  }
+
+  it.runIf(process.platform !== 'win32')('runs an explicit development host override exactly as given', async () => {
+    const dir = await makeTempDir('wgpt-launcher-override-');
     track(() => removeTempDir(dir));
-    const entry = path.join(dir, 'entry.mjs');
-    await fs.writeFile(entry, 'process.stdout.write(JSON.stringify({ argv: process.argv.slice(2), node: process.env.WGPT_NODE_EXECUTABLE }))');
-    const stdout = execFileSync(process.execPath, [path.resolve('bin/wgpt.mjs'), 'daemon', 'start', '--data-dir', path.join(dir, 'with spaces')], {
-      encoding: 'utf8',
-      env: { ...process.env, WGPT_CLI_ENTRY: entry, WGPT_NODE_EXECUTABLE: '' }
+    const bin = path.join(dir, 'path bin');
+    const name = 'wgpt-fixture-app';
+    const marker = path.join(dir, 'path-app-ran');
+    await makeAppFixture(path.join(bin, name), marker);
+    // Stands in for `host start`: spawns whatever host executable the launcher published.
+    const entry = path.join(dir, 'cli.mjs');
+    await fs.writeFile(entry, [
+      "import { spawnSync } from 'node:child_process';",
+      "const host = spawnSync(process.env.WGPT_APP_EXECUTABLE, ['-e', ''], { encoding: 'utf8' });",
+      "process.stdout.write(JSON.stringify({ status: host.status, error: host.error?.code ?? null }));"
+    ].join('\n'));
+    const launcher = path.resolve('bin/wgpt.mjs');
+    const env = { ...process.env, WGPT_CLI_ENTRY: entry, PATH: bin + path.delimiter + (process.env.PATH || '') };
+
+    const byName = spawnSync(process.execPath, [launcher, 'host', 'start'], { env: { ...env, WGPT_APP_EXECUTABLE: name }, encoding: 'utf8' });
+    expect(JSON.parse(byName.stdout)).toEqual({ status: 0, error: null });
+    expect(await exists(marker)).toBe(true);
+
+    // The repo's Electron is available, but a broken explicit path must fail rather than run it.
+    const missing = path.join(dir, 'missing-app');
+    const invalid = spawnSync(process.execPath, [launcher, 'host', 'start'], { env: { ...env, WGPT_APP_EXECUTABLE: missing }, encoding: 'utf8' });
+    expect(JSON.parse(invalid.stdout)).toEqual({ status: null, error: 'ENOENT' });
+  });
+
+  it.runIf(process.platform !== 'win32')('runs the packaged app binary, or an explicit override exactly as given', async () => {
+    const dir = await makeTempDir('wgpt-packaged-launcher-');
+    track(() => removeTempDir(dir));
+    const appRoot = process.platform === 'darwin' ? path.join(dir, 'Web GPT Agent.app', 'Contents') : dir;
+    const resources = path.join(appRoot, process.platform === 'darwin' ? 'Resources' : 'resources');
+    await fs.mkdir(path.join(resources, 'bin'), { recursive: true });
+    await fs.writeFile(path.join(resources, 'app.asar'), 'fixture');
+    const launcher = path.join(resources, 'bin', 'wgpt.mjs');
+    await fs.copyFile(path.resolve('bin/wgpt.mjs'), launcher);
+    const bundledRan = path.join(dir, 'bundled-ran');
+    await makeAppFixture(path.join(appRoot, process.platform === 'darwin' ? 'MacOS/Web GPT Agent' : 'web-gpt-agent'), bundledRan);
+    const bin = path.join(dir, 'path bin');
+    const name = 'wgpt-fixture-app';
+    const pathRan = path.join(dir, 'path-app-ran');
+    await makeAppFixture(path.join(bin, name), pathRan);
+    const entryRan = path.join(dir, 'entry-ran');
+    const entry = path.join(dir, 'cli.mjs');
+    await fs.writeFile(entry, `import { writeFileSync } from 'node:fs'; writeFileSync(${JSON.stringify(entryRan)}, 'ran'); process.exit(4);`);
+    const env = { ...process.env, WGPT_CLI_ENTRY: entry, PATH: bin + path.delimiter + (process.env.PATH || '') };
+    // Unset: the bundled binary runs the entry.
+    const automatic = spawnSync(process.execPath, [launcher, 'host', 'status'], {
+      env: { ...env, WGPT_APP_EXECUTABLE: '' }, encoding: 'utf8'
     });
-    expect(JSON.parse(stdout)).toEqual({
-      argv: ['daemon', 'start', '--data-dir', path.join(dir, 'with spaces')],
-      node: process.execPath
+    expect(automatic.status).toBe(4);
+    expect([await exists(bundledRan), await exists(pathRan), await exists(entryRan)]).toEqual([true, false, true]);
+
+    // A bare name resolves on PATH and replaces the bundled binary.
+    await Promise.all([bundledRan, pathRan, entryRan].map((file) => fs.rm(file, { force: true })));
+    const explicit = spawnSync(process.execPath, [launcher, 'host', 'status'], {
+      env: { ...env, WGPT_APP_EXECUTABLE: name }, encoding: 'utf8'
     });
+    expect(explicit.status).toBe(4);
+    expect([await exists(bundledRan), await exists(pathRan), await exists(entryRan)]).toEqual([false, true, true]);
+
+    // An unusable explicit path fails; the bundled binary is not substituted and the entry never runs.
+    await Promise.all([bundledRan, pathRan, entryRan].map((file) => fs.rm(file, { force: true })));
+    const invalid = spawnSync(process.execPath, [launcher, 'host', 'status'], {
+      env: { ...env, WGPT_APP_EXECUTABLE: path.join(dir, 'missing-app') }, encoding: 'utf8'
+    });
+    expect(invalid.status).toBe(2);
+    expect(invalid.stderr).toContain('ENOENT');
+    expect([await exists(bundledRan), await exists(pathRan), await exists(entryRan)]).toEqual([false, false, false]);
   });
 
   it('refuses when there is no daemon entry to launch', async () => {
