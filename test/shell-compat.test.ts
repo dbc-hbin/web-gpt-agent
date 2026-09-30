@@ -595,13 +595,29 @@ it.each(['image', 'file'])('uploads through the exact shell %s input and waits f
   (f.doc.querySelector('[data-clf-attachment]') as HTMLButtonElement).click();
   expect(f.api.hasComposerAttachments()).toBe(false); expect(f.api.composerAttachmentNames()).toEqual([]);
 });
-it('treats any mounted shell attachment tray as an unsent draft', () => {
+it('anchors companion controls in the shell trailing voice group with or without a draft', () => {
   const f = fixture(), body = f.doc.querySelector('[data-composer-body]')!;
-  expect(f.api.hasComposerAttachments()).toBe(false);
-  const tray = f.doc.createElement('div'); tray.setAttribute('data-composer-attachments', ''); tray.innerHTML = '<div role="button" aria-label="report.md"></div><button aria-label="report.md 제거"></button>';
+  f.doc.querySelector('button[type="submit"]')!.remove();
+  // Live 2026-09-30 empty composer: leading / input / trailing groups; no Send until a draft exists.
+  const footer = f.doc.createElement('div'); footer.setAttribute('data-composer-footer-responsive', '');
+  footer.innerHTML = '<div><button type="button">+</button></div><div data-composer-layout="single-line"></div>' +
+    '<div><div><div><button type="button" aria-label="모델">m</button></div><div id="voice"><div><button type="button" aria-label="음성 입력"></button></div><div><button type="button" aria-label="음성 대화 시작"></button></div></div></div></div>';
+  body.append(footer);
+  const voice = f.doc.getElementById('voice')!;
+  expect(f.api.composerActions()).toEqual({ host: voice, before: null });
+  const send = f.doc.createElement('div'); send.innerHTML = '<button type="submit" aria-label="보내기"></button>';
+  voice.lastElementChild!.replaceWith(send);
+  expect(f.api.composerActions()).toEqual({ host: voice, before: send });
+});
+it('treats a shown shell attachment tray with tiles as an unsent draft', () => {
+  const f = fixture(), body = f.doc.querySelector('[data-composer-body]')!;
+  // Live 2026-09-30: the empty tray stays mounted, hidden and childless.
+  const tray = f.doc.createElement('div'); tray.setAttribute('data-composer-attachments', ''); tray.hidden = true;
   body.before(tray);
+  expect(f.api.hasComposerAttachments()).toBe(false);
+  tray.innerHTML = '<div role="button" aria-label="report.md"></div><button aria-label="report.md 제거"></button>'; tray.hidden = false;
   expect(f.api.hasComposerAttachments()).toBe(true);
-  tray.remove(); expect(f.api.hasComposerAttachments()).toBe(false);
+  tray.replaceChildren(); tray.hidden = true; expect(f.api.hasComposerAttachments()).toBe(false);
 });
 it('preserves prepared multiline text through the shell editor serializer', () => {
   const f = fixture(), edit = editing(f);

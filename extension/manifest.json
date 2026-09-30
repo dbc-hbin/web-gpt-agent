@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Web GPT Agent companion",
-  "version": "2.1.14",
+  "version": "2.2.0",
   "description": "Connects ChatGPT to Web GPT Agent and controls browser tabs in the background with DOM, screenshots and developer tools.",
   "minimum_chrome_version": "125",
   "permissions": [

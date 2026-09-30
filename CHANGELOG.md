@@ -9,10 +9,11 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after replacing the app bundle**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
-## Unreleased — Web GPT Agent fork
+## [2.2.0] — Web GPT Agent fork
 
 Forked from the MIT-licensed Chat On Steroids project by [@totec448-spec](https://github.com/totec448-spec) at commit `8f76ccc` (version 2.1.14). Everything below this section is upstream history and is retained unchanged.
 
+- Follow ChatGPT's 2026-09-30 composer update. The companion settings control appears again in an empty composer, where the new layout shows no Send button and its trailing controls carry no test id. An empty chat no longer counts as holding an attachment draft: the new layout keeps an empty, hidden attachment tray mounted, which blocked tab reuse, model discovery and draft-sensitive cleanup on every page.
 - Fix a companion stall where one Chrome call that never settled (for example a debugger attach to a hung tab) wedged the shared maintenance pass. Every later alarm and wake joined it, so queued input waited until the extension was reloaded. The joined pass now releases after 60 seconds, and rendering-lease debugger calls fail after eight seconds.
 - Replace the former native Desktop engine with bundled CUA Driver 0.29.1, owned by the Electron backend with a private endpoint and bounded shutdown. No external CuaDriver installation, socket or Plugins preset is required. Preserve upstream native schemas, Desktop `exec`/`wait`, managed Core receipts and independent browser tools. Restore Web GPT Agent's macOS Screen Recording/Accessibility permission controls.
 - Recheck native permissions and caller/runtime generation immediately before driver dispatch; withhold screen and clipboard results after revocation. Refuse alternate Windows launch selectors and foreground-only menus. Do not expose Desktop zoom until the driver can carry its owning screenshot session; Core zoom remains a read that preserves the following input's snapshot.

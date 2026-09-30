@@ -1,6 +1,6 @@
 {
   "name": "web-gpt-agent",
-  "version": "2.1.14",
+  "version": "2.2.0",
   "description": "Durable desktop agents driven by ChatGPT Web over MCP, with isolated Git worktrees, a local CLI and mobile work control.",
   "license": "MIT",
   "author": "Web GPT Agent contributors",

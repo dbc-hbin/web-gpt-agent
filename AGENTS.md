@@ -21,8 +21,8 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-09-17**, including the 2.1.14 release candidate. App/extension **2.1.14**,
-bridge protocol **14** in the checked declarations (`package.json`, `src/main/version.ts`,
+Source alignment: **2026-09-30**. App/extension **2.2.0**,
+bridge protocol **16** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
 ## 1. What the whole app is meant to do
@@ -238,6 +238,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 |Native Desktop|`src/main/cua/{runtime,catalog}.ts`: app-owned embedded CUA child, private endpoint and generation-bound catalog; `mcp/tools-desktop.ts` and `work/cua.ts` own caller/managed-work guards. `desktop-access.ts` owns explicit macOS permission requests. Browser control remains independent.|
 | Direct browser control | `src/main/browser-control.ts`, `mcp/tools-browser.ts`, `src/shared/browser-control.ts`, `extension/browser-control{,-page}.js`: short-lived RPCs, session-owned debugger tabs, bounded DOM/diagnostics and background input. |
 | Delivery/build | `src/main/{update,extension-path,version,logger,durable}.ts`, `electron.vite.config.ts`, `electron-builder.yml`, `scripts/*`, `.github/workflows/*`, `vitest.config.ts`. |
+| CLI-managed work guidance | `bin/wgpt.mjs` preserves explicit app executable overrides and discovers a default only when none is set. `src/cli/index.ts` and `src/shared/{work,work-connection}.ts` define commands, exact IDs and receipts; `.agents/skills/wgpt-cli-web/SKILL.md` documents the workflow, including NDJSON event paging by the last processed `sequence`, not a second control authority. |
 
 ### One durable fact, one authoritative owner
 
@@ -1837,11 +1838,16 @@ scan projects their typed owners (primary-action React key `send`/`stop`, header
 `isTemporaryChat === true`, `animatedIcon: 'sidebar-new-chat'`) onto exactly one current node
 as `data-clf-shell-action`, `data-clf-temporary-chat` (bound to path+search) or
 `data-clf-new-chat` (bound to path). Any ambiguity clears every stamp, and a remounted or
-navigated control stays unknown until the next scan. Any mounted `[data-composer-attachments]`
-tray in the shell form counts as an unsent attachment draft. Shell uploads use the composer form's
+navigated control stays unknown until the next scan. A shown `[data-composer-attachments]`
+tray with any tile in the shell form counts as an unsent attachment draft; the empty tray stays
+mounted, `hidden` and childless (live 2026-09-30). Shell uploads use the composer form's
 single `accept="image/*"` input for images and its single accept-less input for files. MAIN
 projects each tile remove control owner's typed `attachment` as `data-clf-attachment="<status>:<name>"`;
 tile identity uses that requested name, and readiness requires `ready:` for every owned tile.
+The shell composer's trailing controls have no test id: `[data-composer-footer-responsive]`
+holds leading / input / trailing groups, and the companion control anchors in the trailing
+row's last voice/Send sub-group before Send, or at its end while the composer is empty and
+Send is absent (live 2026-09-30).
 The closed snapshot describes only the selected native version's buckets; it is selection
 evidence, never a complete catalog. Discovery elects an idle composer, reads the account-evaluated
 choices once per enabled native version, and restores the original model/effort before publication.

@@ -48,10 +48,15 @@ var CLF_DOM = (() => {
     // @ehkogh/#318 shell: one localized primary action; MAIN stamps its React mode key.
     'form[data-chatgpt-composer] button[type="button"][data-clf-shell-action="stop"]';
   const SEND = 'button[data-testid="send-button"], form button[aria-label^="Send" i], form[data-chatgpt-composer] button[type="submit"]';
-  /** The composer's own trailing controls, where the send and dictation buttons live. */
+  /** The composer's own trailing controls, where the send and dictation buttons live.
+   * Live 2026-09-30 shell: the responsive footer holds leading / input / trailing groups;
+   * the trailing group (model picker, dictation, voice) has no test id or stable label.
+   * Its only child is the row of picker and voice/send sub-groups; the last sub-group is where
+   * Send appears with a draft, so the empty composer anchors our control in that same group. */
   const TRAILING =
     '[data-testid="composer-trailing-actions"], [data-testid="composer-footer-actions"], ' +
-    '[class~="[grid-area:trailing]"]';
+    '[class~="[grid-area:trailing]"], ' +
+    '[data-composer-footer-responsive] > div:last-child:not([data-composer-layout]) > div:only-child > div:last-child';
   const SPEECH =
     'button[data-testid="composer-speech-button"], button[data-testid="composer-dictate-button"], ' +
     'button[aria-label^="Dictate" i], button[aria-label^="Voice" i], ' +
@@ -1534,7 +1539,7 @@ var CLF_DOM = (() => {
       // The current provider microphone has no stable button test id; its sprite and
       // composer trailing parent identify it without interpreting a translated label.
       const anchor = sendButton() || stopButton() || nativeComposerControls(SPEECH)[0] ||
-        [...(composerBox()?.querySelectorAll(`${TRAILING} button`) || [])]
+        [...(composerBox()?.querySelectorAll(TRAILING.split(', ').map(area => `${area} button`).join(', ')) || [])]
         .find(button => !button.closest(OWN_SURFACES) && [...button.querySelectorAll('svg use')].some(use => {
           const href = use.getAttribute('href') || use.getAttribute('xlink:href') || '';
           return href.slice(href.lastIndexOf('#')) === '#microphone-regular-24';
@@ -2075,10 +2080,10 @@ var CLF_DOM = (() => {
   const composerFileReady = button => !button.hasAttribute('data-clf-attachment') || button.getAttribute('data-clf-attachment').startsWith('ready:');
   function hasComposerAttachments() {
     const host = composerBox() || composerActions()?.host;
-    // @ehkogh/#318: the shell mounts its attachment tray only while it holds items, and
-    // its tiles name files by a localized caption. Any mounted tray is a draft.
+    // @ehkogh/#318: the shell's tiles name files by a localized caption, so any tile in its
+    // tray is a draft. Live 2026-09-30: the tray stays mounted, `hidden` and childless, while empty.
     return !!host && (!!host.querySelector('[data-inline-file-uploading], [role="progressbar"]') ||
-      !!(host.matches('form[data-chatgpt-composer]') && host.querySelector('[data-composer-attachments]')) ||
+      !!(host.matches('form[data-chatgpt-composer]') && host.querySelector('[data-composer-attachments]:not([hidden]) > *')) ||
       [...host.querySelectorAll('button[aria-label]')].some(button => composerFileName(button)));
   }
   function composerAttachmentNames() {
