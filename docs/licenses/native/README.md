@@ -12,7 +12,7 @@ Retrieved 2026-09-08. These are unmodified license texts. Including GPLv3 here s
 the text incorporated by LGPLv3; it does not relicense Chat On Steroids as GPL software.
 
 Upstream build/source projects:
-- Cua Driver 0.29.1: https://github.com/trycua/cua/tree/7a8f66ad04e62fccb18cca9965f2964fcaee124e
+- Cua Driver 0.31.0: https://github.com/trycua/cua/tree/5272e492d61b96caf08e3bf434d91126c1f3dccc
 - UBRN Node runtime 0.31.0-3 (MPL-2.0): https://www.npmjs.com/package/uniffi-bindgen-react-native/v/0.31.0-3
 - sharp: https://github.com/lovell/sharp
 - Unix libvips builds: https://github.com/lovell/sharp-libvips

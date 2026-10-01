@@ -25,7 +25,7 @@ const allowed = new Set<string>(CUA_DESKTOP_TOOLS);
 const PATH_FIELDS = new Set(['screenshot_out_file', 'debug_image_out', 'image_path', 'file_path', 'urls', 'additional_arguments', 'webkit_inspector_port']);
 const browserApp = /(?:chrome|chromium|edge|brave|firefox|safari|browser|\bArc\b|opera|vivaldi|chatgpt|web gpt agent)/i;
 const SNAPSHOT_MS = 30_000;
-interface Observation { generation: number; snapshotId: string; pid: number; windowId: number; appName: string; hasImage: boolean; hasTree: boolean; at: number; consumed: boolean }
+interface Observation { generation: number; snapshotId: string | null; captureId: string | null; pid: number; windowId: number; appName: string; hasImage: boolean; hasTree: boolean; at: number; consumed: boolean }
 const observations = new Map<string, Observation>();
 const observationEpochs = new Map<string, symbol>();
 const MAX_OBSERVATIONS = 128;
@@ -104,47 +104,52 @@ function invalidFields(args: Record<string, unknown>): string | null {
   return null;
 }
 
-function targetWindow(args: Record<string, unknown>): { pid: number; windowId: number } | null {
+function targetWindow(args: Record<string, unknown>, observation?: Observation): { pid: number; windowId: number } | null {
   const target = args.target;
   if (target && typeof target === 'object' && !Array.isArray(target) && 'kind' in target && target.kind !== 'window') return null;
   const nested = target && typeof target === 'object' && !Array.isArray(target) ? target : null;
   const pid = args.pid ?? (nested && 'pid' in nested ? nested.pid : undefined);
-  const windowId = args.window_id ?? (nested && 'window_id' in nested ? nested.window_id : undefined);
+  const explicitWindowId = args.window_id ?? (nested && 'window_id' in nested ? nested.window_id : undefined);
+  // A current token carries its exact window; never infer a pixel or focused-input target.
+  const windowId = explicitWindowId ?? (observation?.snapshotId && observation.hasTree && pid === observation.pid &&
+    typeof args.element_token === 'string' && args.element_token.split(':', 1)[0] === observation.snapshotId
+    ? observation.windowId : undefined);
   if (args.scope === 'desktop' || typeof pid !== 'number' || !Number.isSafeInteger(pid) || pid <= 0 ||
       typeof windowId !== 'number' || !Number.isSafeInteger(windowId) || windowId <= 0) return null;
   if (nested && ('pid' in nested && nested.pid !== pid || 'window_id' in nested && nested.window_id !== windowId)) return null;
   return { pid, windowId };
 }
 
-function snapshotRefusal(name: string, args: Record<string, unknown>, observation: Observation | undefined, generation: number): string | null {
+function snapshotRefusal(tool: Tool, args: Record<string, unknown>, observation: Observation | undefined, generation: number): string | null {
+  const name = tool.name;
   // Screen-absolute input and implicit focused-element input can hit a protected browser chat.
-  const target = targetWindow(args);
+  const target = targetWindow(args, observation);
   if (!target) return 'CUA_EXACT_WINDOW_REQUIRED: name an observed pid and window_id; desktop/frontmost input is unavailable.';
   if (!observation || observation.generation !== generation ||
       observation.consumed || Date.now() - observation.at > SNAPSHOT_MS || observation.pid !== target.pid || observation.windowId !== target.windowId)
     return 'CUA_SNAPSHOT_STALE: observe this exact window again before input. No action was dispatched.';
   if (browserApp.test(observation.appName))
     return 'CUA_PROTECTED_BROWSER: native input into browser windows is refused; use the browser tools for tabs.';
-  if (name === 'zoom' && !observation.hasImage)
-    return 'CUA_SCREENSHOT_REQUIRED: zoom coordinates require a screenshot of this exact window. No action was dispatched.';
   if (isCuaSnapshotBoundTool(name)) {
     if (['click', 'double_click', 'right_click', 'type_text'].includes(name) &&
-        !('element_token' in args || 'element_index' in args || 'x' in args && 'y' in args))
+        !('element_token' in args || 'x' in args && 'y' in args))
       return 'CUA_EXACT_ELEMENT_REQUIRED: address an observed element or screenshot pixel in this window. No action was dispatched.';
-    const pixel = 'x' in args || 'y' in args || 'from_x' in args || 'to_x' in args || args.from_zoom === true;
+    const pixel = 'x' in args || 'y' in args || 'from_x' in args || 'from_y' in args ||
+      'to_x' in args || 'to_y' in args || args.from_zoom === true;
     if (pixel && !observation.hasImage)
       return 'CUA_SCREENSHOT_REQUIRED: pixel input requires a screenshot of this exact window. No action was dispatched.';
-    if (('element_token' in args || 'element_index' in args) && !observation.hasTree)
+    if ('element_token' in args && (!observation.snapshotId || !observation.hasTree))
       return 'CUA_TREE_REQUIRED: element input requires an accessibility snapshot of this exact window. No action was dispatched.';
     const token = args.element_token;
-    const snapshotId = args.snapshot_id;
-    if (typeof token === 'string' && token.split(':', 1)[0] !== observation.snapshotId ||
-        snapshotId !== undefined && snapshotId !== observation.snapshotId)
+    if (typeof token === 'string' && token.split(':', 1)[0] !== observation.snapshotId)
       return 'CUA_SNAPSHOT_MISMATCH: the action names a different snapshot. No action was dispatched.';
-    // Upstream permits a window-local pixel call without snapshot_id. Desktop deliberately
-    // narrows that admission: otherwise pixels from another frame can hit this window.
-    if (typeof token !== 'string' && snapshotId !== observation.snapshotId)
-      return 'CUA_SNAPSHOT_REQUIRED: pass snapshot_id from the observed window, or its element_token. No action was dispatched.';
+    if (args.capture_id !== undefined && args.capture_id !== observation.captureId)
+      return 'CUA_CAPTURE_MISMATCH: use the capture_id returned by this exact window observation. No action was dispatched.';
+    if (pixel && 'capture_id' in (tool.inputSchema.properties ?? {}) &&
+        (!observation.captureId || args.capture_id !== observation.captureId))
+      return 'CUA_CAPTURE_REQUIRED: pass capture_id from this exact window observation. No action was dispatched.';
+    // Other pixel/keyboard tools bind to this session's current exact-window read.
+    // Do not invent snapshot_id or capture_id arguments absent from their declarations.
   }
   return null;
 }
@@ -186,7 +191,7 @@ export async function invokeDesktopCua(name: string, value: unknown, parent: Cal
       return refused('CUA_BROWSER_CHORD_DENIED: system, tab, window and app switching chords are unavailable through native input.');
     const observation = observations.get(owner.key);
     if (isCuaMutatingTool(name) && name !== 'clipboard_write' && name !== 'launch_app') {
-      const stale = snapshotRefusal(name, args, observation, catalog.generation);
+      const stale = snapshotRefusal(tool, args, observation, catalog.generation);
       if (stale) return refused(stale);
       observation!.consumed = true; // reserve before async dispatch; ambiguous outcomes cannot replay it
     }
@@ -222,14 +227,18 @@ export async function invokeDesktopCua(name: string, value: unknown, parent: Cal
       if (!result.isError && isCuaObservationTool(name)) {
         const data = result.structuredContent;
         const target = targetWindow(args);
-        if (name === 'get_window_state' && target && data && typeof data.snapshot_id === 'string' &&
+        const snapshotId = typeof data?.snapshot_id === 'string' && data.snapshot_id.trim().length > 0 ? data.snapshot_id : null;
+        const captureId = typeof data?.capture_id === 'string' && data.capture_id.trim().length > 0 ? data.capture_id : null;
+        const hasImage = result.content.some(part => part.type === 'image');
+        if (name === 'get_window_state' && target && data && (snapshotId || captureId && hasImage) &&
             data.pid === target.pid && data.window_id === target.windowId && typeof data.app_name === 'string' && data.app_name.trim().length > 0 &&
             embeddedCuaCatalog()?.generation === catalog.generation && observationEpochs.get(owner.key) === observationEpoch) {
           observations.delete(owner.key);
           observations.set(owner.key, { generation: catalog.generation,
-            snapshotId: data.snapshot_id, pid: target.pid, windowId: target.windowId,
-            appName: data.app_name, hasImage: result.content.some(part => part.type === 'image'),
-            hasTree: args.include_accessibility_tree !== false, at: Date.now(), consumed: false });
+            snapshotId, captureId,
+            pid: target.pid, windowId: target.windowId,
+            appName: data.app_name, hasImage,
+            hasTree: snapshotId !== null && args.include_accessibility_tree !== false, at: Date.now(), consumed: false });
           if (observations.size > MAX_OBSERVATIONS) observations.delete(observations.keys().next().value!);
         }
       }

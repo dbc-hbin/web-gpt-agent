@@ -43,7 +43,6 @@ import {
   managedCallerFor,
   noteCuaObservation,
   noteCuaTransportGeneration,
-  noteCuaVerification,
   CuaBusyError,
   ManagedCallerUnavailable,
   type ManagedWorkerIdentity
@@ -440,8 +439,12 @@ async function runCall(input: z.infer<typeof mcpCallSchema>): Promise<ToolResult
       return refuse(`CUA_LEASE_FAILED: ${(error as Error).message}`);
     }
     if (isCuaSnapshotBoundTool(tool.name)) {
-      const stale = assertCuaSnapshot(identity.workId, installation.id, generation, input.arguments);
+      const captureRequired = ('x' in input.arguments || 'y' in input.arguments) &&
+        'capture_id' in (tool.inputSchema.properties ?? {});
+      const stale = assertCuaSnapshot(identity.workId, installation.id, generation, input.arguments, captureRequired);
       if (stale) return refuse(stale);
+      // Reserve before any async dispatch, including uncertain/error outcomes.
+      consumeCuaObservation(identity.workId, installation.id);
     }
   }
 
@@ -472,7 +475,6 @@ async function runCall(input: z.infer<typeof mcpCallSchema>): Promise<ToolResult
       }
       if (!result.isError) {
         if (isCuaObservationTool(tool.name)) noteCuaObservation(identity.workId, installation.id, generation, tool.name, result);
-        else if (tool.name === 'verify_state') noteCuaVerification(identity.workId, installation.id, generation, input.arguments);
         else if (isCuaMutatingTool(tool.name)) consumeCuaObservation(identity.workId, installation.id);
       }
       // A reconnect mints a new transport, so every token and pixel frame from before it is

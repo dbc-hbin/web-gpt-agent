@@ -509,6 +509,95 @@ it('requires a fresh observation for snapshot-bound actions and invalidates it o
   expect(assertCuaSnapshot(workId, installation, 1, click)).toContain('CUA_SNAPSHOT_REQUIRED');
 });
 
+it('binds immutable captures to one work, generation and target', () => {
+  const workId = randomUUID(), installation = randomUUID(), otherWork = randomUUID();
+  const pixels = { pid: 12, window_id: 7, x: 10, y: 20, capture_id: 'capture-a' };
+  noteCuaObservation(workId, installation, 1, 'get_window_state', {
+    content: [], structuredContent: { snapshot_id: 's1', capture_id: 'capture-a', pid: 12, window_id: 7 }
+  } as ToolResult);
+  expect(assertCuaSnapshot(otherWork, installation, 1, pixels, true)).toContain('CUA_SNAPSHOT_REQUIRED');
+  expect(assertCuaSnapshot(workId, installation, 2, pixels, true)).toContain('CUA_SNAPSHOT_STALE');
+  expect(assertCuaSnapshot(workId, installation, 1, { ...pixels, window_id: 8 }, true)).toContain('CUA_SNAPSHOT_MISMATCH');
+  expect(assertCuaSnapshot(workId, installation, 1, { ...pixels, capture_id: 'foreign' }, true)).toContain('CUA_CAPTURE_MISMATCH');
+  expect(assertCuaSnapshot(workId, installation, 1, { pid: 12, window_id: 7, x: 10, y: 20 }, true)).toContain('CUA_CAPTURE_REQUIRED');
+  expect(assertCuaSnapshot(workId, installation, 1, pixels, true)).toBeNull();
+  consumeCuaObservation(workId, installation);
+  expect(assertCuaSnapshot(workId, installation, 1, pixels, true)).toContain('CUA_SNAPSHOT_STALE');
+});
+
+it('reads work-owned cursor state without granting or spending action authority, and reserves uncertain input', async () => {
+  supportedDesktopHost();
+  const config = getConfig();
+  await saveConfig({ ...config, capabilities: { ...config.capabilities, screen: true, control: true } });
+  const cursor: Tool = { name: 'get_agent_cursor_state', inputSchema: { type: 'object',
+    properties: { session: { type: 'string' } }, required: ['session'], additionalProperties: false } };
+  const targetProperties = { pid: { type: 'integer' }, window_id: { type: 'integer' }, session: { type: 'string' } };
+  const tools = projectCuaCatalog([cursor,
+    { name: 'get_window_state', inputSchema: { type: 'object', properties: targetProperties, additionalProperties: false } },
+    { name: 'verify_state', inputSchema: { type: 'object', properties: targetProperties, additionalProperties: false } },
+    { name: 'click', inputSchema: { type: 'object', properties: { ...targetProperties, element_token: { type: 'string' },
+      capture_id: { type: 'string' }, x: { type: 'number' }, y: { type: 'number' } }, additionalProperties: false } }
+  ] as Tool[]);
+  vi.spyOn(nativeRuntime, 'embeddedCuaCatalog').mockReturnValue({ generation: 4, tools });
+  const cursors = new Map<string, { x: number; y: number }>();
+  let ownerSession: string | null = null;
+  const invoke = vi.spyOn(nativeRuntime, 'invokeEmbeddedCua').mockImplementation(async (name, args) => {
+    if (typeof args.session !== 'string') throw new Error('Native session is required');
+    if (name === 'get_agent_cursor_state') {
+      if (!nativeRuntime.validateEmbeddedCuaArguments(cursor, args).ok) throw new Error('Driver session schema rejected call');
+      return { content: [], structuredContent: { position: cursors.get(args.session) ?? null } };
+    }
+    if (name === 'get_window_state') {
+      ownerSession = args.session;
+      return { content: [], structuredContent: { snapshot_id: 's12', capture_id: 'capture-12', pid: args.pid, window_id: args.window_id } };
+    }
+    if (name === 'click') cursors.set(args.session, { x: 100, y: 200 });
+    return { content: [], structuredContent: { effect: 'confirmed' } };
+  });
+  const holder = managedIdentity({ workId: randomUUID() }), other = managedIdentity({ workId: randomUUID() });
+  setManagedCallerResolver(() => holder);
+  const { call } = coreInvoker();
+  const hashes = new Map<string, string>();
+  for (const tool of tools) {
+    const result = JSON.parse(firstText(await call('mcp_tools', { server_id: CUA_SERVER_ID, tool: tool.name }))) as { schema_hash: string };
+    hashes.set(tool.name, result.schema_hash);
+  }
+  const target = { pid: 42, window_id: 7 };
+  const entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  try {
+    await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_window_state', arguments: target, schema_hash: hashes.get('get_window_state') });
+    expect((await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: {}, schema_hash: hashes.get('get_agent_cursor_state') })).structuredContent?.position).toBeNull();
+    // A verification of another target must not retarget an already-issued token.
+    await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'verify_state', arguments: { pid: 99, window_id: 8 }, schema_hash: hashes.get('verify_state') });
+    const action = { pid: 42, element_token: 's12:4' };
+    expect((await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: action, schema_hash: hashes.get('click') })).structuredContent?.effect).toBe('confirmed');
+    expect((await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: {}, schema_hash: hashes.get('get_agent_cursor_state') })).structuredContent?.position).toEqual({ x: 100, y: 200 });
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: action, schema_hash: hashes.get('click') }))).toContain('CUA_SNAPSHOT_STALE');
+    await releaseGuiLease(holder.workId);
+    setManagedCallerResolver(() => other);
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: { session: ownerSession }, schema_hash: hashes.get('get_agent_cursor_state') }))).toContain('CUA_SESSION_OWNED');
+    expect((await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: {}, schema_hash: hashes.get('get_agent_cursor_state') })).structuredContent?.position).toBeNull();
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: action, schema_hash: hashes.get('click') }))).toContain('CUA_SNAPSHOT_REQUIRED');
+    await releaseGuiLease(other.workId);
+    setManagedCallerResolver(() => holder);
+    await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_window_state', arguments: target, schema_hash: hashes.get('get_window_state') });
+    const pixels = { ...target, x: 10, y: 20, capture_id: 'capture-12' };
+    for (const removed of [{ snapshot_id: 's12' }, { element_index: 4 }])
+      expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: { ...pixels, ...removed }, schema_hash: hashes.get('click') }))).toContain('MCP_INVALID_ARGUMENTS');
+    invoke.mockImplementationOnce(async () => { entered.resolve(); await release.promise; throw new Error('lost after dispatch'); });
+    const pending = call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: pixels, schema_hash: hashes.get('click') });
+    await entered.promise;
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: pixels, schema_hash: hashes.get('click') }))).toContain('CUA_SNAPSHOT_STALE');
+    release.resolve();
+    expect(externalCallOutcome(await pending)).toBe('outcome_unknown');
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: pixels, schema_hash: hashes.get('click') }))).toContain('CUA_SNAPSHOT_STALE');
+    await saveConfig({ ...getConfig(), readOnly: true });
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: {}, schema_hash: hashes.get('get_agent_cursor_state') }))).toContain('TOOL_DISABLED');
+    await saveConfig({ ...config, capabilities: { ...config.capabilities, screen: false } });
+    expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_agent_cursor_state', arguments: {}, schema_hash: hashes.get('get_agent_cursor_state') }))).toContain('TOOL_DISABLED');
+  } finally { release.resolve(); await releaseGuiLease(holder.workId); await releaseGuiLease(other.workId); await saveConfig(config); }
+});
+
 it('routes the host-native Core server without an installed plugin and protects managed callers', async () => {
   supportedDesktopHost();
   const config = getConfig();
@@ -516,7 +605,7 @@ it('routes the host-native Core server without an installed plugin and protects 
   const tools = projectCuaCatalog([
     { name: 'list_windows', inputSchema: { type: 'object', properties: {}, additionalProperties: false } },
     { name: 'get_window_state', inputSchema: { type: 'object', properties: { pid: { type: 'integer' }, window_id: { type: 'integer' }, session: { type: 'string' } }, additionalProperties: false } },
-    { name: 'click', inputSchema: { type: 'object', properties: { pid: { type: 'integer' }, window_id: { type: 'integer' }, snapshot_id: { type: 'string' }, session: { type: 'string' } }, additionalProperties: false } },
+    { name: 'click', inputSchema: { type: 'object', properties: { pid: { type: 'integer' }, window_id: { type: 'integer' }, element_token: { type: 'string' }, session: { type: 'string' } }, additionalProperties: false } },
     { name: 'check_permissions', inputSchema: { type: 'object', properties: { prompt: { type: 'boolean' } }, additionalProperties: false } },
     { name: 'set_config', inputSchema: { type: 'object' } }
   ] as Tool[]);
@@ -549,7 +638,7 @@ it('routes the host-native Core server without an installed plugin and protects 
   expect(observed.isError).not.toBe(true);
   expect(invoke.mock.calls[0]?.[1].session).toMatch(/^wga-[a-f0-9]{24}$/);
   const clickSchema = JSON.parse(firstText(await call('mcp_tools', { server_id: CUA_SERVER_ID, tool: 'click' }))) as { schema_hash: string };
-  expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: { pid: 42, window_id: 7, snapshot_id: 's12', session: 'forged' }, schema_hash: clickSchema.schema_hash }))).toContain('CUA_SESSION_OWNED');
+  expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'click', arguments: { pid: 42, window_id: 7, element_token: 's12:4', session: 'forged' }, schema_hash: clickSchema.schema_hash }))).toContain('CUA_SESSION_OWNED');
   const challenger = managedIdentity({ workId: randomUUID() });
   setManagedCallerResolver(() => challenger);
   expect(firstText(await call('mcp_call', { server_id: CUA_SERVER_ID, tool: 'get_window_state', arguments: { pid: 42, window_id: 7 }, schema_hash: windowSchema.schema_hash }))).toContain('CUA_BUSY');

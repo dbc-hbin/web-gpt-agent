@@ -5,7 +5,7 @@ import { desktopAutomationSupported } from '../platform.js';
 export const CUA_SERVER_ID = 'cua-driver';
 export const CUA_ALLOWED_TOOLS = [
   'list_apps', 'list_windows', 'get_window_state', 'get_accessibility_tree',
-  'get_screen_size', 'get_desktop_state', 'get_cursor_position', 'zoom',
+  'get_screen_size', 'get_desktop_state', 'get_cursor_position', 'get_agent_cursor_state', 'zoom',
   'check_permissions', 'verify_state', 'launch_app', 'set_window_frame',
   'invoke_menu', 'click', 'double_click', 'right_click', 'drag', 'type_text',
   'press_key', 'hotkey', 'set_value', 'scroll', 'clipboard_read', 'clipboard_write'
@@ -13,7 +13,7 @@ export const CUA_ALLOWED_TOOLS = [
 export const CUA_DESKTOP_TOOLS = CUA_ALLOWED_TOOLS.filter(name => name !== 'zoom' && name !== 'invoke_menu');
 export const CUA_READ_ONLY_TOOLS: readonly string[] = [
   'list_apps', 'list_windows', 'get_window_state', 'get_accessibility_tree',
-  'get_screen_size', 'get_desktop_state', 'get_cursor_position', 'zoom',
+  'get_screen_size', 'get_desktop_state', 'get_cursor_position', 'get_agent_cursor_state', 'zoom',
   'check_permissions', 'verify_state', 'clipboard_read'
 ];
 export const CUA_OBSERVATION_TOOLS: readonly string[] = ['get_window_state', 'get_accessibility_tree', 'get_desktop_state'];
@@ -42,14 +42,24 @@ export function cuaCapabilityEnabled(name: string): boolean {
 export const cuaReservedRoutingField = (args: Record<string, unknown>): string | null =>
   RESERVED_ROUTING_FIELDS.find(field => field in args) ?? null;
 
-/** Preserve upstream schemas and their $refs; only narrow the prompt-capable permission check. */
+/** Preserve upstream schemas/$refs while projecting host-owned permission and cursor routing. */
 export function projectCuaCatalog(tools: readonly Tool[]): Tool[] {
   const byName = new Map(tools.map(tool => [tool.name, tool]));
   return CUA_ALLOWED_TOOLS.flatMap(name => {
     const tool = byName.get(name);
     if (!tool) return [];
-    if (name !== 'check_permissions') return [tool];
     const properties = tool.inputSchema.properties;
+    if (name === 'get_agent_cursor_state' && properties && 'session' in properties) {
+      const session = properties.session;
+      return [{ ...tool, inputSchema: { ...tool.inputSchema,
+        ...(tool.inputSchema.required ? { required: tool.inputSchema.required.filter(field => field !== 'session') } : {}),
+        properties: { ...properties, session: {
+          ...(session && typeof session === 'object' ? session : {}),
+          description: 'Host-owned session: omit this field. Desktop binds the exact calling chat; Core binds the managed prime work.'
+        } }
+      } }];
+    }
+    if (name !== 'check_permissions') return [tool];
     if (!properties || !('prompt' in properties)) return [tool];
     return [{ ...tool, inputSchema: { ...tool.inputSchema, properties: {
       ...properties, prompt: { type: 'boolean', const: false, default: false,

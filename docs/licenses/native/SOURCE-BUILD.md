@@ -10,11 +10,11 @@ as an inclusive set; use the current build revisions below and each target's ver
 ## Cua Driver
 
 macOS and Windows releases embed only the Cua Driver CLI from the matching
-0.29.1 standalone binary archive, plus the 0.29.1 Node SDK/native package.
+0.31.0 standalone binary archive, plus the 0.31.0 Node SDK/native package.
 The app's Linux release keeps native Desktop disabled and omits the executable
 and native SDK library. The pinned source is
-`cua-driver-source-0.29.1.tar.gz` (trycua/cua commit
-`7a8f66ad04e62fccb18cca9965f2964fcaee124e`); validate its SHA-256 in
+`cua-driver-source-0.31.0.tar.gz` (trycua/cua commit
+`5272e492d61b96caf08e3bf434d91126c1f3dccc`); validate its SHA-256 in
 `sources.json`. The actual Cargo workspace, lockfile, TypeScript generated
 bindings, and modified UBRN Node runtime recipe are under `libs/cua-driver/`.
 Release CI builds the CLI and SDK with `cargo build --locked -p cua-driver -p

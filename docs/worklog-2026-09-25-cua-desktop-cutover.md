@@ -1,5 +1,102 @@
 # Cua Driver Desktop cutover, 2026-09-25
 
+## 0.31.0 engine and cursor update, 2026-10-01
+
+Upgraded the SDK, all six executable target pins and corresponding source/license
+inventory together to 0.31.0 (`5272e492d61b96caf08e3bf434d91126c1f3dccc`).
+Downloaded and hashed the release archives, then checked each target's extracted
+architecture/provenance. Linux retains browser-only native policy. Current Setup,
+Plugins, tool documentation and the ownership map describe the new engine; the
+older release notes and dated evidence below remain historical.
+
+Desktop and managed Core now enforce token-only element actions. Pixel click names
+the observed immutable capture; native tools without that field use their same
+host-owned session's current exact-window observation. Input reserves observation
+authority before dispatch, including uncertain outcomes. Verification cannot retarget
+another window's tokens. The new screen-read `get_agent_cursor_state({})` exposes only
+the host-owned chat/work cursor, does not consume the current input observation and
+rejects caller session routing. Administrative cursor tools remain excluded.
+
+An isolated signed macOS arm64 package passed bundle checks (nine launch modes,
+25 thin Mach-O payloads) and native-stack/Node-daemon smoke checks with CUA 0.31.0.
+An isolated Electron Node-mode harness used the production runtime and Desktop
+wrapper against that packaged SDK/child, not the installed app or external daemon.
+It proved host identity and granted Screen Recording/Accessibility, captured a
+controlled 780×464 AppKit window, typed text, clicked by token and by capture-bound
+pixels, and independently observed exactly two button increments. A repeated stale
+input and a foreign cursor session were refused. A cursor-state read between
+observation and input preserved the input authority. The foreground app and user's
+native mouse position stayed unchanged. Desktop capture reported overlay exclusion
+through `screencapturekit_excluding_windows`. The harness recorded no user screenshot.
+The fixture's initial showing animation produced a correctly refused frame-size
+mismatch; disabling animation and publishing fixture readiness after layout fixed
+only the fixture, without relaxing engine capture validation.
+
+Native Windows execution is unverified: this host is macOS and has no configured
+remote test host. Both Windows targets were integrity/architecture checked only.
+No installed app, running user driver, provider chat or runtime ledger was replaced.
+
+Verification: privacy, notices (168 production packages, seven catalog entries),
+732 native-source archives/patches and TypeScript passed. The full main suite
+completed with 212 passing files, three skipped and one failure in an obsolete
+copied tool-name list. Removed that list rather than repinning it; the existing
+test now checks retained keyboard focus across host-state pushes. All 43 renderer
+tests then passed. The six isolated shutdown tests passed separately. The focused
+native Desktop/managed-gateway/recording run passed 32 tests. An earlier TypeScript
+run caught a possibly undefined test-array access, fixed before the passing check.
+Production main/preload/renderer, CLI and daemon builds passed; final isolated
+packaging sealed with the existing local signing identity and verified its envelope.
+
+Perception assessment: the optional 0.2.1 release is separate from MIT Driver 0.31.0.
+Its MIT worker and ONNX runtime carry AGPL-3.0-only OmniParser detector weights and
+exporter material, plus Apache-2.0 OCR. Selecting only text regions still runs the
+detector and does not remove those obligations. Actual published macOS arm64 and
+Windows x64 manifests match their catalog hashes; archive inventories indicate
+426/421 MB downloads and approximately 450/429 MiB expanded payloads respectively.
+There is no published macOS x64 or Windows arm64 artifact. No extension was installed
+or executed, and this review did not independently hash full compressed archives
+or verify catalog signatures through the local Driver.
+
+Parsing is local, capture/session/generation-bound and non-consuming. A future
+opt-in route would need explicit host-owned installation, signed artifact verification,
+mixed-license notices/source handling, bounded region/text output, and real containment
+and inference checks. Its separate sandboxed process does not establish licensing
+clearance. The current application deliberately does not expose parsing, model-controlled
+installation or cursor administration.
+The user explicitly chose to exclude Perception from this integration after reviewing
+its role and footprint. Its three inference models total about 93.6 MB (80,933,219-byte
+icon detector, 4,826,518-byte OCR detector and 7,848,423-byte English recognizer); the
+larger distribution includes original weights, conversion sources and runtime material.
+No optional installation feature or parser exposure is part of this change.
+
+### Screenshot-only Windows admission correction
+
+Review found that the native Windows screenshot-only response omits `snapshot_id`,
+although it returns a screenshot and `capture_id`. This predates 0.31.0. Desktop now
+keeps nullable snapshot identity and admits either real snapshot authority or a
+delivered image with its capture identity. Capture-based observation grants no token
+authority. It retains exact caller/window/binding/runtime generation, expiry, replacement
+and single-use checks; the native engine and schema remain unchanged.
+
+The positive regression failed before the fix. A separate isolated signed macOS
+runtime smoke used the production wrapper and real screenshot/input transport, removing
+only the screenshot-only result's `snapshot_id` to reproduce the Windows response shape.
+The fixed wrapper delivered one real background pixel click; independent AppKit state
+and a fresh native observation both showed exactly one button increment. Old element
+tokens and repeated input were refused, and foreground/user mouse position were
+unchanged. The harness initially used `width`/`height` for a native rectangle whose
+actual fields are `w`/`h`; correcting only that fixture enabled this successful check.
+This proves the app's capture-only path with real macOS transport, not Windows native
+execution. No installed application or user data was replaced.
+The focused Desktop/recording/Core run passed 178 tests (seven skipped), and the
+final Desktop regression run passed 25. Negative cases cover absent/blank snapshot
+and capture IDs, missing image or app identity, wrong chat/window/capture, token
+misuse, replacement-read ordering and changed runtime generation. The permanent
+image fixture is a valid 64×64 PNG with the tested coordinates inside its bounds.
+Final `npm run verify` passed: privacy/notices/native-source checks, TypeScript,
+213 main-suite files with 5,922 passing tests (84 skipped), and six isolated shutdown
+tests. `npm run build` then passed for main, preload, renderer, CLI and daemon.
+
 ## Embedded-engine correction
 
 The user rejected the external-driver ownership below: the app must bundle and own its

@@ -5,22 +5,22 @@ export { SUPPORTED_ARCHES, SUPPORTED_PLATFORMS };
 // The npm SDK and executable are built from the same Cua Driver Rust release.
 // Standalone binary archives contain no installed CuaDriver.app or daemon service.
 export const CUA_DRIVER = Object.freeze({
-  version: '0.29.1',
-  sourceCommit: '7a8f66ad04e62fccb18cca9965f2964fcaee124e',
-  sourceSha256: '12d53edb0df963057a5581f40051ca96cbbe75d0b73898cd8d2c1653837da735',
+  version: '0.31.0',
+  sourceCommit: '5272e492d61b96caf08e3bf434d91126c1f3dccc',
+  sourceSha256: '8134337f2beb1854918d8bbc5aea22d7ae00de9838ce6426f275d7ba6734d191',
   licenseSha256: 'c0779290c1d4783169aa3dbfb55feb505e563ef8a004bbf55298ceffcfbda8d9',
   targets: Object.freeze({
     darwin: Object.freeze({
-      x64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-darwin-universal-binary.tar.gz', sha256: 'ba47526554ea832b4a77566ee946ef3fac1c51bb5e8a0d3f0c150e1377740bc7', thinArch: 'x86_64', executableSha256: '53aab0dd43029b2b6dcd9219bf021c17c785322566d84cdbbe7cab20ed5fa6b5' }),
-      arm64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-darwin-universal-binary.tar.gz', sha256: 'ba47526554ea832b4a77566ee946ef3fac1c51bb5e8a0d3f0c150e1377740bc7', thinArch: 'arm64', executableSha256: '7a3d4270b2a5ea080a65f34fd6fe137ccc8a3546500506bd955d54ed28f5eb8c' })
+      x64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-darwin-universal-binary.tar.gz', sha256: '06cd80b153bdf046dc067fb593e0fc648e780afa37a902ca0515ac25f32f9a4f', thinArch: 'x86_64', executableSha256: '346419a7c26ceb6c11a6091accd7d2fa8456f47de7af4a39aae0f6a16852d276' }),
+      arm64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-darwin-universal-binary.tar.gz', sha256: '06cd80b153bdf046dc067fb593e0fc648e780afa37a902ca0515ac25f32f9a4f', thinArch: 'arm64', executableSha256: '448f32c2925ad6f327a547584c5c20bedc6f59edf78ccea44d81dda6afe16b7c' })
     }),
     linux: Object.freeze({
-      x64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-linux-x86_64-binary.tar.gz', sha256: 'cf3acd8d7b6ce44917374463758ab6eae0c1e5295592a968fd496c7c8b3d36f1' }),
-      arm64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-linux-arm64-binary.tar.gz', sha256: '92ddc1bf01a68be543445d8cdd0df9900f0a0a43a17d251bf581a7c26cd5168b' })
+      x64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-linux-x86_64-binary.tar.gz', sha256: '59d7d027ad0f24410e88e0cf239a04f8e724de400b5c418fab259f3b5c285ff1' }),
+      arm64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-linux-arm64-binary.tar.gz', sha256: 'a960ffe07869846dde1e2a193c7c3236d530f31631b035c637b7dd701dd6dc6f' })
     }),
     win32: Object.freeze({
-      x64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-windows-x86_64-binary.zip', sha256: '4b5ace1d784b3e4b0d41360408600eac2fa8f008931e07dca200b58e477621ac' }),
-      arm64: Object.freeze({ archive: 'cua-driver-rs-0.29.1-windows-arm64-binary.zip', sha256: '6427e148d5ff322381124945b1870c134c025af219df0054c0027dc58b92569d' })
+      x64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-windows-x86_64-binary.zip', sha256: '461c7d4acd12685ab777fa4a3800e25f75d2f06e8a67ab7a1778701eb25e6728' }),
+      arm64: Object.freeze({ archive: 'cua-driver-rs-0.31.0-windows-arm64-binary.zip', sha256: 'a65898dfaee3fe7f78671ed2db0b7dc06a3c297ab856a8b70bf7a8c69bf59b95' })
     })
   })
 });

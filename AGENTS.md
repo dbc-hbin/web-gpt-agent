@@ -3059,7 +3059,7 @@ and MCP connection have separate lifecycles.
 Desktop's public MCP tools remain `exec`, `wait` and `tools_search`. Browser-tab
 control is an independent Desktop backend (`mcp/tools-browser.ts` and
 `src/main/browser-control.ts`). Native desktop inspection, input and clipboard are the
-bundled CUA Driver 0.29.1's own tool names and upstream schemas. `cua/runtime.ts` owns
+bundled CUA Driver 0.31.0's own tool names and upstream schemas. `cua/runtime.ts` owns
 the embedded child, private endpoint, upstream MCP transport and generation-bound catalog.
 Electron backend startup/shutdown owns this runtime; PATH, an external CuaDriver.app and
 its default socket are never alternatives. Core retains its managed `mcp_tools` / `mcp_call`
@@ -3096,6 +3096,29 @@ process. Browser tools keep their own tab ownership and permission rules. Linux 
 browser control but masks native clipboard permissions; the plain Node daemon does not
 claim Electron Desktop privileges. Test native routing via the isolated CUA transport and
 MCP suites, never by launching the user's running driver or GUI during source checks.
+
+Native element input uses `element_token`; action arguments `element_index` and `snapshot_id`
+are retired. Tokens retain their exact observed window; explicit targets must agree. Pixel
+`click` requires that observation's `capture_id`, while pixel/keyboard tools without that
+schema field use the same host-owned session's current exact-window read. Observation
+generation, freshness and single-use reservation remain host guards; a new read invalidates
+old input references, and `verify_state` cannot retarget them. An invalid or missing screenshot
+does not authorize pixels. Desktop capture's `agent_overlay_capture` reports exclusion or
+its limitation rather than claiming every image is free of the driver's cursor.
+Screenshot-only window results can establish pixel authority from a delivered image and
+nonempty `capture_id` without `snapshot_id`, including the Windows native result shape.
+The same caller/window/epoch, freshness and single-use guards apply. Element tokens still
+require a snapshot and tree; image-only, capture-only or metadata-only results grant no
+capture-based authority. A failed replacement observation still retires the old references.
+`get_agent_cursor_state({})` is a screen-permission read of the exact Desktop chat's agent
+cursor (Core uses its own managed-work session). Catalog projection makes the driver's
+required `session` optional with host-owned guidance; caller-supplied routing stays refused
+and the host injects its proved owner. The getter does not consume or replace observation
+authority and remains available in Desktop Read-only mode. Cursor settings and session
+administration are not exposed.
+The optional Perception extension remains unbundled and unexposed; the Driver upgrade
+does not install weights. Its mixed-license payload and platform availability require
+a separate distribution decision, not another allowlist entry alone.
 
 ## 19. Debugging, tests and working here
 

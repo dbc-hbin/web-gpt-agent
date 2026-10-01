@@ -769,7 +769,7 @@ const CAPABILITY_TOOLS: Record<Capability, readonly string[]> = {
 // not discovery: only tools advertised by the connected driver are actually registered.
 const CUA_SCREEN_TOOLS = [
   'list_apps', 'list_windows', 'get_window_state', 'get_accessibility_tree',
-  'get_screen_size', 'get_desktop_state', 'get_cursor_position',
+  'get_screen_size', 'get_desktop_state', 'get_cursor_position', 'get_agent_cursor_state',
   'check_permissions', 'verify_state'
 ];
 const CUA_CONTROL_TOOLS = [

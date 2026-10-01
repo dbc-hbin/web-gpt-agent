@@ -19,7 +19,7 @@ This fork has no updater and no published installer. Build it yourself; see [Bui
 
 **Separate installations:** the folder opened by the app is generated for its installation identity, including in development. Each `--data-dir` instance needs its matching extension folder and a separate browser profile. A companion with another installation’s saved credentials refuses to reconnect rather than transferring observations. Loading the raw repository `extension/` directly is an unbound manual installation, not a multi-instance isolation setup.
 
-Want screen and keyboard control? Enable **Desktop** permissions and connect its separate **`Web GPT Agent Desktop`** app, which needs its own tunnel. CUA Driver 0.29.1 is bundled and started as an app-owned embedded runtime; do not install a separate driver or configure a socket. On macOS, grant Screen Recording and Accessibility to **Web GPT Agent** using Workspace's permission controls, then recheck to restart the embedded runtime. Browser-tab control remains separate. Core works without Desktop.
+Want screen and keyboard control? Enable **Desktop** permissions and connect its separate **`Web GPT Agent Desktop`** app, which needs its own tunnel. CUA Driver 0.31.0 is bundled and started as an app-owned embedded runtime; do not install a separate driver or configure a socket. On macOS, grant Screen Recording and Accessibility to **Web GPT Agent** using Workspace's permission controls, then recheck to restart the embedded runtime. Browser-tab control remains separate. Core works without Desktop.
 
 **After replacing the app bundle:** reload the companion extension and refresh the connector in ChatGPT. These are two separate steps.
 

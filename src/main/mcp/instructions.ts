@@ -136,7 +136,7 @@ function desktopSurfaceInstructions(_ctx: ToolContext, _platform: NodeJS.Platfor
   return [
     browserInstructions(),
     'Native tools use this app’s bundled CUA Driver. Discover its exact input schemas with tools_search, then call tools[name]({ ...nativeArgs }) inside exec. No plugin installation or separate driver daemon is required.',
-    'Observe the exact pid and window_id with get_window_state before each native input; pass its snapshot_id or element_token and the same target. Native input is background-only, never automatically fronts an app or moves the cursor. Verify the effect from a fresh observation; a failed upstream call may have acted and must not be replayed.',
+    'Observe the exact pid and window_id with get_window_state before each native input. Use its element_token for an element, or current screenshot coordinates for that exact window; pixel click also requires its capture_id. Do not pass element_index or snapshot_id as action arguments. A new observation retires old element tokens. Native input is background-only, never automatically fronts an app or moves the user cursor. Verify the effect from a fresh observation; a failed upstream call may have acted and must not be replayed.',
     'Native input into browser windows is refused. Use browser tools for browser tabs and protected chats. Driver session routing belongs to the host; do not pass session or output file paths.',
     'Files, patches and commands use the separate Core connector.',
     CODE_MODE_INSTRUCTIONS, ...userInstructions()

@@ -552,7 +552,7 @@ are enabled.
 ## Desktop tools
 
 Desktop retains public `exec`, `wait` and `tools_search` and the independent browser tools
-listed below. Native desktop tools come from bundled **CUA Driver 0.29.1**, replacing the
+listed below. Native desktop tools come from bundled **CUA Driver 0.31.0**, replacing the
 former custom macOS addon, Swift helper and Windows PowerShell/Window2 facades. There is no
 `sky`, `observe` or `computer` fallback. The Electron backend owns runtime startup/shutdown;
 no external driver installation or socket is used. On macOS grant Web GPT Agent Screen
@@ -570,10 +570,10 @@ page JavaScript. These tools do not route through Cua Driver.
 ### Native Cua Driver tools
 
 `tools_search` shows only the driver tools actually advertised by the embedded runtime and
-allowed by the host. Their input schemas are the driver’s upstream schemas, not a local
-translated action format. The reviewed native names include `list_apps`, `list_windows`,
+allowed by the host. Their input schemas follow the driver rather than a local translated
+action format, with host-owned permission/session fields narrowed below. The reviewed native names include `list_apps`, `list_windows`,
 `get_window_state`, `get_accessibility_tree`, `get_screen_size`, `get_desktop_state`,
-`get_cursor_position`, `check_permissions`, `verify_state`, `launch_app`,
+`get_cursor_position`, `get_agent_cursor_state`, `check_permissions`, `verify_state`, `launch_app`,
 `set_window_frame`, `click`, `double_click`, `right_click`, `drag`,
 `type_text`, `press_key`, `hotkey`, `set_value`, `scroll`, `clipboard_read` and
 `clipboard_write`. Unsupported or undiscovered tools are absent; there is no synthetic
@@ -583,11 +583,34 @@ Desktop omits `invoke_menu`: the driver brings its target to the foreground. It 
 Both remain in Core's separate managed gateway; Desktop does not borrow that gateway's
 implicit transport session or weaken its per-chat snapshot fence.
 
+`get_agent_cursor_state({})` reads only the current chat's agent cursor, not the user's mouse
+position. The host supplies its exact session; the upstream required `session` field is
+advertised as optional with host-owned guidance, and caller-supplied values remain refused.
+Core's managed gateway supplies its separately owned work session. This is a screen-permission
+read available in Desktop Read-only mode; it does not consume or replace an input observation.
+Cursor configuration, theming and session administration remain unavailable.
+The optional mixed-license Perception extension is not bundled or exposed. Upgrading
+the MIT driver does not install its detector/OCR models or grant extension administration.
+
 Every native call uses the exact caller’s identity and current screen/control/clipboard
 permissions. Read-only mode can retain observations and clipboard reads while preventing
 state-changing input and clipboard writes. Snapshot-bound input must use an observation
 belonging to that caller; one work cannot spend another work’s desktop state. Driver replies
 retain the MCP envelope and are bounded before reaching code mode.
+Element actions use the current observation's `element_token`, not `element_index` or
+`snapshot_id` arguments. A token can supply its observed window identity; an explicit target
+must still agree. Pixel `click` also names that observation's immutable `capture_id`.
+Screenshot-only window observations may omit `snapshot_id`: a delivered image plus its
+nonempty `capture_id` establishes pixel authority for the same exact owner and window.
+It grants no element-token authority; token input still needs a snapshot and tree.
+An image without a capture, or a capture without an image, cannot establish this path.
+Other pixel and keyboard actions use the same host-owned session's fresh exact-window observation,
+without adding fields absent from the driver's schema. Input reserves its observation before
+dispatch, including uncertain outcomes; another input requires a new observation.
+New reads retire previous action references. `verify_state` neither refreshes nor retargets
+an existing observation's input authority. Missing/invalid screenshot evidence permits no
+pixel action. Desktop captures report whether the driver's overlay was excluded through
+`agent_overlay_capture`; an unavailable exclusion is reported, not silently claimed.
 Desktop launch uses `name` or `bundle_id`; Windows `path`, `launch_path` and `aumid`
 selectors are refused because they can supersede the checked name or carry arguments.
 Revoked read results are withheld, not delivered with a warning. A mutation whose authority

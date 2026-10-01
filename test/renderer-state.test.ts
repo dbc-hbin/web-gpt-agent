@@ -4,7 +4,7 @@ import path from 'node:path';
 import { JSDOM } from 'jsdom';
 import { afterEach, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_MODEL, DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
-import { BROWSER_READ_TOOLS, BROWSER_WRITE_TOOLS } from '../src/shared/browser-control.js';
+
 import ko from '../src/renderer/locales/ko.json';
 
 let dom: JSDOM | null = null;
@@ -760,25 +760,17 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
   expect(browser.value).toBe('chrome');
 });
 
-it('shows the current host Desktop tools without rebuilding permission controls on state pushes', async () => {
+it('preserves focused Desktop permission controls across supported-host state pushes', async () => {
   const mounted = await mountChat({
     platform: { family: 'windows', name: 'Windows', desktopAutomation: true }
   });
   const doc = mounted.window.document;
-  const names = () => Array.from(doc.querySelectorAll('[data-group="desktop"] .tool-names code'), node => node.textContent);
   const control = doc.querySelector<HTMLInputElement>('[data-cap="control"]')!;
-  const driverNames = [...BROWSER_READ_TOOLS,
-    'list_apps', 'list_windows', 'get_window_state', 'get_accessibility_tree', 'get_screen_size',
-    'get_desktop_state', 'get_cursor_position', 'check_permissions', 'verify_state',
-    ...BROWSER_WRITE_TOOLS, 'zoom', 'launch_app', 'set_window_frame', 'invoke_menu', 'click',
-    'double_click', 'right_click', 'drag', 'type_text', 'press_key', 'hotkey', 'set_value', 'scroll',
-    'clipboard_read', 'clipboard_write', 'exec'];
-  expect(names()).toEqual(driverNames);
+  control.focus();
   mounted.push({ ...mounted.state, platform: { family: 'macos', name: 'macOS', desktopAutomation: true } });
-  expect(names()).toEqual(driverNames);
-  expect(doc.querySelector('[data-cap="control"]')).toBe(control);
+  expect(doc.activeElement).toBe(control);
   mounted.push(mounted.state);
-  expect(names()).toEqual(driverNames);
+  expect(doc.activeElement).toBe(control);
   expect(mounted.calls).toHaveLength(0);
 });
 

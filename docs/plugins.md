@@ -54,7 +54,7 @@ is a third-party integration, not an official Blender feature supplied by Web GP
 ## Embedded CUA native desktop engine
 
 Native desktop control is app infrastructure, not a Plugins installation. The Electron
-backend starts bundled **CUA Driver 0.29.1** as its own child with a private endpoint and
+backend starts bundled **CUA Driver 0.31.0** as its own child with a private endpoint and
 stops it during backend shutdown. It never searches PATH, a CuaDriver.app installation or
 the external driver's default socket. The former Cua Driver preset is removed.
 

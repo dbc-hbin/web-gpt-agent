@@ -151,6 +151,8 @@ export interface CuaObservation {
   generation: number;
   /** Driver snapshot id, when the observation produced one. */
   snapshotId: string | null;
+  /** Immutable screenshot capture delivered with this observation, when available. */
+  captureId: string | null;
   pid: number | null;
   windowId: number | null;
   desktop: boolean;
@@ -208,6 +210,7 @@ export function noteCuaObservation(
     installationId,
     generation,
     snapshotId: data ? stringOrNull(data.snapshot_id) : null,
+    captureId: data ? stringOrNull(data.capture_id) : null,
     pid: data ? numeric(data.pid) : null,
     windowId: data ? numeric(data.window_id) : null,
     desktop,
@@ -216,44 +219,7 @@ export function noteCuaObservation(
   });
 }
 
-/**
- * Records that a verification read the target back — without changing what the work can address.
- *
- * A verification confirms current state; it neither mints element targets nor invalidates the
- * ones the last snapshot produced. The driver replaces its element index map on a *snapshot*, so
- * a legitimate observe → act → verify → act sequence must keep working: overwriting the
- * observation here would refuse the second action's token for a reason the driver itself does not
- * have. An observation that was already consumed stays consumed, because those tokens were spent.
- */
-export function noteCuaVerification(
-  workId: string,
-  installationId: string,
-  generation: number,
-  args: Record<string, unknown>
-): void {
-  const key = observationKey(workId, installationId);
-  const existing = observations.get(key);
-  if (!existing) {
-    // No snapshot to preserve. A verification is not an observation, so this records the fact
-    // without granting any element token authority it did not already have.
-    observations.set(key, {
-      installationId,
-      generation,
-      snapshotId: null,
-      pid: numeric(args.pid),
-      windowId: numeric(args.window_id),
-      desktop: false,
-      at: Date.now(),
-      consumed: false
-    });
-    return;
-  }
-  existing.at = Date.now();
-  existing.pid = numeric(args.pid) ?? existing.pid;
-  existing.windowId = numeric(args.window_id) ?? existing.windowId;
-}
-
-function targetOf(args: Record<string, unknown>): { pid: number | null; windowId: number | null; desktop: boolean; snapshotId: string | null; tokenSnapshot: string | null } {
+function targetOf(args: Record<string, unknown>): { pid: number | null; windowId: number | null; desktop: boolean; captureId: string | null; tokenSnapshot: string | null } {
   const target = args.target;
   const nested = target && typeof target === 'object' && !Array.isArray(target) ? target as Record<string, unknown> : null;
   const desktop = args.scope === 'desktop' || nested?.kind === 'desktop';
@@ -262,7 +228,7 @@ function targetOf(args: Record<string, unknown>): { pid: number | null; windowId
     pid: numeric(args.pid) ?? (nested ? numeric(nested.pid) : null),
     windowId: numeric(args.window_id) ?? (nested ? numeric(nested.window_id) : null),
     desktop,
-    snapshotId: stringOrNull(args.snapshot_id),
+    captureId: stringOrNull(args.capture_id),
     // Element tokens are snapshot-scoped: `s0000002a:14` addresses one snapshot's element map.
     tokenSnapshot: token ? token.split(':', 1)[0] ?? null : null
   };
@@ -271,7 +237,7 @@ function targetOf(args: Record<string, unknown>): { pid: number | null; windowId
 const snapshotRequired =
   'CUA_SNAPSHOT_REQUIRED: this action addresses a specific observation, and this work has not taken a fresh one. ' +
   'Call get_window_state (or get_desktop_state for screen-absolute work) first, then address the element token, ' +
-  'snapshot id or pixel from that same result. No action was dispatched.';
+  'capture id or pixel from that same result. No action was dispatched.';
 
 const snapshotStale =
   'CUA_SNAPSHOT_STALE: the observation this work was addressing is no longer current — either an action already ' +
@@ -289,7 +255,8 @@ export function assertCuaSnapshot(
   workId: string,
   installationId: string,
   generation: number,
-  args: Record<string, unknown>
+  args: Record<string, unknown>,
+  captureRequired = false
 ): string | null {
   const observation = observations.get(observationKey(workId, installationId));
   if (!observation) return snapshotRequired;
@@ -299,7 +266,10 @@ export function assertCuaSnapshot(
     return observation.desktop
       ? 'CUA_SNAPSHOT_MISMATCH: the last observation was of the whole desktop, but this action names a window. Take a window observation for the window you intend to drive. No action was dispatched.'
       : 'CUA_SNAPSHOT_MISMATCH: the last observation was of one window, but this action targets the whole desktop. Take a desktop observation first. No action was dispatched.';
-  if (target.snapshotId && observation.snapshotId && target.snapshotId !== observation.snapshotId) return snapshotStale;
+  if (target.captureId && target.captureId !== observation.captureId)
+    return 'CUA_CAPTURE_MISMATCH: this capture does not belong to the current observation. Observe the exact target again. No action was dispatched.';
+  if (captureRequired && (!observation.captureId || target.captureId !== observation.captureId))
+    return 'CUA_CAPTURE_REQUIRED: pass capture_id from this exact target observation. No action was dispatched.';
   if (target.tokenSnapshot && target.tokenSnapshot !== observation.snapshotId)
     return 'CUA_SNAPSHOT_MISMATCH: this element token belongs to a different snapshot than the one this work observed. Take a fresh observation and use its token. No action was dispatched.';
   if (target.pid !== null && observation.pid !== null && target.pid !== observation.pid)

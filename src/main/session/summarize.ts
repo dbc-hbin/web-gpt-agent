@@ -352,6 +352,7 @@ function build(
       return { kind: 'screen', tone: 'neutral', title: 'Inspected desktop state' };
     case 'get_screen_size':
     case 'get_cursor_position':
+    case 'get_agent_cursor_state':
     case 'check_permissions':
     case 'verify_state':
       return { kind: 'screen', tone: 'neutral', title: 'Checked desktop state' };
