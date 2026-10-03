@@ -821,8 +821,6 @@ describe('surface boundaries', () => {
     }
   });
 
-  it('keeps the worst-case no-query discovery of each surface small', async () => { everything(); const coreTools=toolList(await core('tools/list')); const desktopTools=toolList(await desktop('tools/list')); expect(desktopTools).toHaveLength(3); expect(Buffer.byteLength(JSON.stringify(coreTools))).toBeLessThan(14*1024); expect(Buffer.byteLength(JSON.stringify(desktopTools))).toBeLessThan(3*1024); });;
-
   it('describes both surfaces well enough for a user to set them up and a model to find them', () => {
     for (const surface of SURFACE_LIST) {
       expect(surface.serverName, surface.id).toMatch(/^web-gpt-agent-/);

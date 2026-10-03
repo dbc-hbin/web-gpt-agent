@@ -412,8 +412,9 @@ own detailed usage. Enabled writing/exec guidance rejects imagined environment b
 overriding real refusals; it is omitted when neither capability is enabled. Ordinary workers
 need no managed connection. User standing instructions, selected Skills and project AGENTS
 content remain unchanged.
-The shared retry contract distinguishes actual MCP errors from command exits and uncertain
-delivery. Both OpenAI safety-check blocks and inability-to-determine-security-status blocks
+The shared `exec` and Core `exec_read` descriptions distinguish actual MCP errors from command
+exits and uncertain delivery, without adding retry prose to initialize instructions or opening
+prompts. Both OpenAI safety-check blocks and inability-to-determine-security-status blocks
 receive the same retry guidance: recheck the discovered schema, narrow scope to exact
 paths/selectors or specify the command, workdir and arguments, then retry the corrected operation.
 Generated control prose uses neutral names rather than product branding. Recovery continuation

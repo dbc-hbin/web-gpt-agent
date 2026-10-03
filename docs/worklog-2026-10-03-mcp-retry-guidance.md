@@ -1,6 +1,6 @@
 # MCP retry guidance and obsolete build cleanup
 
-Date: 2026-10-03. Source-only prompt change and explicitly requested obsolete-build removal. No package replacement, installed-app restart, credential/ledger edit or Funnel-worktree mutation.
+Date: 2026-10-03. Initial source/log audit and obsolete-build removal, followed by the user's explicit commit/push/rebuild/run request and relocation of retry guidance into MCP tool descriptions. No credential/ledger edit or Funnel-worktree mutation.
 
 ## Build cleanup
 
@@ -15,17 +15,26 @@ Date: 2026-10-03. Source-only prompt change and explicitly requested obsolete-bu
 - The retained refreshed-wrapper experiment reported three upstream blocks among 18 cases; the later direct-tool experiment reported five among 18. Native refusal objects support both reports, but equivalent operations changed outcomes between runs and narrower individual calls could still be blocked. Scope narrowing and precise arguments are an operational retry recommendation, not a demonstrated guaranteed cure. Earlier case reports correlated blocked cases with no app execution record; this review independently confirmed native errors and local outcome categories, but did not independently reconstruct every per-call ingress correlation. No provider experiment was rerun.
 - An independent streaming count confirmed 64 script-error mentions, 43 parse-error mentions, 56 no-dispatch notices and 67 notices that dispatched effects were not rolled back. `EXEC_RESULTS_UNREAD` appeared on 12 total lines versus six leading-code guard entries. No `security`/`policy` text occurred in this log snapshot. No private request/task/tool contents are copied here.
 
-## Prompt change
+## Initial prompt change
 
 - Extended the existing `CODE_MODE_INSTRUCTIONS` in `src/main/mcp/code-mode-tool.ts`; no new retry handler or duplicated connector authority. LSP references confirmed that Core, Desktop and Plugins initialization all use this shared contract. `currentCoreInstructions()` supplies the same contract to prepared executor openings and worker setup.
 - Read the actual error and distinguish invalid arguments, identity/permission refusal, command failure, provider-security rejection and uncertain delivery. Both observed OpenAI responses (safety-check block and inability to determine security status) now explicitly receive the same guidance: recheck the discovered schema, narrow scope to one relevant tool with exact paths/selectors or specify the exact command, workdir and arguments, then retry the corrected operation.
 - At the user's request, removed the newly added policy/approval and evasion/replay prohibition prose to avoid redundant model context. The pre-existing shared prompt, authored instructions and frozen outbox bytes remain unchanged.
-- Updated the owning MCP section of `AGENTS.md` and the fork changelog. Funnel remains separated in its existing worktree; this change is not installed into the running app.
+- Updated the owning MCP section of `AGENTS.md` and the fork changelog. Funnel remains separated in its existing worktree. These initial checks preceded the explicitly requested app rebuild.
 
 ## Exercised checks
 
 - A temporary real loopback HTTP smoke initialized all three production MCP surfaces and observed the complete new guidance in each response. The production opening-preparation path retained the guidance and exact authored task. This proves local publication/preparation, not provider ingestion or model compliance. The temporary smoke and its isolated stores were removed.
 - The smoke and adjacent `mcp-user-instructions`, `session-prompt`, `code-mode-mcp`, `kernel-tool-disabled-message` and `kernel-identity-recovery` suites passed: 70 tests across six files. Existing tests cover real permission refusal, identity recovery and non-replay behavior; no permanent wording-pinning test was added.
-- `npm run verify` passed: verified/staged pinned ripgrep, public-history privacy, production license/native-source inventories, typecheck and Electron resolution; 5,950 main-suite tests plus six isolated MCP shutdown tests passed (5,956 total), with 84 skipped. No app build/package/install was performed.
+- Initial `npm run verify` passed: verified/staged pinned ripgrep, public-history privacy, production license/native-source inventories, typecheck and Electron resolution; 5,950 main-suite tests plus six isolated MCP shutdown tests passed (5,956 total), with 84 skipped. No app build/package/install was performed at that stage.
 - After the requested context trim, a fresh real three-surface initialization/opening smoke and the adjacent authored-instructions/prompt suites passed 16 tests. The removed sentences were absent from published instructions and the original shared prompt remained present. The throwaway smoke was removed. `npm run verify` on the trimmed source also passed 5,956 tests, with 84 skipped, plus the same privacy/notices/typecheck gates.
 - After explicitly naming both OpenAI block responses in the retry sentence, the real three-surface initialization/opening smoke and adjacent prompt suites again passed 16 tests. The temporary smoke was removed. `npm run verify` on that source passed 5,956 tests, with 84 skipped, plus privacy/notices/typecheck and Electron-resolution gates. This verifies prompt publication, not a provider-side retry success.
+
+## Final placement: executing tool descriptions
+
+- After initial commit `02a9142` was pushed, the user requested tool descriptions instead of shared prompt prose. Moved the complete retry paragraph into one private `MCP_RETRY_GUIDANCE` string used by Core/Desktop/Plugins `exec` and Core `exec_read`. It is absent from initialize instructions and prepared executor openings. Existing code-mode instructions, authored standing instructions and frozen outbox messages remain unchanged.
+- Kept `wait`'s cell-continuation contract unchanged: correcting an executing request does not authorize replaying an existing yielded script. No retry dispatcher, fallback, configuration or protocol change was introduced.
+- A throwaway real HTTP smoke observed both OpenAI block variants and corrected-operation guidance in all four executing descriptions, checked absence in all three initialize responses and `wait`, and exercised real opening preparation without changing the authored task. Along with `mcp-user-instructions`, `session-prompt` and `code-mode-mcp`, 49 tests passed. The throwaway smoke was removed.
+- The first full verification exposed an obsolete discovery snapshot requiring Desktop's serialized descriptions to remain below 3 KiB (observed 3,666 bytes). Removed that incidental wording/size snapshot instead of increasing its arbitrary threshold. Production discovery/schema bounds and consumer-behavior tests are unchanged.
+- Final `npm run verify` passed all privacy, license/native-source, typecheck and Electron-resolution gates; 5,949 main-suite tests plus six isolated shutdown tests passed (5,955 total), with 84 skipped.
+- Rebuilt all Electron main/preload/renderer, CLI and daemon outputs and a native macOS arm64 unpacked app. Native packaged-runtime and strict macOS bundle/seal smoke checks passed. Both old GUI and backend owners were proved exited before replacement; the backend used its authenticated, descriptor-fenced `host.stop` operation.

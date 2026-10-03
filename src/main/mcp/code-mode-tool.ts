@@ -264,19 +264,21 @@ function resultContract(surface: SurfaceId): string {
     : 'Nested results are this connector’s raw MCP CallToolResult objects: inspect content, structuredContent and isError yourself. isError is data, not a thrown error.';
 }
 
+const MCP_RETRY_GUIDANCE = "Read the actual MCP error before retrying: invalid arguments, identity or permission refusal, command failure, provider security rejection and uncertain delivery are different outcomes. For either OpenAI response — blocked by the safety check, or blocked because the request's security status could not be determined — recheck the discovered schema, narrow the request to one relevant tool and exact paths or selectors, or specify the exact command, workdir and arguments, then retry the corrected operation. A nonzero command exit alone does not prove a connector failure or an OpenAI security block.";
+
 export const codeModeDeclaration = (options: CodeModeFacadeOptions) => toolDeclaration('exec', () => ({
   title: 'Run JavaScript',
   description: 'Run JavaScript with top-level await. Call this connector’s tools by name: await tools["name"](value)' +
     (options.surface === 'core' ? ', one argument object for an object schema or the raw string for a string schema' : '') + '. ' +
     resultContract(options.surface) +
-    ' A script that exceeds one call’s window yields a cell; continue it with wait.',
+    ' A script that exceeds one call’s window yields a cell; continue it with wait. ' + MCP_RETRY_GUIDANCE,
   inputSchema: codeModeSchema,
   annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true }
 }), options.surface);
 
 export const codeModeReadDeclaration = (options: CodeModeFacadeOptions) => toolDeclaration('exec_read', () => ({
   title: 'Read with JavaScript',
-  description: 'Run JavaScript with top-level await using only Core read, find, view_image, work_resume, and mcp_tools. No shell or mutation is available. Nested read results are text, view_image returns {image_url}, and failures throw Error. Emit text(), image(), audio() or notify(); a yielded cell continues through wait.',
+  description: 'Run JavaScript with top-level await using only Core read, find, view_image, work_resume, and mcp_tools. No shell or mutation is available. Nested read results are text, view_image returns {image_url}, and failures throw Error. Emit text(), image(), audio() or notify(); a yielded cell continues through wait. ' + MCP_RETRY_GUIDANCE,
   inputSchema: codeModeSchema,
   annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false }
 }), options.surface);
@@ -347,6 +349,4 @@ export function registerCodeMode(
   reg.register('wait', waitDeclaration(options), codeModeWaitHandler(options));
 }
 
-export const CODE_MODE_INSTRUCTIONS = `Discover schemas with tools_search; on Core, prefer exec_read for read, find, view_image, work_resume and mcp_tools, and exec for everything else. Desktop and Plugins use exec. Call via the selected wrapper: await tools["name"](value). Pass apply_patch one raw patch string; other object-schema tools take objects. Continue a yielded cell only through outer wait; nested exec and wait refuse. Call agents, work and session_finish directly, never inside exec. Emit concise text(...), image(...), audio(...) or notify(...); notify is also delivered in the next exec/wait result. Use operation_id only where its discovered object schema includes it. A failed call may have acted: inspect state before retrying; never replay a script blindly.
-
-Read the actual MCP error before retrying: invalid arguments, identity or permission refusal, command failure, provider security rejection and uncertain delivery are different outcomes. For either OpenAI response — blocked by the safety check, or blocked because the request's security status could not be determined — recheck the discovered schema, narrow the request to one relevant tool and exact paths or selectors, or specify the exact command, workdir and arguments, then retry the corrected operation. A nonzero command exit alone does not prove a connector failure or an OpenAI security block.`;
+export const CODE_MODE_INSTRUCTIONS = `Discover schemas with tools_search; on Core, prefer exec_read for read, find, view_image, work_resume and mcp_tools, and exec for everything else. Desktop and Plugins use exec. Call via the selected wrapper: await tools["name"](value). Pass apply_patch one raw patch string; other object-schema tools take objects. Continue a yielded cell only through outer wait; nested exec and wait refuse. Call agents, work and session_finish directly, never inside exec. Emit concise text(...), image(...), audio(...) or notify(...); notify is also delivered in the next exec/wait result. Use operation_id only where its discovered object schema includes it. A failed call may have acted: inspect state before retrying; never replay a script blindly.`;
