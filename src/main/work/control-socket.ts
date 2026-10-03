@@ -874,6 +874,7 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
   if (endpointProblem) throw new ControlSocketError(endpointProblem, 'INTERNAL');
   const pid = options.pid ?? process.pid;
   const sockets = new Set<net.Socket>();
+  const refusing = new Set<net.Socket>();
   let connectionOrder = 0;
   /**
    * Whether the endpoint's access control is in force. False only while a Windows pipe is
@@ -943,8 +944,12 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
       return;
     }
     if (sockets.size >= MAX_CLIENTS) {
-      writeLine(socket, { error: { code: 'TOO_MANY_CLIENTS', message: 'too many control clients' } });
-      socket.end();
+      // Refused peers never reach the protocol, but still own an fd until the error flushes.
+      // Track that lifetime for shutdown and handle errors before the first write.
+      refusing.add(socket);
+      socket.on('error', () => socket.destroy());
+      socket.on('close', () => refusing.delete(socket));
+      socket.end(`${JSON.stringify({ error: { code: 'TOO_MANY_CLIENTS', message: 'too many control clients' } })}\n`, () => socket.destroy());
       return;
     }
     sockets.add(socket);
@@ -1275,6 +1280,8 @@ export async function startControlSocket(options: StartControlSocketOptions): Pr
     close: async () => {
       if (closed) return;
       closed = true;
+      for (const socket of refusing) socket.destroy();
+      refusing.clear();
       for (const socket of sockets) socket.destroy();
       sockets.clear();
       await new Promise<void>((resolve) => server.close(() => resolve()));

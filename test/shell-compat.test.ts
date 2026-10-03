@@ -97,6 +97,26 @@ function fixture() {
 
 // Models the observed Markdown editor's native text/break serialization, not
 // the app's receipt check. No exported scripts, credentials or chat text are used.
+it('retires cloned shell proof but preserves a replacement with readable Fiber', async () => {
+  const f = fixture();
+  await f.ask();
+  const original = f.doc.querySelector('[data-turn-key]')!;
+  expect(original.getAttribute('data-clf-fiber-turn')).not.toBeNull();
+  expect(f.api.generating()).toBe(true);
+  const clone = original.cloneNode(true);
+  original.replaceWith(clone);
+  const empty = await f.ask();
+  expect(empty).toMatchObject({ scanOk: true, turns: [] });
+  expect(f.doc.querySelectorAll('[data-clf-fiber-turn], [data-clf-fiber-message], [data-clf-fiber-thought], [data-clf-fiber-image], [data-clf-shell-running]')).toHaveLength(0);
+  expect(f.api.generating()).toBe(false);
+  expect(f.api.messages()).toEqual([]);
+  Reflect.set(clone, '__reactFiber$fixture', f.row);
+  const readable = await f.ask();
+  expect(readable).toMatchObject({ scanOk: true, turns: [{ turnId: TURN }] });
+  expect(f.api.generating()).toBe(true);
+  expect(f.api.messages().map((message: { id: string }) => message.id)).toEqual([USER, ANSWER]);
+});
+
 function editing(f: ReturnType<typeof fixture>) {
   const box = f.api.composer() as HTMLElement;
   const serialize = (node: Node, literal = false, display = false): string => {

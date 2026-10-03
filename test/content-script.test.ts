@@ -127,7 +127,7 @@ interface Hook {
   observe(): void;
   syncTheme(): void;
   meterView(): { filled: number; level: string; status: string; tip: string } | null;
-  paint(): void;
+  unpaint(): void;
   renderStreams(): void;
   foldBootstrap(): void;
   injectControl(): void;
@@ -2190,7 +2190,7 @@ describe('page-native tool presentation and archived row evidence', () => {
     await live.hook.pullActivity();
     await settle();
     live.hook.renderStreams();
-    live.hook.paint();
+    live.hook.unpaint();
 
     expect(label.textContent).toBe(said);
     expect(label.getAttribute('title')).toBeNull();
@@ -2216,13 +2216,36 @@ describe('page-native tool presentation and archived row evidence', () => {
     row.classList.add('clf-tool');
     label.textContent = 'Old local label';
     label.classList.add('clf-tool-title');
-    live.hook.paint();
+    await live.runtimeMessage({ type: 'clf-render-stream', enabled: false });
 
     expect(label.textContent).toBe(said);
     expect(label.classList.contains('clf-tool-title')).toBe(false);
     expect(row.classList.contains('clf-tool')).toBe(false);
     expect(row.dataset['clfCall']).toBeUndefined();
     expect(row.dataset['clfOriginal']).toBeUndefined();
+  });
+
+  it('restores legacy labels once at takeover without touching native media or later provider text', async () => {
+    live = await harness(undefined, {}, document => {
+      const section = assistantTurn(document, 'legacy-takeover', ['Called tool!']);
+      const row = section.querySelector('.pointer-events-none.contents') as HTMLElement;
+      row.dataset.clfCall = 'old-local-call'; row.dataset.clfOriginal = 'Called tool!';
+      row.classList.add('clf-tool');
+      row.querySelector('.text-start')!.textContent = 'Old app label';
+      const media = document.createElement('img'); media.src = 'https://chatgpt.com/native-result.png';
+      const link = document.createElement('a'); link.href = 'https://example.com/result'; link.textContent = 'Native result';
+      row.append(media, link);
+    });
+    const row = live.document.querySelector('.pointer-events-none.contents') as HTMLElement;
+    const label = row.querySelector('.text-start')!;
+    const media = row.querySelector('img')!, link = row.querySelector('a')!;
+    expect(label.textContent).toBe('Called tool!');
+    expect(row.dataset.clfCall).toBeUndefined();
+    label.textContent = 'New native result';
+    live.reply.set('activity', () => ({ ok: true, data: { entries: [], stream: [], job: null } }));
+    await live.hook.pullActivity(); live.hook.observe(); await settle();
+    expect(label.textContent).toBe('New native result');
+    expect(row.querySelector('img')).toBe(media); expect(row.querySelector('a')).toBe(link);
   });
 
   it('does not close a bound conversation when ChatGPT temporarily loses its route id', async () => {
@@ -16604,11 +16627,18 @@ describe('the goal loop', () => {
     );
 
     await settle(400);
+    // This harness disables the production lifecycle poll. Drive its existing quiet deadline
+    // explicitly: the accepted bootstrap opens a local turn even when its whole answer landed
+    // before observation, and degraded DOM completion still requires TURN_SETTLE_MS. Own
+    // presentation mutations must not provide accidental clock advances or lifecycle ticks.
+    live.advance(live.hook.TURN_SETTLE_MS);
+    live.hook.observe();
+    await settle(1200);
+    expect(live.document.visibilityState).toBe('hidden');
+    expect(requested).toBe(1);
 
-    // Recovery is allowed to start while the tab is still hidden. Returning to it is also a
-    // deterministic wake-up: visibilitychange forces an immediate activity pull. Either way B
-    // already has the moved objective, so its bootstrap-caused first answer must enter Goal
-    // exactly once instead of being mistaken for old transcript history.
+    // Returning to the tab is another deterministic wake-up, not another Goal grant. B already
+    // has the moved objective, so its bootstrap-caused first answer enters Goal exactly once.
     Object.defineProperty(live.document, 'visibilityState', { configurable: true, value: 'visible' });
     live.document.dispatchEvent(new live.window.Event('visibilitychange'));
     await settle(1200);

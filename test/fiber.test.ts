@@ -1329,6 +1329,70 @@ describe('the calls a turn says it made', () => {
     expect(turns).toEqual([]);
     expect(turnStamps).toEqual([null]);
   });
+
+  it('retires prior selected proof across viewport changes, unreadable turns and detached nodes without deleting native UI', () => {
+    const dom = new JSDOM('<body></body>', { url: `https://chatgpt.com/c/${THREAD}`, runScripts: 'outside-only' });
+    const win = dom.window, doc = win.document;
+    let visible = new Set([0, 1, 2, 3]);
+    let reply: unknown;
+    win.postMessage = (message: unknown) => { reply = message; };
+    const nodes = Array.from({ length: 12 }, (_, at) => {
+      const section = doc.createElement('section');
+      section.dataset.testid = `conversation-turn-${at}`; section.dataset.turnId = `turn-${at}`;
+      section.getBoundingClientRect = () => ({ top: visible.has(at) ? 10 : -100,
+        bottom: visible.has(at) ? 100 : -10, left: 0, right: 300 } as DOMRect);
+      const owner = `${String(at).padStart(8, '0')}-2222-4333-8444-555555555555`;
+      const assetId = `file_${String(at).padStart(32, '0')}`;
+      const prose = authored(`message-${at}`, `Native answer ${at}`);
+      const imageMessage: Message = { id: `image-${at}`, author: { role: 'tool' }, recipient: 'all', channel: 'final',
+        content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer', asset_pointer: `sediment://${assetId}` }] } };
+      const fiber = turnNode([prose, thought(owner), imageMessage]);
+      Reflect.set(section, '__reactFiber$test', fiber);
+      const text = doc.createElement('div'); text.className = 'markdown';
+      text.dataset.messageId = prose.id; text.textContent = `Native answer ${at}`;
+      const status = doc.createElement('span'); status.className = 'group/tool-message'; status.textContent = 'Native thinking';
+      Reflect.set(status, '__reactFiber$test', chain({ item: { type: 'thought', key: `thought-${owner}-7` } }));
+      const media = doc.createElement('div'); media.className = 'group/imagegen-image';
+      const image = doc.createElement('img'); image.src = `https://chatgpt.com/backend-api/estuary/content?id=${assetId}`;
+      const link = doc.createElement('a'); link.href = 'https://example.com/result'; link.textContent = 'Native result';
+      media.append(image); section.append(text, status, media, link); doc.body.append(section);
+      return { section, text, status, image, link };
+    });
+    const capture = (nonce: string) => win.dispatchEvent(new win.MessageEvent('message',
+      { data: { source: 'clf-fiber-ask', nonce }, source: win as unknown as Window }));
+    try {
+      win.eval(source); capture('scan-first');
+      expect(reply).toMatchObject({ v: 18, scanToken: 'scan-first', scanOk: true,
+        turns: [0, 1, 2, 3, 10, 11].map(at => ({ turnId: `turn-${at}` })) });
+      for (const at of [0, 1, 2, 3, 10, 11]) {
+        const node = nodes[at]!;
+        for (const [element, attribute] of [[node.section, 'data-clf-fiber-turn'], [node.text, 'data-clf-fiber-message'],
+          [node.status, 'data-clf-fiber-thought'], [node.image, 'data-clf-fiber-image']] as const) {
+          expect(element.getAttribute(attribute)).toContain('scan-first:');
+        }
+      }
+      visible = new Set([4, 5, 6, 7]);
+      Reflect.set(nodes[10]!.section, '__reactFiber$test', turnNode([]));
+      nodes[0]!.section.remove();
+      capture('scan-second');
+      expect(reply).toMatchObject({ scanToken: 'scan-second', scanOk: true,
+        turns: [4, 5, 6, 7, 11].map(at => ({ turnId: `turn-${at}` })) });
+      for (const at of [0, 1, 2, 3, 10]) {
+        const node = nodes[at]!;
+        expect(node.section.hasAttribute('data-clf-fiber-turn')).toBe(false);
+        expect(node.text.hasAttribute('data-clf-fiber-message')).toBe(false);
+        expect(node.status.hasAttribute('data-clf-fiber-thought')).toBe(false);
+        expect(node.image.hasAttribute('data-clf-fiber-image')).toBe(false);
+      }
+      for (const at of [4, 5, 6, 7, 11]) expect(nodes[at]!.text.getAttribute('data-clf-fiber-message')).toContain('scan-second:');
+      for (const [at, node] of nodes.entries()) {
+        expect(node.text.textContent).toBe(`Native answer ${at}`);
+        expect(node.section.querySelector('img')).toBe(node.image);
+        expect(node.section.querySelector('a')).toBe(node.link);
+        expect(node.status.textContent).toBe('Native thinking');
+      }
+    } finally { dom.window.close(); }
+  });
 });
 
 describe('which call a row stands for', () => {

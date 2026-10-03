@@ -1630,6 +1630,12 @@
     }
     if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
     const messages = [], calls = [], slots = [], seen = new Set();
+    const units = new Map();
+    for (const node of section.querySelectorAll('[data-content-search-unit-key]')) {
+      if (node.closest('[data-turn-key]') !== section) continue;
+      const key = node.getAttribute('data-content-search-unit-key');
+      units.set(key, units.has(key) ? null : node);
+    }
     const remember = id => { if (!id || seen.has(id)) return false; seen.add(id); return true; };
     let work = 0;
     for (const [index, item] of entry.turn.items.entries()) {
@@ -1645,9 +1651,8 @@
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
           status: completed ? 'finished_successfully' : 'in_progress', metadata: {} });
         const key = `${turnId}:${index}:${role}`;
-        const nodes = [...section.querySelectorAll('[data-content-search-unit-key]')].filter(node =>
-          node.closest('[data-turn-key]') === section && node.getAttribute('data-content-search-unit-key') === key);
-        if (nodes.length === 1) slots.push({ node: nodes[0], id });
+        const node = units.get(key);
+        if (node) slots.push({ node, id });
       } else if (item?.type === 'chatgpt-reasoning-group' && Array.isArray(item.items)) {
         for (const step of item.items) {
           if (++work > MAX_ROWS) return null;
@@ -1662,6 +1667,9 @@
     }
     return { entry, messages, calls, slots };
   }
+  // Retain prior selected nodes so detached proof is retired too. Mounted copies and
+  // older-helper stamps are discovered separately, without per-section subtree scans.
+  let turnStampNodes = new Set();
   function turnsOf(scanToken) {
     const out = [];
     let sections;
@@ -1670,11 +1678,8 @@
     } catch {
       return out;
     }
-    // A descriptor index is valid for one scan only. Stale stamps must disappear when a
-    // still-mounted section becomes unreadable, but clearing every stamp up front is not
-    // harmless: these attributes are observed by the isolated-world MutationObserver, so
-    // remove+restore on every scan creates a self-sustaining scan/mutation loop. Build the
-    // desired stamp set first, then change only attributes whose value actually differs.
+    // A descriptor index is valid for one scan only. Retire previous proof without walking
+    // every historical subtree. Build desired stamps first; a stable scan does no DOM writes.
     const desiredTurnStamps = new Map();
     const desiredMessageStamps = new Map();
     const desiredThoughtStamps = new Map();
@@ -1693,6 +1698,8 @@
     for (let at = Math.max(0, groups.length - 2); at < groups.length; at++) selected.add(at);
     const width = window.innerWidth;
     const height = window.innerHeight;
+    // ponytail: O(mounted groups) geometry preserves exact viewport coverage even for
+    // collapsed/transformed sections; only a native visibility index could safely replace it.
     if (Number.isFinite(width) && width > 0 && Number.isFinite(height) && height > 0) {
       for (let at = groups.length - 1; at >= 0 && selected.size < MAX_TURNS; at--) {
         if (selected.has(at)) continue;
@@ -1839,45 +1846,29 @@
       // content.js will simply leave local turn ownership unset when the page turn id is null.
       if (entry) out.push(entry);
     }
-    for (let at = 0; at < sections.length; at++) {
-      const section = sections[at];
+    const wantedNodes = new Set([...desiredTurnStamps.keys(), ...desiredMessageStamps.keys(),
+      ...desiredThoughtStamps.keys(), ...desiredImageStamps.keys()]);
+    const mountedStamps = document.querySelectorAll(
+      '[data-clf-fiber-turn], [data-clf-fiber-message], [data-clf-fiber-thought], [data-clf-fiber-image], [data-clf-shell-running]');
+    const stampGroups = [
+      ['data-clf-fiber-turn', desiredTurnStamps], ['data-clf-fiber-message', desiredMessageStamps],
+      ['data-clf-fiber-thought', desiredThoughtStamps], ['data-clf-fiber-image', desiredImageStamps]
+    ];
+    for (const node of new Set([...turnStampNodes, ...mountedStamps, ...wantedNodes])) {
       try {
-        if (!section || !section.getAttribute) continue;
-        for (const node of section.querySelectorAll(`[data-clf-fiber-message], [data-content-search-unit-key], ${MARKDOWN}`)) {
-          const wantedMessage = desiredMessageStamps.get(node);
-          const currentMessage = node.getAttribute('data-clf-fiber-message');
-          if (wantedMessage === undefined) {
-            if (currentMessage !== null) node.removeAttribute('data-clf-fiber-message');
-          } else if (currentMessage !== wantedMessage) node.setAttribute('data-clf-fiber-message', wantedMessage);
-        }
-        for (const node of section.querySelectorAll(`${TOOL}, [data-clf-fiber-thought]`)) {
-          const wantedThought = desiredThoughtStamps.get(node);
-          const currentThought = node.getAttribute('data-clf-fiber-thought');
-          if (wantedThought === undefined) {
-            if (currentThought !== null) node.removeAttribute('data-clf-fiber-thought');
-          } else if (currentThought !== wantedThought) node.setAttribute('data-clf-fiber-thought', wantedThought);
-        }
-        for (const node of section.querySelectorAll(`${GENERATED_IMAGE}, [data-clf-fiber-image]`)) {
-          const wantedImage = desiredImageStamps.get(node);
-          const currentImage = node.getAttribute('data-clf-fiber-image');
-          if (wantedImage === undefined) {
-            if (currentImage !== null) node.removeAttribute('data-clf-fiber-image');
-          } else if (currentImage !== wantedImage) node.setAttribute('data-clf-fiber-image', wantedImage);
-        }
-        if (!desiredTurnStamps.has(section)) section.removeAttribute('data-clf-shell-running');
-        for (const stamped of [section, ...section.querySelectorAll('[data-content-search-unit-key]')]) {
-          const wanted = desiredTurnStamps.get(stamped);
-          const current = stamped.getAttribute('data-clf-fiber-turn');
+        for (const [attribute, stamps] of stampGroups) {
+          const wanted = stamps.get(node);
+          const current = node.getAttribute(attribute);
           if (wanted === undefined) {
-            if (current !== null && stamped.removeAttribute) stamped.removeAttribute('data-clf-fiber-turn');
-          } else if (current !== wanted && stamped.setAttribute) {
-            stamped.setAttribute('data-clf-fiber-turn', wanted);
-          }
+            if (current !== null) node.removeAttribute(attribute);
+          } else if (current !== wanted) node.setAttribute(attribute, wanted);
         }
+        if (!desiredTurnStamps.has(node)) node.removeAttribute('data-clf-shell-running');
       } catch {
         // One hostile/stale DOM node must not cost the remaining turns their evidence.
       }
     }
+    turnStampNodes = wantedNodes;
     return out;
   }
 
@@ -1905,14 +1896,15 @@
     try {
       // Inspect existing native tool containers, never translated control labels.
       // The row-local Fiber group is the authority; built-in tools fail describe().
-      found = [...document.querySelectorAll(TOOL)].filter(row => !row.closest(OWN_SURFACES));
+      found = document.querySelectorAll(TOOL);
       for (const old of document.querySelectorAll(CONNECTOR)) old.removeAttribute('data-clf-fiber');
     } catch {
       return post({ source: REPLY, nonce, scanToken, v: VERSION, scanOk: false, rows: [], turns }, location.origin);
     }
-    const limit = Math.min(found.length, MAX_ROWS);
-    for (let index = 0; index < limit; index++) {
-      const row = found[index];
+    let index = 0;
+    for (const row of found) {
+      if (index >= MAX_ROWS) break;
+      if (row.closest(OWN_SURFACES)) continue;
       let descriptor = null;
       try {
         descriptor = describe(row, index);
@@ -1928,6 +1920,7 @@
         descriptor = null;
       }
       if (descriptor) rows.push(descriptor);
+      index++;
     }
     // Row stamps must exist before native activity projection excludes connectors.
     try {

@@ -40,6 +40,25 @@ let subscriptionAttempt: Promise<void> | null = null;
 let subscriptionEpoch = 0;
 let reconnectTimer: NodeJS.Timeout | undefined;
 let connectionPaused = false;
+// Leave half the control host's sixteen slots for its push subscription, lifecycle and CLI.
+const MAX_GUI_INVOCATIONS = 8;
+const MAX_QUEUED_GUI_INVOCATIONS = 64;
+let activeInvocations = 0;
+const invocationQueue: Array<{ owner: string | null; resolve: (admitted: boolean) => void }> = [];
+
+function drainInvocations(): void {
+  for (let index = 0; index < invocationQueue.length;) {
+    const pending = invocationQueue[index]!;
+    if (closing || pending.owner !== rendererId) {
+      invocationQueue.splice(index, 1);
+      pending.resolve(false);
+    } else if (activeInvocations < MAX_GUI_INVOCATIONS) {
+      invocationQueue.splice(index, 1);
+      activeInvocations++;
+      pending.resolve(true);
+    } else index++;
+  }
+}
 
 function unavailable(error: unknown): IpcReply<never> {
   return { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -207,11 +226,23 @@ async function invokeBackend(channel: string, payload: unknown): Promise<IpcRepl
   let client: ControlClient | null = null;
   const owner = rendererId;
   const viewOwned = channel === 'workspaceTerminal:request' || channel === 'projectFiles:watch';
+  let admitted = false;
   let dispatched = false;
   try {
     if (viewOwned) await ensureSubscription();
+    if (closing || owner !== rendererId || (viewOwned && !owner)) throw new Error('The owning desktop view was closed or replaced.');
+    if (activeInvocations < MAX_GUI_INVOCATIONS) {
+      activeInvocations++;
+      admitted = true;
+    } else {
+      if (invocationQueue.length >= MAX_QUEUED_GUI_INVOCATIONS) throw new Error('Desktop request queue is full. Wait for pending operations to finish.');
+      const pending = Promise.withResolvers<boolean>();
+      invocationQueue.push({ owner, resolve: pending.resolve });
+      admitted = await pending.promise;
+    }
+    if (!admitted || closing || owner !== rendererId) throw new Error('The owning desktop view was closed or replaced.');
     client = await connectedClient();
-    if (viewOwned && (!owner || owner !== rendererId)) throw new Error('The owning desktop view was closed or replaced.');
+    if (closing || owner !== rendererId) throw new Error('The owning desktop view was closed or replaced.');
     const encoded = encodeGuiPayload(payload);
     let result: unknown;
     if (Buffer.byteLength(encoded, 'utf8') <= 48 * 1024) {
@@ -224,6 +255,7 @@ async function invokeBackend(channel: string, payload: unknown): Promise<IpcRepl
       for (let offset = 0, part = 0; offset < bytes.length; offset += 48 * 1024, part += 1) {
         await client.call('gui.stage', { id: transferId, part, total, data: bytes.subarray(offset, offset + 48 * 1024).toString('base64') });
       }
+      if (closing || owner !== rendererId) throw new Error('The owning desktop view was closed or replaced.');
       dispatched = true;
       result = await client.call('gui.invoke', { channel, stage: transferId, rendererId: owner });
     }
@@ -248,6 +280,10 @@ async function invokeBackend(channel: string, payload: unknown): Promise<IpcRepl
     return unavailable(error);
   } finally {
     await client?.close().catch(() => undefined);
+    if (admitted) {
+      activeInvocations--;
+      drainInvocations();
+    }
   }
 }
 
@@ -410,11 +446,13 @@ void app.whenReady().then(async () => {
     onVisibilityChange: updatePresence,
     rendererStarting: () => {
       rendererId = randomUUID();
+      drainInvocations();
       rendererLoaded = false;
       void clearSubscription().then(() => ensureSubscription()).catch(() => undefined);
     },
     rendererClosed: () => {
       rendererId = null;
+      drainInvocations();
       rendererLoaded = false;
       void clearSubscription().then(() => ensureSubscription()).catch(() => undefined);
     },
@@ -448,6 +486,7 @@ app.on('second-instance', (_event, _argv, _directory, data: unknown) => {
 
 app.on('before-quit', () => {
   closing = true;
+  drainInvocations();
   clearTimeout(reconnectTimer);
   desktopWindow?.dispose();
   desktopWindow = null;

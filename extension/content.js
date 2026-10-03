@@ -8,11 +8,9 @@
  *     reported to the local app. Nothing is inferred that the page does not show, and
  *     a turn that stops for no visible reason is reported as exactly that.
  *
- *  2. Relabel. The app knows what every MCP tool call actually did, because it ran it.
- *     Each recorded call is matched to one "Called tool" block and given the real thing.
- *     Matching is per call and incremental: a block that cannot be matched confidently
- *     keeps ChatGPT's own label, and — this is the part that used to be wrong — it no
- *     longer suppresses the blocks around it that *can* be matched.
+ *  2. Present. Recorded activity is placed beside exact native authored-message anchors.
+ *     Native answers, media and controls stay owned by ChatGPT; unmatched tool rows stay
+ *     native too. Only completely covered exact local tool rows may be suppressed.
  *
  *  3. Offer Compact & resume, as a control beside ChatGPT's own composer buttons that
  *     says what the job is doing rather than vanishing on the next React render.
@@ -362,6 +360,8 @@
   const nativeImageCaptureActiveTasks = new Set();
 
   let generating = false;
+  // Live adoption can happen during startup, before the scheduler's functions are reached.
+  let activityTimer = null;
   /**
    * When the stop button was first found missing while a turn was open. 0 while it is there.
    *
@@ -1492,6 +1492,7 @@
     // Send receipt in another document cannot open it a second time.
     if (questionId) openedUserMessageId = questionId;
     generating = true;
+    expediteActivityPull();
     unwitnessedGeneration = true;
     turnId = open;
     genNode = null;
@@ -2494,6 +2495,7 @@
     if (newUserMessage && !generating) {
       openedUserMessageId = newUserMessage;
       generating = true;
+      expediteActivityPull();
       quietSince = 0;
       quietTurn = null;
       quietOutcome = null;
@@ -2813,10 +2815,26 @@
   function watchTranscript() {
     if (typeof MutationObserver !== 'function' || !document.body) return;
     let timer = null;
-    let urgentQueued = false;
+    let urgentQueued = null;
     let idlePresentationPending = false;
     const observer = new MutationObserver((records) => {
       if (!recorderHandle.healthy() || !sameChat()) return;
+      const ownStreamNode = (node) => {
+        const element = node && node.nodeType === 1 ? node : node?.parentElement;
+        // The bootstrap root is our wrapper, but its body is moved native user DOM.
+        // Only the app header (not native descendants of the fold) is presentation.
+        return Boolean(element && ((node?.nodeType === 1 && element.matches?.('.clf-boot')) ||
+          element.matches?.('.clf-stream, .clf-stage, .clf-composer, .clf-boot-head') ||
+          element.closest?.('.clf-stream, .clf-stage, .clf-composer, .clf-boot-head')));
+      };
+      // Presentation is not terminal evidence, including app roots inserted into native parents.
+      // Filter before inspecting Stop, but keep native composer mutations outside the transcript.
+      records = records.filter(record => {
+        if (ownStreamNode(record.target)) return false;
+        const changed = [...(record.addedNodes || []), ...(record.removedNodes || [])];
+        return changed.length === 0 || !changed.every(ownStreamNode);
+      });
+      if (records.length === 0) return;
       // Attribute-only native updates matter when React reuses the submit button.
       // Ignore unrelated styling/Fiber stamps; they cannot change composer readiness.
       if (records.every(record => record.type === 'attributes')) {
@@ -2834,28 +2852,22 @@
           clearTimeout(timer);
           timer = null;
         }
-        if (!urgentQueued) {
-          urgentQueued = true;
+        // An old settled capture must not hold up a newer generation's native terminal edge.
+        if (urgentQueued?.epoch !== epoch || !urgentQueued.terminal) {
+          const queued = { epoch, terminal: true };
+          urgentQueued = queued;
           void Promise.resolve().then(() => {
-            urgentQueued = false;
-            if (!alive || !sameChat()) return;
+            if (urgentQueued !== queued) return;
+            urgentQueued = null;
+            if (!alive || epoch !== queued.epoch || !sameChat()) return;
             observe();
           });
         }
         return;
       }
-      const ownStreamNode = (node) => {
-        const element = node && node.nodeType === 1 ? node : node?.parentElement;
-        return Boolean(element && (element.matches?.('.clf-stream') || element.closest?.('.clf-stream')));
-      };
       const relevant = records.some((record) => {
         const target = record.target && record.target.nodeType === 1 ? record.target : record.target.parentElement;
-        if (!target || (target.closest && target.closest('.clf-stream'))) return false;
-        // A chunk is inserted into a native parent, so checking only the mutation target
-        // feeds our own paint back into this observer. Added/removed app roots and their
-        // descendants are presentation, not new native transcript evidence.
-        const changed = [...(record.addedNodes || []), ...(record.removedNodes || [])];
-        if (changed.length > 0 && changed.every(ownStreamNode)) return false;
+        if (!target) return false;
         if (target.closest && target.closest(TURN_SECTION)) return true;
         for (const node of record.addedNodes || []) {
           if (!node || node.nodeType !== 1) continue;
@@ -2878,16 +2890,33 @@
       // A hidden tab may hydrate the remaining final text after the request-id
       // settle window has ended. Reuse this observer and its exact settled owner
       // instead of waiting for visibilitychange or starting another polling loop.
-      if (!generating && fiberSettled?.localTurnId) {
-        if (!urgentQueued) {
-          urgentQueued = true;
-          const settled = fiberSettled;
-          const settledEpoch = epoch;
-          void Promise.resolve().then(() => {
-            urgentQueued = false;
-            if (!alive || epoch !== settledEpoch || !sameChat() || fiberSettled !== settled) return;
-            observe();
-            if (!generating && epoch === settledEpoch && fiberSettled === settled) void refreshFiber(settled);
+      if (!generating && fiberSettled?.localTurnId && document.visibilityState === 'hidden') {
+        if (timer !== null) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        // A suspended capture from a retired navigation cannot reserve this epoch's slot.
+        if (urgentQueued?.epoch !== epoch) {
+          const queued = { epoch, terminal: false };
+          urgentQueued = queued;
+          void Promise.resolve().then(async () => {
+            try {
+              do {
+                if (!alive || generating || epoch !== queued.epoch || !sameChat() || urgentQueued !== queued) return;
+                const settled = fiberSettled;
+                if (!settled?.localTurnId) return;
+                idlePresentationPending = false;
+                observe();
+                if (!alive || generating || epoch !== queued.epoch || !sameChat() ||
+                    urgentQueued !== queued || fiberSettled !== settled) return;
+                await refreshFiber(settled);
+                // One in-flight capture plus one latest trailing revision. Hidden-tab timers
+                // can be frozen; drain the current settled owner even if a newer turn finished
+                // while the previous capture was pending. A native terminal job still preempts it.
+              } while (idlePresentationPending);
+            } finally {
+              if (urgentQueued === queued) urgentQueued = null;
+            }
           });
         }
         return;
@@ -2914,7 +2943,13 @@
         idlePresentationPending = false;
         const observedEpoch = epoch;
         const observedRoute = CLF_DOM.conversationId();
+        const settled = fiberSettled;
         observe();
+        if (!generating && settled?.localTurnId && epoch === observedEpoch &&
+            CLF_DOM.conversationId() === observedRoute && fiberSettled === settled) {
+          void refreshFiber(settled);
+          return;
+        }
         // observe() may have opened a generation and already requested the page model.
         // For a genuinely idle history mount, refresh the exact native anchors now and
         // repaint the already-loaded local feed instead of waiting for the 10-second pull.
@@ -4540,11 +4575,7 @@
   /**
    * Takes a recorded call's label back off a row, leaving what ChatGPT drew.
    *
-   * The one caller is a row whose own descriptor names a different tool than the call it
-   * is wearing, so the label is known to be wrong rather than merely unproven. Leaving it
-   * would be the single outcome worse than "Called tool": another call's name, in this
-   * app's own styling, with a duration and an outcome, over work it did not describe.
-   *
+   * Legacy labels from an older recorder are restored at takeover or preference changes.
    * Restore the original value once, then remove every app presentation marker. Future
    * React-native text is authoritative and must not be overwritten from a stale snapshot.
    */
@@ -4579,24 +4610,11 @@
   /**
    * Gives every row this app has named back to ChatGPT.
    *
-   * The disabled half of paint(), and it runs the restore rather than merely skipping the
-   * loop for the same reason renderStreams() does: a switch flipped off mid-session has to
-   * undo what it did, or our labels stay frozen on the page for the life of the tab.
+   * Only takeover and explicit preference changes need legacy cleanup. New presentation
+   * never labels native rows; recurring observation/feed ticks must not scan them.
    */
   function unpaint() {
-    for (const turn of CLF_DOM.turns()) {
-      if (turn.role !== 'assistant') continue;
-      for (const block of CLF_DOM.toolBlocks(turn)) {
-        if (!block.dataset.clfCall && !block.dataset.clfPage) continue;
-        releaseLabel(block);
-      }
-    }
-  }
-
-  function paint() {
-    // The canonical stream is now the only app-owned activity presentation. Restore rows
-    // touched by older code/candidate builds, then leave unmatched provider rows native.
-    unpaint();
+    for (const block of document.querySelectorAll('[data-clf-call], [data-clf-page]')) releaseLabel(block);
   }
 
   /**
@@ -6462,7 +6480,6 @@
       // Checked again: refreshFiber() talks to the page context, so the tab can move
       // between the check above and the painting below.
       if (!current()) return;
-      paint();
       renderStreams();
       foldBootstrap();
       renderControl();
@@ -10748,7 +10765,6 @@
     later(tick, ms);
   }
 
-  let activityTimer = null;
   function activityPullDelay(input = {}) {
     const hidden = input.hidden === true;
     if (input.drafting === true || input.presentationPending === true) return LIVE_ACTIVITY_MS;
@@ -10843,7 +10859,7 @@
       }
       if (!changed) return;
       renderPreferenceReady = true;
-      paint();
+      unpaint();
       renderStreams();
     };
     chrome.storage.onChanged.addListener(storageChanged);
@@ -11630,7 +11646,7 @@
       if (message.type === 'clf-render-stream') {
         RENDER_STREAM = message.enabled !== false;
         renderPreferenceReady = true;
-        paint();
+        unpaint();
         renderStreams();
         sendResponse({ ok: true, enabled: RENDER_STREAM });
         return false;
@@ -11658,7 +11674,7 @@
         }
         void pullActivity()
           .then(() => {
-            paint();
+            unpaint();
             renderStreams();
             sendResponse({ ok: true, enabled: true });
           })
@@ -11704,6 +11720,7 @@
     });
 
   syncTheme();
+  unpaint();
   wireTips();
   wireMenu();
   if (typeof globalThis.addEventListener === 'function') {
@@ -11720,10 +11737,6 @@
     syncTheme();
     injectControl();
     injectStage();
-    // Relabelling on the observe tick as well as the activity tick: the calls are
-    // already known here, and ChatGPT rendering a block a second after we heard about
-    // its call used to mean waiting for the next poll to see the real label.
-    paint();
     renderStreams();
     foldBootstrap();
   });
@@ -11816,7 +11829,7 @@
       observe,
       syncTheme,
       meterView,
-      paint,
+      unpaint,
       renderStreams,
       foldBootstrap,
       injectControl,

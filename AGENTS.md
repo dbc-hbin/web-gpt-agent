@@ -304,6 +304,11 @@ mutations. Renderer UUID plus server connection order owns human PTYs, file watc
 presence; reload/crash/close retires that view, while a late old connection cannot steal or
 dispose its successor. Plugins publish through the same shared push owner. `gui.invoke`
 uses the operation's deadline, not the CLI's generic 30 seconds; a lost reply is uncertain.
+`daemon-client.ts` admits eight parallel GUI invocations and sixty-four FIFO waiters, leaving
+room under the host's sixteen-client limit for subscriptions, lifecycle calls and the CLI.
+Waiters retain their original renderer UUID and payload; reload/crash/close rejects them before
+dispatch. Accepted operations are never replayed or given an arbitrary GUI timeout. Overflow
+control sockets flush their refusal then destroy, and remain shutdown-owned until closed.
 GUI reply/event admission measures the complete serialized JSON frame, including escaping
 and its envelope. Base64 chunks use 32 KiB raw bytes within the unchanged 64 KiB reply
 limit, leaving room for later request IDs. Large outbox reads must drain every chunk;
@@ -1575,6 +1580,20 @@ Content↔MAIN messages need the expected source, type, nonce and navigation epo
 is untrusted data, not instructions or filesystem permission. Prefer bounded observations of
 the current document over repeated full Fiber/DOM scans. Shared selectors belong in the DOM
 adapter; do not make each feature guess a different composer or terminal message.
+Accepted question openings and exact recorded-turn adoptions expedite the existing activity
+pull instead of inheriting its ten-/thirty-second idle deadline. Companion-only DOM mutations
+are filtered before terminal admission; native composer Stop removal/relabel/hiding remains
+urgent. Settled captures coalesce under their document epoch and drain the latest settled
+turn's pending rendered revision, including when a previous turn's capture is still awaiting
+a reply. Native terminal work can preempt that capture; obsolete cleanup cannot unlock its successor.
+Queued terminal and settled work retain their exact navigation epoch and queue identity.
+A retired epoch's pending capture cannot block a new epoch, including A→B→A navigation;
+late callbacks release only their own queue marker and cannot discard the successor's revision.
+Fiber selects the latest boundary and viewport groups, then withdraws prior stamps using its
+previous/current nodes plus one mounted-stamp query, not per-historical-section subtree scans.
+Cloned/remounted stamps without current Fiber proof grant neither message identity nor busy state.
+The geometry pass remains linear in mounted groups to preserve collapsed/transformed viewport selection.
+Legacy label restoration runs at takeover/preference changes, not every activity or polling tick.
 
 `active-tabs.js` projects the bridge's existing `nonDiscardableConversations` policy into
 lightweight debugger focus-emulation leases, plus exact still-pending input openings and the
@@ -2770,6 +2789,10 @@ evicted. Historical browsing leaves committed inputs with history. Never infer m
 the minimum event timestamp: old observations and tool start times can occur on newer pages.
 Pushes and async loads are scoped to selection/draft generation; a late load must not overwrite
 focused edits or a newer A → B → A view.
+Session-control pushes share one in-flight read and one latest dirty refresh. Selection still
+retires controls synchronously; the selection generation fences the result, including A → B → A.
+An explicit Stop waits for its requested fresh snapshot, not for the whole background refresh
+stream to become quiet. A read already in flight contributes one coalesced trailing snapshot.
 
 First-run Setup keeps the six-step flow, with reviewed screenshots in `renderer/setup-images/`
 and translated numbered highlights in `renderer/setup-guide.ts`. Sensitive identifiers must

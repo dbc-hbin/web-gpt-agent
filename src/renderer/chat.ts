@@ -824,6 +824,9 @@ function mergeDetailDelta(delta: SessionEvent[]): void {
 }
 
 let controlsGeneration = 0;
+let controlsSelection = -1;
+let controlsRefresh: Promise<void> | null = null;
+let controlsRefreshDirty = false;
 let controlledSessionId: string | null = null;
 let controlledTurnId: string | null = null;
 let controlledSelection = -1;
@@ -1159,8 +1162,12 @@ function paintAutomationSwitch(): void {
   ui($<HTMLTextAreaElement>('sessionObjective'), 'placeholder', () => loop ? t("What should each continuation focus on?") : t("What should this chat achieve?"));
   paintTaskActions();
 }
-async function refreshSessionControls(): Promise<void> {
-  const id = selectedId, generation = ++controlsGeneration;
+function refreshSessionControls(): Promise<void> {
+  const id = selectedId;
+  if (controlsSelection !== selectionGeneration) {
+    controlsSelection = selectionGeneration;
+    controlsGeneration++;
+  }
   const planHost = $('agentPlan');
   if (planHost.dataset.sessionId !== (id ?? '')) renderAgentPlan(planHost, id, null);
   const menu = $('sessionControls');
@@ -1175,7 +1182,7 @@ async function refreshSessionControls(): Promise<void> {
     $<HTMLTextAreaElement>('sessionObjective').disabled = false;
     paintTaskActions();
     for (const action of ['compactSession', 'cancelCompaction']) $(action).hidden = true;
-    return; }
+    return Promise.resolve(); }
   const opening = pendingComposerInputs.find(row => row.opening && row.sessionId === id && ['queued', 'browser'].includes(row.state));
   if (!sessions.find(row => row.id === id)?.conversationId) {
     controlledSessionId = id; controlledSelection = selectionGeneration; controlledTurnId = null;
@@ -1190,10 +1197,28 @@ async function refreshSessionControls(): Promise<void> {
     objective.dataset.sessionId = id;
     for (const action of ['compactSession', 'cancelCompaction']) $(action).hidden = true;
     paintAutomationSwitch(); paintDeliveryControls();
-    return;
+    return Promise.resolve();
   }
+  // Pushes share one trailing read. An action waits only for its requested snapshot,
+  // not for a continuously extended background drain; selection fences still apply.
+  if (controlsRefresh) {
+    controlsRefreshDirty = true;
+    return controlsRefresh.then(() => controlsRefresh ?? Promise.resolve());
+  }
+  controlsRefreshDirty = false;
+  controlsRefresh = readSessionControls().finally(() => {
+    controlsRefresh = null;
+    if (controlsRefreshDirty) void refreshSessionControls();
+  });
+  return controlsRefresh;
+}
+
+async function readSessionControls(): Promise<void> {
+  const id = selectedId, generation = controlsGeneration, selection = selectionGeneration;
+  if (!id) return;
+  const planHost = $('agentPlan'), menu = $('sessionControls');
   const controls = await run(api.getSessionControls(id));
-  if (generation !== controlsGeneration || id !== selectedId) return;
+  if (generation !== controlsGeneration || selection !== selectionGeneration || id !== selectedId) return;
   renderAgentPlan(planHost, id, controls?.plan ?? null);
   controlledSessionId = id;
   controlledSelection = selectionGeneration;

@@ -400,18 +400,24 @@ it('clears control projections on an existing-session switch and fences A to B t
   const status = w.document.getElementById('sessionControlStatus')!;
   expect(status.textContent).toContain('Compaction');
   expect(w.document.getElementById('recoveryStatus')!.textContent).toContain('Reload in');
-  const pending: Array<(value: unknown) => void> = [];
-  api.getSessionControls = () => new Promise(resolve => pending.push(resolve));
+  const retired = Promise.withResolvers<unknown>();
+  const current = Promise.withResolvers<unknown>();
+  const currentStarted = Promise.withResolvers<string>();
+  api.getSessionControls = () => retired.promise;
   await append([]); // old A refresh
+  api.getSessionControls = (id: string) => { currentStarted.resolve(id); return current.promise; };
   (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLElement).click();
   expect(status.textContent).toBe('');
   expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
   expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
   (w.document.querySelector(`#sessionList [data-id="${first.id}"]`) as HTMLElement).click();
-  expect(pending).toHaveLength(3);
-  pending[2]!({ ok: true, data: { ...busy, job: null, recovery: [] } }); await settle();
-  pending[1]!({ ok: true, data: busy });
-  pending[0]!({ ok: true, data: busy }); await settle();
+  // The held read drains first; only the latest selection may publish its successor.
+  retired.resolve({ ok: true, data: busy });
+  expect(await currentStarted.promise).toBe(first.id);
+  expect(status.textContent).toBe('');
+  expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
+  expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
+  current.resolve({ ok: true, data: { ...busy, job: null, recovery: [] } }); await settle();
   expect(status.textContent).toBe('');
   expect(w.document.getElementById('cancelCompaction')!.hidden).toBe(true);
   expect(w.document.getElementById('recoveryStatus')!.hidden).toBe(true);
@@ -440,9 +446,11 @@ it('keeps the prior transcript inert until the selected detail arrives and fence
 
   type Reply = (value: unknown) => void;
   const details: Array<{ id: string; reply: Reply }> = [];
-  const controls: Array<{ id: string; reply: Reply }> = [];
+  const retiredControls = Promise.withResolvers<unknown>();
+  const currentControls = Promise.withResolvers<unknown>();
+  const currentControlsStarted = Promise.withResolvers<string>();
   api.getSession = vi.fn((id: string) => new Promise(resolve => details.push({ id, reply: resolve })));
-  api.getSessionControls = vi.fn((id: string) => new Promise(resolve => controls.push({ id, reply: resolve })));
+  api.getSessionControls = () => retiredControls.promise;
   const detail = (sum: SessionSummary, rows: SessionEvent[]) => ({ ok: true, data: { summary: sum, events: rows, total: rows.length,
     nextFrom: rows.reduce((cursor, event) => Math.max(cursor, event.seq + 1), 0) } });
 
@@ -450,6 +458,7 @@ it('keeps the prior transcript inert until the selected detail arrives and fence
   // merely because the selected id later returns to A.
   app.notifySession();
   await vi.waitFor(() => expect(details.map(entry => entry.id)).toEqual([first.id]));
+  api.getSessionControls = (id: string) => { currentControlsStarted.resolve(id); return currentControls.promise; };
   (w.document.querySelector(`#sessionList [data-id="${second.id}"]`) as HTMLButtonElement).click();
   expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session B');
   expect(timeline.textContent).toContain('A QUESTION');
@@ -475,8 +484,8 @@ it('keeps the prior transcript inert until the selected detail arrives and fence
   };
   details[1]!.reply({ ok: false, error: 'B detail unavailable' });
   details[0]!.reply(detail(first, [staleA]));
-  controls[0]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: { busy: true } } });
-  controls[1]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: 'blocked', job: null } });
+  retiredControls.resolve({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: { busy: true } } });
+  expect(await currentControlsStarted.promise).toBe(first.id);
   await settle();
   expect(w.document.getElementById('chatTitle')!.textContent).toBe('Session A');
   expect(timeline.textContent).not.toContain('STALE A QUESTION');
@@ -486,7 +495,7 @@ it('keeps the prior transcript inert until the selected detail arrives and fence
 
   const current: SessionEvent[] = [{ seq: 3, time: T0 + 3, source: 'extension', kind: 'assistant_message', messageId: 'a-current', message: text('CURRENT A ANSWER'), state: 'final', final: true }];
   details[2]!.reply(detail(first, current));
-  controls[2]!.reply({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: null, recovery: [] } });
+  currentControls.resolve({ ok: true, data: { automation: 'off', objective: '', blocked: '', job: null, recovery: [] } });
   await settle();
   expect(timeline.textContent).toContain('CURRENT A ANSWER');
   expect(timeline.textContent).not.toContain('STALE A QUESTION');
@@ -2620,21 +2629,27 @@ it('does not retarget an awaiting Stop after leaving and reselecting the same ch
     plan: { updatedAt: 2, plan: [{ step: 'Current plan', status: 'in_progress', details: 'Current selection' }] } } });
   const stop = vi.fn(async () => ({ ok: true, data: {} }));
   api.stopSessionTurn = stop;
-  let resolve!: (value: any) => void;
-  api.getSessionControls = () => new Promise(done => { resolve = done; });
+  const retired = Promise.withResolvers<unknown>();
+  api.getSessionControls = () => retired.promise;
   w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
   api.getSessionControls = original;
   w.document.getElementById('newChat')!.click();
   (w.document.querySelector('#sessionList [data-id]') as HTMLElement).click();
   await settle();
-  expect(w.document.getElementById('agentPlan')!.textContent).toContain('Current plan');
-  resolve({ ok: true, data: { ...(await original('2026-09-02-test0001')).data,
+  expect(w.document.getElementById('agentPlan')!.textContent).not.toContain('Current plan');
+  expect(stop).not.toHaveBeenCalled();
+  retired.resolve({ ok: true, data: { ...(await original('2026-09-02-test0001')).data,
     plan: { updatedAt: 1, plan: [{ step: 'Stale plan', status: 'pending' }] } } });
   await settle();
   expect(stop).not.toHaveBeenCalled();
   expect(w.document.getElementById('chatSend')!.dataset.action).toBe('stop');
   expect(w.document.getElementById('agentPlan')!.textContent).toContain('Current plan');
   expect(w.document.getElementById('agentPlan')!.textContent).not.toContain('Stale plan');
+  // Only a fresh deliberate Stop may act on the reselected owner's exact turn.
+  w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+  await settle();
+  expect(stop).toHaveBeenCalledOnce();
+  expect(stop).toHaveBeenCalledWith('2026-09-02-test0001', 'held-turn');
 });
 
 it('streams a new Goal opening, queues it once, and displays authoritative delivery failure', async () => {

@@ -417,6 +417,82 @@ const projectSidebarFixture = () => {
   return { project, session };
 };
 
+it('coalesces pushed control reads, keeps the latest refresh and retires A to B to A synchronously', async () => {
+  const { project, session } = projectSidebarFixture();
+  type Reply = { ok: true; data: { objective: string; automation: string; blocked: string | null; job: null } };
+  const reads: Array<{ id: string; resolve: (reply: Reply) => void }> = [];
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session, { ...session, id: 'other', title: 'Other' }], activeId: null, pressure: [], blocked: [] } }),
+    getSessionControls: (id: string) => {
+      const pending = Promise.withResolvers<Reply>();
+      reads.push({ id, resolve: pending.resolve });
+      return pending.promise;
+    }
+  });
+  const doc = mounted.window.document;
+  const select = (id: string) => doc.querySelector<HTMLButtonElement>(`[data-id="${id}"]`)!.click();
+  select(session.id);
+  expect(reads).toHaveLength(1);
+  for (let push = 0; push < 40; push += 1) mounted.push(structuredClone(mounted.state));
+  expect(reads).toHaveLength(1);
+  reads[0]!.resolve({ ok: true, data: { objective: 'First', automation: 'goal', blocked: 'worker', job: null } });
+  await vi.waitFor(() => expect(reads).toHaveLength(2));
+  expect(doc.getElementById('sessionControlStatus')!.textContent).toContain('managed by its prime');
+  select('other');
+  expect(doc.getElementById('sessionControlStatus')!.textContent).toBe('');
+  select(session.id);
+  expect(reads).toHaveLength(2);
+  reads[1]!.resolve({ ok: true, data: { objective: 'Retired A', automation: 'goal', blocked: 'worker', job: null } });
+  await vi.waitFor(() => expect(reads).toHaveLength(3));
+  expect(reads[2]!.id).toBe(session.id);
+  expect(doc.getElementById('sessionControlStatus')!.textContent).toBe('');
+  reads[2]!.resolve({ ok: true, data: { objective: 'Latest A', automation: 'goal', blocked: null, job: null } });
+  await vi.waitFor(() => expect((doc.getElementById('sessionObjective') as HTMLTextAreaElement).value).toBe('Latest A'));
+  expect(reads).toHaveLength(3);
+});
+
+it.each(['own', 'queued'])('dispatches Stop after its %s fresh read while pushed control refreshes remain pending', async boundary => {
+  const { project, session } = projectSidebarFixture();
+  const controls = { objective: '', automation: 'off', blocked: null, job: null, activeTurnId: 'held-turn', canInject: true };
+  type Reply = { ok: true; data: typeof controls };
+  const reads: Array<(reply: Reply) => void> = [];
+  let hold = false;
+  const stop = vi.fn(async () => ({ ok: true, data: {} }));
+  const mounted = await mountChat({}, [], {
+    listProjects: async () => ({ ok: true, data: [project] }),
+    listSessions: async () => ({ ok: true, data: { sessions: [session], activeId: null, pressure: [], blocked: [] } }),
+    getSessionControls: () => {
+      if (!hold) return Promise.resolve({ ok: true, data: controls });
+      const pending = Promise.withResolvers<Reply>();
+      reads.push(pending.resolve);
+      return pending.promise;
+    },
+    stopSessionTurn: stop
+  });
+  const doc = mounted.window.document;
+  doc.querySelector<HTMLButtonElement>(`[data-id="${session.id}"]`)!.click();
+  await vi.waitFor(() => expect(doc.getElementById('chatSend')!.dataset.action).toBe('stop'));
+  vi.useFakeTimers();
+  try {
+    hold = true;
+    if (boundary === 'queued') mounted.push(structuredClone(mounted.state));
+    doc.getElementById('composer')!.dispatchEvent(new mounted.window.Event('submit', { bubbles: true, cancelable: true }));
+    expect(reads).toHaveLength(1);
+    for (let pass = 0; pass < (boundary === 'own' ? 1 : 2); pass++) {
+      for (let push = 0; push < 20; push++) mounted.push(structuredClone(mounted.state));
+      reads.shift()!({ ok: true, data: controls });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reads).toHaveLength(1); // The trailing read is deliberately still unresolved.
+    }
+    expect(stop).toHaveBeenCalledExactlyOnceWith(session.id, 'held-turn');
+    hold = false;
+    reads.shift()!({ ok: true, data: controls });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(stop).toHaveBeenCalledTimes(1);
+  } finally { vi.useRealTimers(); }
+});
+
 it('starts project groups collapsed and deliberately expands the project selected for a new chat', async () => {
   const { project, session } = projectSidebarFixture();
   const mounted = await mountChat({}, [], {
