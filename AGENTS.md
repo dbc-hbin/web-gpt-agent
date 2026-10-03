@@ -508,7 +508,8 @@ before opening preparation; provider-cached initialize instructions remain a sna
 ### `exec_read`, `exec` and `wait` compose tools; they are not a shell
 
 The reference is `openai/codex@94174e44cbc54cece45f6052328ca0c2cd7a8a2a`. Core nested calls use
-native values: `tools.apply_patch(rawString)` returns `{}`, terminal tools return their
+native values: `tools.apply_patch(rawString)` returns a textual change receipt with bounded
+numbered post-edit excerpts when Read is enabled; terminal tools return their
 structured object, `find` returns its structured search page, `view_image` returns `{image_url}`,
 and ordinary reading tools return text. Core
 failures throw the child error. Core `mcp_call` and Desktop/Plugins preserve raw MCP envelopes,
@@ -809,6 +810,16 @@ path authority. Shell-style `apply_patch` interception lives above the parser; q
 and shell control flow are invocation problems, not grammar fixes.
 Intercepted patch results use the requested terminal output budget from their first formatting
 pass, clamped to the existing terminal ceiling. Standalone patches retain their default budget.
+Successful exact patches keep the applied A/M/D file list first, then return final per-path
+change counts, explicit move/replacement receipts and bounded numbered post-edit excerpts.
+`tools-core.ts` derives these from committed deltas, folding repeated paths instead of
+showing intermediate edits or rereading files after the patch. Details fit the remaining
+output budget, capped at 16 KiB; each excerpt has at most eight lines and 240 characters
+per line, with explicit omission notices. Both the admitted and current Read permission
+must permit source previews. Read-off retains path/status/count receipts, including through
+Command-only interception. Failed or inexact patches retain their existing error/rollback
+report instead of a successful post-edit preview. Core code mode no longer discards the
+successful receipt as an empty object; raw patch input and failure propagation are unchanged.
 
 Content-match failures explain when the expected text lies behind the forward search cursor;
 callers must order edits within each Update File block. Diagnostics bound expected text and

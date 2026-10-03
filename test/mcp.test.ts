@@ -22,7 +22,8 @@ import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { effectiveCapabilities, defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import { effectiveCapabilities, defaultConfig, getConfig, initConfigPath, saveConfig } from '../src/main/config.js';
+import * as patchFs from '../src/main/codex/filesystem.js';
 import { flushDurable, initDurableStore } from '../src/main/durable.js';
 import { addProject, assignSessionProject } from '../src/main/projects.js';
 import { lastRequestAt, selfTestHeaders, startMcpServer, tunnelProbeHeaders, type McpEndpoint } from '../src/main/mcp/server.js';
@@ -1612,6 +1613,76 @@ describe('apply_patch', () => {
     expect(await fs.readFile(path.join(approved, 'unchanged.txt'), 'utf8')).toBe('before\n');
   });
 
+  it.each(['apply_patch', 'exec_command'] as const)('keeps successful %s receipts content-free without Read', async tool => {
+    const target = path.join(approved, 'write-without-read.txt');
+    await fs.writeFile(target, 'before\nUNTOUCHED_SECRET\n');
+    ctx.caps = withCaps({ read: false, edit: tool === 'apply_patch', command: tool === 'exec_command' });
+    const patch = ['*** Begin Patch', '*** Update File: /workspace/write-without-read.txt', '@@', '-before', '+after', '*** End Patch'].join('\n');
+    const reply = tool === 'apply_patch'
+      ? await backendCall('core', tool, patch)
+      : await backendCall('core', tool, { cmd: `apply_patch <<'PATCH'\n${patch.replace('/workspace/write-without-read.txt', 'write-without-read.txt')}\nPATCH`, workdir: '/workspace' });
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    const output = tool === 'apply_patch' ? nativeOf(reply) : terminalOf(reply).output;
+    expect(output).toContain('/workspace/write-without-read.txt');
+    expect(output).toContain('+1');
+    expect(output).not.toContain('UNTOUCHED_SECRET');
+    expect(output).not.toContain('1: after');
+    expect(await fs.readFile(target, 'utf8')).toBe('after\nUNTOUCHED_SECRET\n');
+  });
+
+  it('withholds post-edit content when Read is revoked during the commit await', async () => {
+    const config = getConfig();
+    const target = path.join(approved, 'revoke-read.txt');
+    await fs.writeFile(target, 'before\nUNTOUCHED_SECRET\n');
+    const write = patchFs.writeFile;
+    const spy = vi.spyOn(patchFs, 'writeFile').mockImplementation(async (file, contents) => {
+      await write(file, contents);
+      if (file === target) await saveConfig({ ...config, capabilities: { ...config.capabilities, read: false } });
+    });
+    try {
+      const reply = await backendCall('core', 'apply_patch', ['*** Begin Patch', '*** Update File: /workspace/revoke-read.txt', '@@', '-before', '+after', '*** End Patch'].join('\n'));
+      expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+      expect(nativeOf(reply)).toContain('/workspace/revoke-read.txt');
+      expect(nativeOf(reply)).not.toContain('UNTOUCHED_SECRET');
+      expect(nativeOf(reply)).not.toContain('1: after');
+      expect(await fs.readFile(target, 'utf8')).toBe('after\nUNTOUCHED_SECRET\n');
+    } finally {
+      spy.mockRestore();
+      await saveConfig(config);
+    }
+  });
+
+  it('reports only final images after repeated updates, replacement and move', async () => {
+    await fs.writeFile(path.join(approved, 'repeat-source.txt'), 'original\n');
+    await fs.writeFile(path.join(approved, 'repeat-destination.txt'), 'occupied\n');
+    const reply = await backendCall('core', 'apply_patch', [
+      '*** Begin Patch', '*** Update File: /workspace/repeat-source.txt', '@@', '-original', '+intermediate-one',
+      '*** Update File: /workspace/repeat-source.txt', '@@', '-intermediate-one', '+intermediate-two',
+      '*** Update File: /workspace/repeat-source.txt', '*** Move to: /workspace/repeat-destination.txt', '@@', ' intermediate-two',
+      '*** Delete File: /workspace/repeat-destination.txt',
+      '*** Add File: /workspace/repeat-destination.txt', '+final-only',
+      '*** End Patch'
+    ].join('\n'));
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    const output = nativeOf(reply);
+    expect(output).toContain('/workspace/repeat-source.txt -> /workspace/repeat-destination.txt');
+    expect(output).toContain('replaced existing destination');
+    expect(output).toMatch(/1[:\t]\s*final-only/);
+    for (const preimage of ['original', 'occupied', 'intermediate-one', 'intermediate-two']) expect(output).not.toContain(preimage);
+    expect(await fs.readFile(path.join(approved, 'repeat-destination.txt'), 'utf8')).toBe('final-only\n');
+    await expect(fs.stat(path.join(approved, 'repeat-source.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('clips a huge individual post-edit line before rendering the receipt', async () => {
+    const line = '한'.repeat(10_000);
+    const reply = await backendCall('core', 'apply_patch', addPatch('/workspace/huge-line.txt', [line, 'last-line']));
+    expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
+    expect(nativeOf(reply)).toContain('/workspace/huge-line.txt');
+    expect(nativeOf(reply)).toContain('line clipped');
+    expect(Buffer.byteLength(nativeOf(reply), 'utf8')).toBeLessThan(4_000);
+    expect(await fs.readFile(path.join(approved, 'huge-line.txt'), 'utf8')).toBe(`${line}\nlast-line\n`);
+  });
+
   it('resolves later hunks against files created earlier in the same patch', async () => {
     const reply = await backendCall('core', 'apply_patch', [
         '*** Begin Patch',
@@ -1625,17 +1696,20 @@ describe('apply_patch', () => {
       ].join('\n'));
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
     expect(await fs.readFile(path.join(approved, 'fresh-sequential.ts'), 'utf8')).toBe('const fresh = 2;\n');
+    expect(nativeOf(reply)).toMatch(/1[:\t]\s*const fresh = 2;/);
+    expect(nativeOf(reply)).not.toContain('const fresh = 1;');
   });
 
   it('adds, updates, moves and deletes through one tool', async () => {
     const added = await backendCall('core', 'apply_patch', addPatch('/workspace/scratch.txt', ['first', 'second']));
     expect(added.body.result?.isError).toBeFalsy();
-    // A successful Core patch is the pinned upstream `{}`; the file itself is the evidence.
-    expect(nativeOf(added)).toBe('{}');
+    expect(nativeOf(added)).toContain('/workspace/scratch.txt');
+    expect(nativeOf(added)).toMatch(/1[:\t]\s*first/);
     expect(await fs.readFile(path.join(approved, 'scratch.txt'), 'utf8')).toBe('first\nsecond\n');
 
     const edited = await backendCall('core', 'apply_patch', ['*** Begin Patch', '*** Update File: /workspace/scratch.txt', '@@', '-second', '+SECOND', '*** End Patch'].join('\n'));
     expect(edited.body.result?.isError).toBeFalsy();
+    expect(nativeOf(edited)).toMatch(/2[:\t]\s*SECOND/);
     expect(await fs.readFile(path.join(approved, 'scratch.txt'), 'utf8')).toContain('SECOND');
 
     const moved = await backendCall('core', 'apply_patch', [
@@ -1647,10 +1721,14 @@ describe('apply_patch', () => {
         '*** End Patch'
       ].join('\n'));
     expect(moved.body.result?.isError).toBeFalsy();
+    expect(nativeOf(moved)).toContain('/workspace/scratch.txt -> /workspace/moved.txt');
+    expect(nativeOf(moved)).toMatch(/2[:\t]\s*SECOND/);
     await expect(fs.stat(path.join(approved, 'scratch.txt'))).rejects.toThrow();
 
     const deleted = await backendCall('core', 'apply_patch', ['*** Begin Patch', '*** Delete File: /workspace/moved.txt', '*** End Patch'].join('\n'));
     expect(deleted.body.result?.isError).toBeFalsy();
+    expect(nativeOf(deleted)).toContain('/workspace/moved.txt');
+    expect(nativeOf(deleted)).not.toContain('SECOND');
     await expect(fs.stat(path.join(approved, 'moved.txt'))).rejects.toThrow();
   });
 
@@ -1740,8 +1818,11 @@ describe('apply_patch', () => {
         '*** End Patch'
       ].join('\n'));
     expect(reply.body.result?.isError).toBeFalsy();
-    expect(nativeOf(reply)).toBe('{}');
     expect(await fs.readFile(a, 'utf8')).toBe('ALPHA\n');
+    expect(nativeOf(reply)).toContain('/workspace/batch-a.txt');
+    expect(nativeOf(reply)).toContain('/workspace/batch-b.txt');
+    expect(nativeOf(reply)).toMatch(/1[:\t]\s*ALPHA/);
+    expect(nativeOf(reply)).toMatch(/1[:\t]\s*BETA/);
     expect(await fs.readFile(b, 'utf8')).toBe('BETA\n');
   });
 
@@ -1824,7 +1905,7 @@ describe('apply_patch', () => {
     await expect(fs.stat(path.join(approved, 'env-selected.txt'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
-  it('keeps Codex apply_patch output shape for a huge rewrite', async () => {
+  it('returns bounded post-edit excerpts for a huge rewrite', async () => {
     const before = Array.from({ length: 1600 }, (_, index) => `old-${index}`);
     await fs.writeFile(path.join(approved, 'rewrite.txt'), `${before.join('\n')}\n`, 'utf8');
     const hunk = [
@@ -1838,7 +1919,11 @@ describe('apply_patch', () => {
 
     const reply = await backendCall('core', 'apply_patch', hunk);
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
-    expect(nativeOf(reply)).toBe('{}');
+    expect(nativeOf(reply)).toContain('/workspace/rewrite.txt');
+    expect(nativeOf(reply)).toMatch(/1[:\t]\s*new-0/);
+    expect(nativeOf(reply)).not.toContain('old-0');
+    expect(nativeOf(reply)).not.toContain('new-1599');
+    expect(nativeOf(reply)).toContain('omitted');
     expect(await fs.readFile(path.join(approved, 'rewrite.txt'), 'utf8')).toBe(`${before.map((_, index) => `new-${index}`).join('\n')}\n`);
   });
 
@@ -1891,7 +1976,8 @@ describe('apply_patch', () => {
     const reply = await backendCall('core', 'apply_patch', patch);
     expect(reply.body.result?.isError, textOf(reply)).toBeFalsy();
     expect(await fs.readFile(target, 'utf8')).toBe('native-patch-ok\n');
-    expect(nativeOf(reply)).toBe('{}');
+    expect(nativeOf(reply)).toContain('/workspace/native-patch.txt');
+    expect(nativeOf(reply)).toMatch(/1[:\t]\s*native-patch-ok/);
     expect(nativeOf(reply)).not.toContain(approved);
   });
 
@@ -1913,14 +1999,16 @@ describe('apply_patch', () => {
     expect(movedReply.body.result?.isError, textOf(movedReply)).toBeFalsy();
     await expect(fs.stat(source)).rejects.toMatchObject({ code: 'ENOENT' });
     expect(await fs.readFile(moved, 'utf8')).toBe('after\n');
-    expect(nativeOf(movedReply)).toBe('{}');
+    expect(nativeOf(movedReply)).toContain('/workspace/native-patch-source.txt -> /workspace/native-patch-moved.txt');
+    expect(nativeOf(movedReply)).toMatch(/1[:\t]\s*after/);
     expect(nativeOf(movedReply)).not.toContain(approved);
 
     const deletePatch = ['*** Begin Patch', `*** Delete File: ${moved}`, '*** End Patch'].join('\n');
     const deletedReply = await backendCall('core', 'apply_patch', deletePatch);
     expect(deletedReply.body.result?.isError, textOf(deletedReply)).toBeFalsy();
     await expect(fs.stat(moved)).rejects.toMatchObject({ code: 'ENOENT' });
-    expect(nativeOf(deletedReply)).toBe('{}');
+    expect(nativeOf(deletedReply)).toContain('/workspace/native-patch-moved.txt');
+    expect(nativeOf(deletedReply)).not.toContain('Post-edit excerpt');
     expect(nativeOf(deletedReply)).not.toContain(approved);
   });
 

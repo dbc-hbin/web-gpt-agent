@@ -13,8 +13,8 @@ const nativeSchema = z.looseObject({ __thrown: z.string() });
 /**
  * Exercise the public exec boundary and report what the script saw.
  *
- * A nested call now returns the connector's own native value — a string, a structured object, `{}`
- * for a successful patch, or the raw `CallToolResult` of an external server — and a Core failure
+ * A nested call returns the connector's own native value — text (including patch receipts), a
+ * structured object, or the raw `CallToolResult` of an external server — and a Core failure
  * arrives as a thrown `Error` rather than a returned `isError` envelope. The wrapper therefore
  * reports a thrown failure as `{__thrown}` so tests can distinguish "the tool refused" from "the
  * script failed", and leaves every other value exactly as the runtime produced it.
@@ -39,7 +39,7 @@ export function codeModeCall(name: string, args: unknown, pragma?: { yield_time_
  * unchanged (external servers, Desktop and Plugins), a thrown Core failure becomes an `isError`
  * envelope carrying the tool's own message, and a Core native value becomes the envelope a caller of
  * that tool would have seen before code mode — text for a string, the structured object (and its JSON
- * text) for a machine-readable result, and no content at all for a successful patch.
+ * text) for a machine-readable result.
  */
 export function codeModeResult(value: unknown) {
   const outer = resultSchema.parse(value);

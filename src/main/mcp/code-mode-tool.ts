@@ -81,8 +81,8 @@ function nestedFailure(result: ToolResult): Error {
 /**
  * Convert this connector's recorded result envelope into the value a script receives.
  *
- * Core follows the pinned upstream `code_mode_result` contracts: `apply_patch` returns `{}` on
- * success, the terminal tools return their structured object, `view_image` returns the upstream
+ * Core returns apply_patch's committed change receipt as text. The terminal tools return their
+ * structured object, `view_image` returns the upstream
  * `{image_url}` shape, and every other tool uses the upstream default conversion — its non-empty
  * text and media as data URLs, joined by newlines, falling back to its structured object only when
  * it has neither. A failed Core tool is thrown as a real JavaScript `Error` carrying the child's own
@@ -96,7 +96,6 @@ function nestedFailure(result: ToolResult): Error {
 export function codeModeNestedResult(surface: SurfaceId, name: string, result: ToolResult): unknown {
   if (surface !== 'core' || name === 'mcp_call') return result;
   if (result.isError) throw nestedFailure(result);
-  if (name === 'apply_patch') return {};
   if (name === 'find') {
     if (!result.structuredContent) throw new Error('FIND_INVALID_RESULT: search page was missing its structured result.');
     return result.structuredContent;
@@ -261,7 +260,7 @@ function facadeOptions(parent: CallContext, options: CodeModeFacadeOptions): Cod
  * description stays the small per-tool contract discovery actually needs. */
 function resultContract(surface: SurfaceId): string {
   return surface === 'core'
-    ? 'Nested results are native values: apply_patch takes one raw patch string and returns {} on success, exec_command and write_stdin return their structured object, view_image returns {image_url}, other tools return their text, and mcp_call returns the external server’s raw CallToolResult. A failed Core tool throws an Error carrying its own message.'
+    ? 'Nested results are native values: apply_patch takes one raw patch string and returns a change receipt with bounded numbered post-edit previews when Read is enabled; exec_command and write_stdin return their structured object, view_image returns {image_url}, other tools return their text, and mcp_call returns the external server’s raw CallToolResult. A failed Core tool throws an Error carrying its own message.'
     : 'Nested results are this connector’s raw MCP CallToolResult objects: inspect content, structuredContent and isError yourself. isError is data, not a thrown error.';
 }
 

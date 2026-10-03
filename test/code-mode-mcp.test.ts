@@ -586,15 +586,16 @@ it('allows unattributed file edits through code mode while preserving permission
   const patch = '*** Begin Patch\n*** Add File: /workspace/unattributed.txt\n+created anonymously\n*** End Patch';
   const response = await call(undefined, `text(await tools.apply_patch(${JSON.stringify(patch)}));`);
   expect(response.result.isError, text(response)).not.toBe(true);
-  // A successful Core patch resolves to `{}`, the pinned upstream code-mode conversion.
-  expect(emittedText(response)).toBe('{}');
+  expect(emittedText(response)).toContain('/workspace/unattributed.txt');
+  expect(emittedText(response)).toMatch(/1[:\t]\s*created anonymously/);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('created anonymously\n');
   const read = await call(`wfr_${randomUUID().replaceAll('-', '')}`, 'text(await tools.read({paths:["/workspace/unattributed.txt"]}));');
   expect(text(read)).toContain('created anonymously');
   const edit = '*** Begin Patch\n*** Update File: /workspace/unattributed.txt\n@@\n-created anonymously\n+edited anonymously\n*** End Patch';
   const edited = await call(undefined, `text(await tools.apply_patch(${JSON.stringify(edit)}));`);
   expect(edited.result.isError, text(edited)).not.toBe(true);
-  expect(emittedText(edited)).toBe('{}');
+  expect(emittedText(edited)).toContain('/workspace/unattributed.txt');
+  expect(emittedText(edited)).toMatch(/1[:\t]\s*edited anonymously/);
   expect(await fs.readFile(path.join(directory, 'unattributed.txt'), 'utf8')).toBe('edited anonymously\n');
   ctx.caps = { ...ctx.caps, edit: false };
   const deniedPatch = edit.replace('-created anonymously', '-edited anonymously').replace('+edited anonymously', '+must not change');

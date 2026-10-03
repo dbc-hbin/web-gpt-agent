@@ -1,0 +1,21 @@
+# Core apply_patch change receipts
+
+Date: 2026-10-03. User requested useful patch feedback like OMP edit rather than an empty success object. Source-only change; no installed app, browser extension, production configuration or private ledgers changed.
+
+## Behavior and ownership
+
+- A disposable real OMP edit returned a file header and numbered post-edit text; its structured details separately contained a diff. The existing Core HTTP path applied the requested file edit but returned `{}`. `code-mode-tool.ts` was discarding the successful producer result; failures already propagated their diagnostic text.
+- Core now returns the existing producer's text. `tools-core.ts::runParsedPatch` keeps the applied A/M/D list first and adds final per-path status/count receipts, move endpoints and destination-replacement notices. Numbered excerpts use committed delta strings, not submitted fuzzy hunks or a new filesystem read. Repeated paths fold into final images with their earliest preimages; deleted paths have no post-edit body.
+- Details use at most 16 KiB within the remaining terminal-output allowance. Excerpts show up to eight lines near the first change, at most 240 characters per line, with explicit clipping/omission notices. The existing head/tail output policy remains authoritative; previews must not displace the last applied-file receipt under a small budget.
+- Source excerpts require both the admitted Read capability and current authoritative config after execution. Read-off returns only paths/status/counts. Intercepted shell patches retain Command-only mutation authority while passing their separate Read permission to the shared output owner. Failures and inexact deltas retain error/rollback reporting without successful previews.
+- Raw patch input, parser/matching, path validation, mutation permissions, rollback, other native result conversions and global response limits are unchanged. Model-facing result guidance, integration consumers and AGENTS.md describe the text receipt instead of `{}`.
+
+## Exercised verification
+
+- Real isolated MCP server/HTTP/code-mode smoke reproduced the old empty receipt despite a committed edit. The updated path returned the changed file, counts and correctly numbered new text. Actual disk assertions passed for Read-off context suppression, a multi-file rename/add, rejected mismatch preserving bytes, and deletion. A separate actual HTTP command-interception check passed with Edit and Read disabled and Command enabled; its receipt contained no neighboring source content.
+- Smoke setup initially used a noncanonical macOS temporary-root spelling; resolving its real path fixed the fixture without changing sandbox policy. The initial command-interception fixture embedded a virtual path in shell text and was correctly refused. The corrected relative-path scenario passed independently; no command-path guard was relaxed.
+- `npm test -- test/code-mode-runtime.test.ts test/codex-apply-patch-parity.test.ts test/codex-apply-patch-move-rollback.test.ts test/codex-patch-diagnostics.test.ts`: 73 passed.
+- `npm test -- test/code-mode-mcp.test.ts test/mcp-session-independent-coding.test.ts`: 37 passed.
+- Producer checks: `npm test -- test/mcp.test.ts -t apply_patch`: 26 passed, 138 filtered out, before a final test-only equivalent multibyte fixture replacement. Coverage includes in-flight Read revocation, repeated-path final images, replaced rename destinations and oversized-line clipping.
+- `npm test -- test/exec-output-budget-mcp.test.ts -t 'intercepted patch'`: one passed, two filtered out. This existing regression exposed and then verified the fix for preview text displacing the last file receipt under a small output budget.
+- Final `npm run verify` passed privacy, dependency notices/native-source inventory, TypeScript and Electron resolution. The main suite passed 5,984 tests (84 skipped), and the isolated socket-shutdown suite passed six: 5,990 exercised tests in total. This run includes the final multibyte fixture and remaining-budget fix. No package, installation or signed-in ChatGPT acceptance is claimed.

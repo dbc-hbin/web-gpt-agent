@@ -51,7 +51,7 @@ import { DEFAULT_APPLY_PATCH_FILE_UPDATE_MODE } from '../codex/apply-patch/mode.
 import { maybeParseApplyPatchForExec } from '../codex/apply-patch/invocation.js';
 import { composeCommandBatch, parseCommandBatchSections } from '../codex/command-batch.js';
 import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.js';
-import { policyTokenBudget, type TruncationPolicy } from '../codex/truncate.js';
+import { policyByteBudget, policyTokenBudget, type TruncationPolicy } from '../codex/truncate.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
   backgroundExecObligations,
@@ -92,7 +92,8 @@ import {
   WRITE_STDIN_SESSION_ID_DESCRIPTION,
   WRITE_STDIN_YIELD_TIME_DESCRIPTION
 } from '../codex/tool-specs.js';
-import { lineDelta } from '../diffstat.js';
+import { formatDelta, lineDelta } from '../diffstat.js';
+import { SourceFile } from '../codex/apply-patch/text-file.js';
 import {
   benignExitNote,
   bindBundledRipgrep,
@@ -736,7 +737,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
                   kind: 'tokens',
                   tokens: Math.min(resolveMaxTokens(input.max_output_tokens), policyTokenBudget(EXEC_OUTPUT_CEILING_POLICY))
                 };
-                const patchRun = await runParsedPatch(interceptedPatch.args, ctx.roots, dir, undefined, patchOutputPolicy);
+                const patchRun = await runParsedPatch(interceptedPatch.args, ctx.roots, dir, undefined, patchOutputPolicy, caps.read);
                 if (patchRun.result.isError || patchRun.content === null) return patchRun.result;
 
                 // `exec_command.rs` converts a successful intercepted patch into an
@@ -1666,7 +1667,8 @@ async function runParsedPatch(
   roots: readonly Root[],
   base: { real: string; virtual: string },
   caps?: Capabilities,
-  outputPolicy: TruncationPolicy = DEFAULT_TRUNCATION_POLICY
+  outputPolicy: TruncationPolicy = DEFAULT_TRUNCATION_POLICY,
+  includePreview = caps?.read === true
 ): Promise<ParsedPatchRun> {
   if (caps !== undefined) {
     // Product permission gates around the otherwise ported Codex patch runtime. exec_command's
@@ -1767,7 +1769,15 @@ async function runParsedPatch(
     const rollback = await rollbackFailedPatch(rollbackSnapshots, execution.delta);
     rollbackNote = rollback.note;
   }
-  const stdout = safePatchOutput(execution.stdout, resolution);
+  let stdout = safePatchOutput(execution.stdout, resolution);
+  if (execution.exitCode === 0 && execution.delta.exact) {
+    stdout += patchResultDetails(
+      execution.delta,
+      resolution.virtualPaths,
+      includePreview && getConfig().capabilities.read,
+      Math.min(16 * 1024, Math.max(0, policyByteBudget(outputPolicy) - Buffer.byteLength(stdout, 'utf8') - 256))
+    );
+  }
   const stderr = safePatchOutput(`${execution.stderr}${rollbackNote ? `${execution.stderr.endsWith('\n') || execution.stderr === '' ? '' : '\n'}${rollbackNote}\n` : ''}`, resolution);
   const aggregatedOutput = `${stdout}${stderr}`;
   const content = formatExecOutputForModel(
@@ -1985,6 +1995,81 @@ async function resolvePatchPaths(
     return resolved;
   };
   return { resolve, realBySpelling, virtualPaths, displayRewrites };
+}
+
+/** Final committed images, not intermediate hunks or a fresh read racing another writer. */
+function patchResultDetails(
+  delta: AppliedPatchDelta,
+  virtualPaths: ReadonlyMap<string, string>,
+  includePreview: boolean,
+  maxBytes: number
+): string {
+  if (maxBytes < 256) return '(Post-edit details omitted by the output cap; applied file receipts take priority.)\n';
+  const files = new Map<string, { before: string | null; after: string | null; moves: string[] }>();
+  const record = (path: string, before: string | null, after: string | null) => {
+    let file = files.get(path);
+    if (file === undefined) {
+      file = { before, after, moves: [] };
+      files.set(path, file);
+    } else file.after = after;
+    return file;
+  };
+  for (const { path, change } of delta.changes) {
+    if (change.kind === 'add') record(path, change.overwrittenContent, change.content);
+    else if (change.kind === 'delete') record(path, change.content, null);
+    else if (change.movePath === null) record(path, change.oldContent, change.newContent);
+    else {
+      record(path, change.oldContent, null);
+      const destination = record(change.movePath, change.overwrittenMoveContent, change.newContent);
+      destination.moves.push(
+        `${virtualPaths.get(path) ?? '[unresolved patch path]'} -> ${virtualPaths.get(change.movePath) ?? '[unresolved patch path]'}` +
+        (change.overwrittenMoveContent === null ? '' : ' (replaced existing destination)')
+      );
+    }
+  }
+
+  // Keep the complete upstream A/M/D list ahead of these bounded details. In particular, a
+  // large patch must not lose its file receipts to the first file's post-edit excerpt.
+  const sections: string[] = [];
+  let bytes = 0;
+  for (const [path, file] of files) {
+    if (bytes >= maxBytes - 256) break;
+    const counts = lineDelta(file.before ?? '', file.after ?? '');
+    const status = file.after === null ? 'deleted' : file.before === null ? 'created' : 'updated';
+    const metric = formatDelta(counts) ?? '+0 −0';
+    let section = `\n[${virtualPaths.get(path) ?? '[unresolved patch path]'}] ${status}; ${counts.approximate ? '~' : ''}${metric}\n`;
+    for (const move of file.moves) {
+      if (Buffer.byteLength(section, 'utf8') + Buffer.byteLength(move, 'utf8') > maxBytes - bytes - 256) {
+        section += '(additional move details omitted)\n';
+        break;
+      }
+      section += `Moved ${move}\n`;
+    }
+    if (includePreview && file.after !== null) {
+      const before = SourceFile.parse(file.before ?? '').lineTexts();
+      const after = SourceFile.parse(file.after).lineTexts();
+      let firstChange = 0;
+      while (firstChange < before.length && firstChange < after.length && before[firstChange] === after[firstChange]) firstChange++;
+      // A deletion at EOF anchors at the last surviving line; empty files have no excerpt.
+      const from = Math.max(0, Math.min(firstChange, after.length - 1) - 2);
+      const to = Math.min(after.length, from + 8);
+      section += 'Post-edit excerpt (line numbers are not file content):\n';
+      if (after.length === 0) section += '(empty file)\n';
+      for (let index = from; index < to; index++) {
+        const line = after[index]!;
+        // Bound a huge individual source line before adding numbering or serializing it.
+        section += `${index + 1}: ${line.length > 240 ? `${line.slice(0, 240)}… (line clipped)` : line}\n`;
+      }
+      if (from > 0 || to < after.length) section += '(excerpt only; other post-edit lines omitted)\n';
+    }
+    const cost = Buffer.byteLength(section, 'utf8');
+    if (bytes + cost > maxBytes - 256) break;
+    sections.push(section);
+    bytes += cost;
+  }
+  const omitted = files.size - sections.length;
+  if (omitted > 0) sections.push(`\n(${omitted} additional file detail(s) omitted by the output cap; the applied A/M/D list is above.)\n`);
+  return sections.join('');
 }
 
 function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): FileChange[] {
