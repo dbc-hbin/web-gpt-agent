@@ -1194,10 +1194,7 @@ it('keeps plugin connection controls out of general Setup and preserves its tunn
   expect(doc.querySelector('[data-panel="setup"] [data-link="https://chatgpt.com/plugins"]')).not.toBeNull();
 });
 
-/**
- * The exact sentence, because it is the same sentence the composer's settings sheet shows
- * and the two are meant to be recognisably one message rather than two paraphrases.
- */
+/** The settings sheet reports the same stored-credential sentence as the composer. */
 it('reports stored API credentials without exposing app-wide Goal switches', async () => {
   const mounted = await mountChat();
   expect(mounted.window.document.getElementById('goalEnabled')).toBeNull();
