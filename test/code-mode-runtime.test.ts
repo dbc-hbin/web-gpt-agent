@@ -229,11 +229,18 @@ it('expires a cell that completes while yielded output is being decoded', async 
   const data = (await sharp({ create: { width: 2, height: 2, channels: 3, background: 'blue' } }).png().toBuffer()).toString('base64');
   vi.useFakeTimers();
   try {
-    const output = await runCodeMode(`image({type:"image",mimeType:"image/png",data:${JSON.stringify(data)}}); yield_control();`,
-      [], async () => result('unused'), { ...limits, cellIdleMs: 25 }, { owner: 'core:image-retention' });
+    // The script reports its own continuation after the yield, so the terminal message that arms the
+    // idle deadline is already queued behind a host-visible one when the loop below starts advancing.
+    const settled = Promise.withResolvers<void>();
+    const output = await runCodeMode(`image({type:"image",mimeType:"image/png",data:${JSON.stringify(data)}}); yield_control(); notify("settled");`,
+      [], async () => result('unused'), { ...limits, cellIdleMs: 25 },
+      { owner: 'core:image-retention', onNotify: () => settled.resolve() });
     const cellId = cellIdOf(output);
     expect(output.content[0]).toMatchObject({ type: 'image', mimeType: 'image/png' });
-    await vi.advanceTimersByTimeAsync(25);
+    await settled.promise;
+    // Each advance runs on a native timer, so the event loop delivers whatever is still queued, and
+    // the deadline armed on any of those turns is reached by the next advance.
+    for (let attempt = 0; attempt < 20; attempt += 1) await vi.advanceTimersByTimeAsync(25);
     expect(rendered(await waitCodeMode({ cell_id: cellId }, { owner: 'core:image-retention' }))).toContain('CODE_MODE_UNKNOWN_CELL');
   } finally {
     vi.useRealTimers();
@@ -302,12 +309,15 @@ it('stops new admission on timeout while an accepted tool finishes under its own
 
 it('defaults a direct result to one MiB and honours a larger pragma budget', async () => {
   const onTruncatedOutput = vi.fn();
-  const output = await runCodeMode('text("x".repeat(1048577));', [], async () => result('unused'), limits, { onTruncatedOutput });
+  // The guest CPU budget is a wall-clock slice, so a loaded packaging runner can burn the shared
+  // fixture's 100 ms on a mebibyte of guest work. Give this emission production-sized headroom.
+  const heavy = { ...limits, cpuMs: 2_000, wallMs: 10_000 };
+  const output = await runCodeMode('text("x".repeat(1048577));', [], async () => result('unused'), heavy, { onTruncatedOutput });
   expect(output.isError).not.toBe(true);
   expect(output.content[0]).toMatchObject({ text: expect.stringContaining('truncated') });
   expect(output.content[1]).toEqual({ type: 'text', text: 'x'.repeat(1_048_576) });
   expect(onTruncatedOutput).toHaveBeenCalledOnce();
-  const full = await runCodeMode('// @exec: {"max_output_tokens": 300000}\ntext("x".repeat(1048577));', [], async () => result('unused'), limits);
+  const full = await runCodeMode('// @exec: {"max_output_tokens": 300000}\ntext("x".repeat(1048577));', [], async () => result('unused'), heavy);
   expect(full.content).toEqual([{ type: 'text', text: 'x'.repeat(1_048_577) }]);
   const narrow = await runCodeMode('// @exec: {"max_output_tokens": 10}\ntext("x".repeat(100));', [], async () => result('unused'), limits);
   expect(narrow.content[1]).toEqual({ type: 'text', text: 'x'.repeat(40) });
