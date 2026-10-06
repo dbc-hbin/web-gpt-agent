@@ -536,7 +536,8 @@ function loadWorker(options: {
   const tabsSendMessage = vi.fn(options.tabsSendMessage ?? (async () => ({ ok: true })));
   const tabsRemove = vi.fn(async () => undefined);
   const tabsReload = vi.fn(async () => undefined);
-  const scriptingExecuteScript = vi.fn(async () => []);
+  const scriptingExecuteScript = vi.fn(async ({ target }: { target: { tabId: number; documentIds?: string[] } }) =>
+    [{ frameId: 0, documentId: target.documentIds?.[0] ?? documentFor(target.tabId) }]);
   const scriptingInsertCSS = vi.fn(async () => undefined);
   const alarmCreate = vi.fn(() => undefined);
   const alarmClear = vi.fn(async () => true);
@@ -2096,6 +2097,39 @@ describe('extension command delivery', () => {
     expect(backgroundSource).not.toContain("call('/commands'");
   });
 
+  it.each(['stable', 'navigation', 'missing-document'])('keeps the DOM adapter and recorder in one proven document (%s)', async scenario => {
+    const code = backgroundSource.slice(backgroundSource.indexOf('async function restoreChatgptTab('),
+      backgroundSource.indexOf('// The existing maintenance owner repairs missing observers'));
+    const documents = new Map([['source', vm.createContext({})], ['replacement', vm.createContext({})]]);
+    let activeDocument = 'source';
+    let orphanRecorder = false;
+    const executeScript = vi.fn(async ({ target, world, files }: {
+      target: { tabId: number; documentIds?: string[] }; world?: string; files: string[];
+    }) => {
+      if (target.documentIds && !target.documentIds.includes(activeDocument)) throw new Error('Document retired');
+      const documentId = activeDocument, context = documents.get(documentId)!;
+      for (const file of files) {
+        if (world !== 'MAIN' && file === 'chatgpt-dom.js') vm.runInContext(domSource, context);
+        if (world !== 'MAIN' && file === 'content.js') {
+          orphanRecorder ||= vm.runInContext('typeof CLF_DOM === "undefined"', context);
+          vm.runInContext('CLF_DOM.TURN_SELECTOR', context);
+        }
+      }
+      if (scenario === 'navigation') activeDocument = 'replacement';
+      return scenario === 'missing-document' ? [] : [{ frameId: 0, documentId }];
+    });
+    const insertCSS = vi.fn();
+    const restore: (id: number) => Promise<boolean> = vm.runInNewContext(`${code}\nrestoreChatgptTab`, {
+      PAGE_RECORDER_VERSION: 18, tabReply: async () => null, chrome: { scripting: { executeScript, insertCSS } }
+    });
+    expect(await restore(41)).toBe(scenario === 'stable');
+    expect(orphanRecorder).toBe(false);
+    expect(insertCSS).toHaveBeenCalledTimes(scenario === 'stable' ? 1 : 0);
+    if (scenario === 'stable') expect(executeScript).toHaveBeenLastCalledWith({
+      target: { tabId: 41, documentIds: ['source'] }, files: ['chatgpt-dom.js', 'content.js']
+    });
+  });
+
   it('re-injects the recorder into already-open ChatGPT tabs after an extension reload', async () => {
     const local = new FakeStorageArea(paired);
     const session = new FakeStorageArea();
@@ -2108,16 +2142,14 @@ describe('extension command delivery', () => {
       url: ['https://chatgpt.com/*', 'https://chat.openai.com/*']
     });
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, files: ['chatgpt-dom.js'] }],
       [{ target: { tabId: 41 }, world: 'MAIN', files: ['fiber.js'] }],
-      [{ target: { tabId: 41 }, files: ['content.js'] }],
-      [{ target: { tabId: 42 }, files: ['chatgpt-dom.js'] }],
+      [{ target: { tabId: 41, documentIds: ['document-41-0'] }, files: ['chatgpt-dom.js', 'content.js'] }],
       [{ target: { tabId: 42 }, world: 'MAIN', files: ['fiber.js'] }],
-      [{ target: { tabId: 42 }, files: ['content.js'] }]
+      [{ target: { tabId: 42, documentIds: ['document-42-0'] }, files: ['chatgpt-dom.js', 'content.js'] }]
     ]);
     expect(worker.scriptingInsertCSS.mock.calls).toEqual([
-      [{ target: { tabId: 41 }, files: ['overlay.css'] }],
-      [{ target: { tabId: 42 }, files: ['overlay.css'] }]
+      [{ target: { tabId: 41, documentIds: ['document-41-0'] }, files: ['overlay.css'] }],
+      [{ target: { tabId: 42, documentIds: ['document-42-0'] }, files: ['overlay.css'] }]
     ]);
   });
 
@@ -2211,9 +2243,8 @@ describe('extension command delivery', () => {
     expect(repaired).toMatchObject({ ok: true });
     const target = { tabId: 73, documentIds: ['document-73-0'] };
     expect(worker.scriptingExecuteScript.mock.calls).toEqual([
-      [{ target, files: ['chatgpt-dom.js'] }],
       [{ target, world: 'MAIN', files: ['fiber.js'] }],
-      [{ target, files: ['content.js'] }]
+      [{ target, files: ['chatgpt-dom.js', 'content.js'] }]
     ]);
     expect(worker.scriptingInsertCSS).toHaveBeenCalledWith({ target, files: ['overlay.css'] });
     expect(worker.tabsReload).not.toHaveBeenCalled();
@@ -2223,13 +2254,13 @@ describe('extension command delivery', () => {
     expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false, error: 'tab_closed' });
   });
 
-  it.each([1, 2, 3])('stops paired helper repair when Chrome loses the target during injection %s', async stage => {
+  it.each([1, 2])('stops paired helper repair when Chrome loses the target during injection %s', async stage => {
     const session = new FakeStorageArea();
     const worker = loadWorker({ local: new FakeStorageArea(paired), session });
     let injections = 0;
     worker.scriptingExecuteScript.mockImplementation(async () => {
       if (++injections === stage) throw new Error('The target document no longer exists');
-      return [];
+      return [{ frameId: 0, documentId: 'document-73-0' }];
     });
     expect(await worker.send({ type: 'repair_fiber' }, 73)).toMatchObject({ ok: false });
     expect(worker.scriptingExecuteScript).toHaveBeenCalledTimes(stage);

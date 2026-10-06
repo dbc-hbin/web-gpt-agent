@@ -2244,6 +2244,10 @@ On-demand helper repair refreshes the DOM adapter, MAIN reader and matching isol
 through the existing restoration path, pinned to the requesting Chrome document. The recorder's
 version guard retains an equal healthy instance. Repairing only MAIN can strand a cached recorder
 on an older protocol after unpacked-extension edits; no new page reload or timer is authorized.
+Full recorder restoration first obtains MAIN injection's exact top-frame document id, then
+injects the DOM adapter and recorder together in one ordered isolated-world call and applies
+CSS to that same document. Navigation cannot carry a recorder without its adapter into a
+replacement document; missing document proof or injection failure grants no new tab opening.
 First sightings and announced states share one bounded map, reset with the bridge. Repeated no-tab/stalled refusals
 are logged once per chat/cause/minute; handout logs and confirmed browser-action logs remain distinct.
 Assistant-error repairs retain their three-minute cooldown. Attribution, silence, Goal,

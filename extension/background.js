@@ -4602,17 +4602,18 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
   }
   try {
     if (!current()) return false;
-    // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
-    await chrome.scripting.executeScript({ target, files: ['chatgpt-dom.js'] });
-    if (!current()) return false;
     // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
     // declaration. An older helper may still answer too; the nonce/version gate in
     // content.js makes those replies harmless, and a future version bump rejects them.
-    await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['fiber.js'] });
+    const results = await chrome.scripting.executeScript({ target, world: 'MAIN', files: ['fiber.js'] });
+    const restoredDocument = results.find(result => result.frameId === 0)?.documentId;
+    if (!current() || !restoredDocument) return false;
+    const restoredTarget = { tabId: id, documentIds: [restoredDocument] };
+    // One injection owns both isolated scripts. Navigation between separate awaits
+    // must not start a recorder without its DOM adapter in a replacement document.
+    await chrome.scripting.executeScript({ target: restoredTarget, files: ['chatgpt-dom.js', 'content.js'] });
     if (!current()) return false;
-    await chrome.scripting.executeScript({ target, files: ['content.js'] });
-    if (!current()) return false;
-    await chrome.scripting.insertCSS({ target, files: ['overlay.css'] });
+    await chrome.scripting.insertCSS({ target: restoredTarget, files: ['overlay.css'] });
     // Successful injection means this exact tab is recovering. Its document registration will
     // re-run revival routing; opening a second tab during that handoff recreates the race.
     return current();
