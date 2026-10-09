@@ -977,6 +977,15 @@ height across draft changes, hidden panels and width changes; do not persist a m
 `scrollHeight` as an inline height. Empty and fitting input must not overflow; longer text
 remains scrollable at the cap. `scripts/verify-composer-layout.cjs` checks real Electron layout.
 
+The composer model button opens separate account-observed model rows with their supported
+reasoning levels. Its native range controls only the selected model, never advances into
+another family, and is fixed for a one-level Pro selection. Native radio/range keyboard
+behavior and focus survive unchanged catalog pushes; hidden model/effort selects remain
+the Send authority. Unknown or removed models require deliberate selection, not guessed
+fallback. Existing GPT-5.5 and Instant/Minimal exclusions remain composer-only.
+`scripts/verify-composer-models.cjs` exercises the production controls in isolated Electron
+at desktop/narrow widths and both themes.
+
 `session/start-input.ts` returns durable local admission before waiting for connector readiness
 or browser delivery. Each New Chat opening reserves its own local session in the outbox, then
 materializes that exact desktop session. Another New Chat may be admitted immediately; pending
@@ -1800,6 +1809,8 @@ entitlement. Do not enumerate every model × effort or create helper tabs to com
 uncertain catalog. Exact family rules live in `shared/chat-models.ts`.
 
 Model names and recovery policy checked against native picker metadata on **2026-09-17**:
+The **2026-10-09** native picker additionally exposes GPT-6 Instant/Medium/High/Extra High
+as `gpt-6` / `gpt-6-thinking`, under the existing normal two-minute silence policy.
 
 | Display family / compatible short name | Execution identity / selected effort | Silence refresh |
 | --- | --- | --- |
@@ -1829,8 +1840,11 @@ The alternate shell uses an id-less editable textbox under `form[data-chatgpt-co
 version options normalize into the same bounded picker snapshot. A power whose bare
 `modelLabel` (for example `5.6`) exactly names an enabled version joins that version family
 and its `GPT-…` display name, like the classic `category.modelVersion`; other mixed Latest
-powers retain their execution ids rather than forming a synthetic Latest family. The shell's
-`max` Extra High step records as `xhigh` unless that model also offers `xhigh`; a sole power
+powers retain their execution ids rather than forming a synthetic Latest family.
+October's `latest` option now explicitly names `GPT-6`. Its exact matching powers join
+the single observed Instant execution slug as their stable family; Pro remains separate.
+An ambiguous name/Instant selection or a mixed Latest option retains the execution ids.
+The shell's `max` Extra High step records as `xhigh` unless that model also offers `xhigh`; a sole power
 on an exact `gpt-…-pro` slug records its request effort as `pro`. The composer's GPT-5.5
 exclusion depends on these classic `GPT-` labels.
 Ambiguous triggers and unrecognized state remain unknown. MAIN helper replacement removes the
@@ -1849,7 +1863,13 @@ It never imports unmounted messages or cached assistant prose/completion. The ex
 user message may supply its bounded original text from this same proved graph: node id, message
 id and user role must agree. This uses the existing public user-text allowlist: plain text or
 the string parts of `multimodal_text`, never image pointers, object parts or attachment metadata.
-The assistant reader is unchanged. Shell `item.message` can contain Markdown presentation escapes;
+Generated UI assistant text (observed 2026-10-09) uses `::chatgpt-content-reference` markers.
+`fiber.js` resolves only the matching index and source-message id in that exact item's
+`contentReferences`, using `type: dil` / `model_dil_v2.fallbackMarkdownVersion: 1` public
+`fallbackMarkdown`. Surrounding Markdown is retained under the existing text budget.
+Unknown, mismatched or oversized references and user-authored literal markers remain literal.
+No generated DIL code is executed or recorded, and a reference's status cannot establish completion.
+Shell `item.message` can contain Markdown presentation escapes;
 Send receipts and hidden context frames use the original text without unescaping authored bytes.
 Missing source retains the existing receipt wait, not authority to resend. Duplicate/conflicting caches
 abstain, and an unavailable optional cache leaves mounted messages readable. That cache is only

@@ -1644,7 +1644,22 @@
         const user = item.type === 'user-message', id = str(item.messageId) || (user ? str(item.serverMessageId) : null);
         if (!id) continue;
         if (!remember(id) || (user && item.serverMessageId && item.messageId && item.serverMessageId !== item.messageId)) return null;
-        const role = user ? 'user' : 'assistant', text = user ? item.message : item.content;
+        const role = user ? 'user' : 'assistant';
+        let text = user ? item.message : item.content;
+        // October's generated UI carries public Markdown on the exact inline reference,
+        // not in item.content. Never execute its DIL code or borrow rendered DOM text.
+        if (!user && typeof text === 'string' && text.length <= MAX_RENDERED_TEXT &&
+            Array.isArray(item.contentReferences) && item.contentReferences.length <= MAX_ROWS) {
+          let length = text.length;
+          text = text.replace(/::chatgpt-content-reference\{index="(\d{1,3})" source_message_id="([a-zA-Z0-9_-]{1,200})"\}/g, (marker, index, source) => {
+            const reference = item.contentReferences[Number(index)], fallback = reference?.model_dil_v2?.fallbackMarkdown;
+            if (reference?.type !== 'dil' || reference.source_message_id !== source ||
+                reference.model_dil_v2?.fallbackMarkdownVersion !== 1 || typeof fallback !== 'string' ||
+                length - marker.length + fallback.length > MAX_RENDERED_TEXT) return marker;
+            length += fallback.length - marker.length;
+            return fallback;
+          });
+        }
         const final = !user && item.phase === 'final_answer';
         const completed = final && item.completed === true && entry.turn.status === 'complete';
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
@@ -2112,10 +2127,16 @@
       if (current.length !== 1) return null;
       const version = group(current[0].id);
       const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
-      // A power labelled exactly with an enabled version id belongs to that version, like the
-      // classic category.modelVersion, and takes its display name. Other powers keep their
-      // execution slug, so the mixed Latest group itself never becomes a family.
-      const family = value => versions.find(v => v.id === value && id(v.id));
+      // Exact version id/name joins its powers. October's Latest now names GPT-6; use its
+      // observed Instant slug as the stable family, not the replaceable "latest" alias.
+      // Mixed Latest and ambiguous names retain each execution slug.
+      const family = value => {
+        const matches = versions.filter(v => (v.id === value || v.id === 'latest' && v.label === named(value)) && id(v.id));
+        const version = matches.length === 1 ? matches[0] : null;
+        if (!version || version.id !== 'latest') return version;
+        const instant = p.powerSelections.filter(c => c?.modelLabel === value && c?.reasoningEffort === 'none');
+        return instant.length === 1 && id(instant[0]?.model) ? { ...version, id: instant[0].model } : null;
+      };
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
         label: named(c?.modelLabel), familyId: family(c?.modelLabel)?.id || id(c?.model),
         familyLabel: family(c?.modelLabel)?.label || named(c?.modelLabel), effort: powerEffort(c),

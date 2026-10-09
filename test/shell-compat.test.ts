@@ -825,6 +825,31 @@ it('sends a marked shell handoff once and captures its exact completed brief ins
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
 
+it('records generated UI Markdown from exact inline references without granting completion', async () => {
+  const f = fixture(), answer = f.entry.turn.items[2];
+  const marker = `::chatgpt-content-reference{index="0" source_message_id="${ANSWER}"}`;
+  answer.content = `Before\n${marker}\nAfter`;
+  answer.contentReferences = [{ type: 'dil', source_message_id: ANSWER, source_message_status: 'finished_successfully',
+    model_dil_v2: { fallbackMarkdown: '**Public card**\n\nDone', fallbackMarkdownVersion: 1, code: 'NEVER_EXECUTE_OR_RECORD_DIL' } }];
+  const working = (await f.ask()).turns[0];
+  expect(working.messages).toContainEqual(expect.objectContaining({ messageId: ANSWER, rawText: 'Before\n**Public card**\n\nDone\nAfter' }));
+  expect(working.endMessageId).toBeNull();
+  expect(JSON.stringify(working)).not.toContain('NEVER_EXECUTE_OR_RECORD_DIL');
+  f.entry.turn.status = 'complete'; answer.completed = true;
+  const completed = (await f.ask()).turns[0];
+  expect(completed.endMessageId).toBe(ANSWER);
+  expect(completed.messages.find((message: { role: string }) => message.role === 'user').rawText).toBe('hello');
+});
+it.each(['foreign-source', 'missing-index', 'unknown-type', 'unknown-version', 'oversized', 'user-literal'])('preserves an unproved or bounded generated UI reference (%s)', async kind => {
+  const f = fixture(), item = f.entry.turn.items[kind === 'user-literal' ? 0 : 2];
+  const marker = `::chatgpt-content-reference{index="${kind === 'missing-index' ? 1 : 0}" source_message_id="${ANSWER}"}`;
+  const text = `Literal ${marker}`;
+  if (kind === 'user-literal') item.message = text; else item.content = text;
+  item.contentReferences = [{ type: kind === 'unknown-type' ? 'other' : 'dil', source_message_id: kind === 'foreign-source' ? OTHER : ANSWER,
+    model_dil_v2: { fallbackMarkdown: kind === 'oversized' ? 'x'.repeat(256001) : 'Foreign text', fallbackMarkdownVersion: kind === 'unknown-version' ? 2 : 1 } }];
+  const messages = (await f.ask()).turns[0].messages;
+  expect(messages.find((message: { role: string }) => message.role === (kind === 'user-literal' ? 'user' : 'assistant')).rawText).toBe(text);
+});
 it.each(['streaming', 'cancelled', 'conflicting-conversation'])('does not promote an unproven shell final identity: %s', async scenario => {
   const f = fixture();
   f.entry.turn.status = scenario === 'cancelled' ? 'cancelled' : 'complete';
@@ -922,6 +947,24 @@ it('publishes the observed Latest/5.6/5.5 shell catalog with GPT labels, Extra H
   f.props.powerSelections = f.selections[0];
   const efforts = (await f.ask('clf-picker-ask')).picker.choices.map((c: any) => c.effort);
   expect(efforts).toEqual(['none', 'medium', 'high', 'max', 'pro', 'xhigh']);
+});
+it('groups the observed GPT-6 Instant and Thinking powers without merging Pro or saving Latest', async () => {
+  const f = fixture();
+  f.versions[0] = { id: 'latest', label: 'GPT-6', selected: true };
+  const powers = [
+    { model: 'gpt-6', modelLabel: 'GPT-6', reasoningEffort: 'none', powerSettingIndex: 0 },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'medium', powerSettingIndex: 1 },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'high', powerSettingIndex: 2 },
+    { model: 'gpt-6-thinking', modelLabel: 'GPT-6', reasoningEffort: 'max', powerSettingIndex: 3 },
+    { model: 'gpt-6-pro', modelLabel: 'GPT-6 Pro', reasoningEffort: 'medium', powerSettingIndex: 4 }
+  ];
+  f.selections[0] = powers; f.props.powerSelections = powers; f.props.selectedLabelCandidate = powers[1];
+  expect(await f.api.inspectModelSettings()).toEqual(expect.arrayContaining([
+    { id: 'gpt-6', label: 'GPT-6', efforts: ['none', 'medium', 'high', 'xhigh'], aliases: ['gpt-6', 'gpt-6-thinking'] },
+    { id: 'gpt-6-pro', label: 'GPT-6 Pro', efforts: ['pro'], aliases: ['gpt-6-pro'] }
+  ]));
+  expect(await f.api.selectModelSettings('GPT-6', 'high')).toBe(true);
+  expect(f.api.visibleModelSelection()).toEqual({ model: 'gpt-6-thinking', reasoningEffort: 'high' });
 });
 it.each([false, true])('rechecks the cold shell picker owner when its account state hydrates (cancelled=%s)', async cancelled => {
   const f = fixture(), options = f.props.modelListConfig;

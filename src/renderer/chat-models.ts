@@ -3,7 +3,7 @@ import type { ChatModelCatalog } from '../shared/chat-models.js';
 import { chatModelDisplayLabel } from '../shared/chat-models.js';
 import type { Config } from '../shared/types.js';
 import type { ReasoningEffort } from '../shared/session.js';
-import { $, el, run } from './dom.js';
+import { $, el, icon, run } from './dom.js';
 
 let catalog: ChatModelCatalog = { state: 'unknown', requestedAt: null, observedAt: null, models: [] };
 let generation = 0;
@@ -114,20 +114,35 @@ function paintComposerChoices(): void {
   const selected = $<HTMLSelectElement>('composerModel');
   const effort = $<HTMLSelectElement>('composerReasoning');
   const choices = composerModels();
-  const signature = JSON.stringify([catalog.state, choices, selected.value, effort.value]);
-  if (models.dataset.signature === signature) return;
-  models.dataset.signature = signature;
-  models.replaceChildren();
+  const modelSignature = JSON.stringify(choices);
+  if (models.dataset.signature !== modelSignature) {
+    models.dataset.signature = modelSignature;
+    models.replaceChildren(...choices.map(choice => {
+      const row = el('label', 'composer-model-choice');
+      const radio = document.createElement('input'); radio.type = 'radio'; radio.name = 'composerModelChoice'; radio.value = choice.id;
+      radio.onchange = () => { selected.value = choice.id; selected.dispatchEvent(new window.Event('change')); };
+      const caption = el('span', 'composer-model-caption');
+      caption.append(el('strong', '', choice.label), el('span', '', () => choice.efforts.map(effortLabel).join(' · ')));
+      const check = icon('i-check'); check.setAttribute('aria-hidden', 'true');
+      row.append(radio, caption, check);
+      return row;
+    }));
+  }
+  for (const radio of models.querySelectorAll<HTMLInputElement>('input')) radio.checked = radio.value === selected.value;
+  const choice = choices.find(choice => choice.id === selected.value);
+  const signature = JSON.stringify([choice, selected.value, effort.value, choices.length ? null : catalog.state]);
+  if (powers.dataset.signature === signature) return;
+  powers.dataset.signature = signature;
   powers.replaceChildren();
   // Order supported levels from Low upwards; never manufacture an unobserved step.
-  const steps = choices.flatMap(choice => choice.efforts.map(power => ({
+  const steps = choice?.efforts.map(power => ({
     model: choice.id, modelLabel: choice.label, effort: power, label: () => chatModelDisplayLabel(choice.label, power, effortLabel(power))
-  })));
+  })) ?? [];
   const title = document.getElementById('composerPowerTitle');
   const subtitle = document.getElementById('composerPowerModel');
   if (!steps.length) {
-    if (title) ui(title, 'textContent', () => catalog.state === 'pending' ? t("Loading models…") : t("Models unavailable"));
-    if (subtitle) ui(subtitle, 'textContent', () => catalog.state === 'pending' ? t("Reading your ChatGPT account") : t("Reload models"));
+    if (title) ui(title, 'textContent', () => choices.length ? t("Select model") : catalog.state === 'pending' ? t("Loading models…") : t("Models unavailable"));
+    if (subtitle) ui(subtitle, 'textContent', () => choices.length ? t("Previous selection unavailable") : catalog.state === 'pending' ? t("Reading your ChatGPT account") : t("Reload models"));
     return;
   }
   const current = steps.findIndex(step => step.model === selected.value && step.effort === effort.value);
@@ -136,7 +151,8 @@ function paintComposerChoices(): void {
   dots.append(...steps.map(() => el('span', 'power-dot')));
   const slider = document.createElement('input'); slider.type = 'range'; slider.min = '0'; slider.max = String(steps.length - 1); slider.step = '1';
   slider.value = String(Math.max(0, current));
-  ui(slider, 'aria-label', () => t("Model and thinking effort"));
+  slider.disabled = steps.length === 1 && current >= 0;
+  ui(slider, 'aria-label', () => t("Thinking effort"));
   const show = () => {
     const step = steps[Number(slider.value)]!;
     if (title) ui(title, 'textContent', () => effortLabel(step.effort));
@@ -156,7 +172,7 @@ function paintComposerChoices(): void {
     const step = show();
     paintPair('composerModel', 'composerReasoning', step.model, step.effort);
     paintComposerLabel();
-    models.dataset.signature = JSON.stringify([catalog.state, choices, selected.value, effort.value]);
+    powers.dataset.signature = JSON.stringify([choice, selected.value, effort.value, choices.length ? null : catalog.state]);
   };
   slider.oninput = choose;
   slider.onclick = () => { if (current < 0) choose(); };
@@ -289,7 +305,7 @@ export function initChatModels(onPaint?: () => void): void {
     document.getElementById(modelId)?.addEventListener('change', () => {
       if (modelId === 'composerModel' && composerContext) composerContext.edited = true;
       const model = $<HTMLSelectElement>(modelId);
-      const supported = catalog.models.find(item => item.id === model.value)?.efforts ?? [];
+      const supported = (modelId === 'composerModel' ? composerModels() : catalog.models).find(item => item.id === model.value)?.efforts ?? [];
       paintPair(modelId, effortId, model.value, supported.includes('high') ? 'high' : supported[0] ?? '');
       paintStatus();
     });

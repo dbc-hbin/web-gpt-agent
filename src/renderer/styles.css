@@ -3098,7 +3098,17 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 .model-menu .composer-popover { width: 272px; padding: 8px 12px 15px; }
 .model-menu .model-reload { display: flex; width: 28px; height: 28px; min-height: 28px; padding: 5px; justify-content: center; }
 #composerModelStatus { font-size: calc(12px * var(--text-scale, 1)); padding: 4px 10px; line-height: 1.5; }
-.power-header { display: grid; grid-template-columns: 28px minmax(0, 1fr) 28px; align-items: center; gap: 8px; margin-bottom: 17px; }
+#composerModelChoices:not(:empty) { display: grid; gap: 2px; max-height: min(240px, 40vh); overflow-y: auto; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--edge); }
+.composer-popover .composer-model-choice { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) 16px; align-items: center; gap: 10px; padding: 9px 8px; border-radius: 8px; cursor: pointer; color: var(--ink); }
+.composer-model-choice:hover, .composer-model-choice:has(input:checked) { background: var(--hover); }
+.composer-model-choice:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+.composer-model-choice input { position: absolute; width: 1px; height: 1px; padding: 0; opacity: 0; }
+.composer-model-caption { display: flex; flex-direction: column; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.composer-model-caption strong { font-size: calc(13px * var(--text-scale, 1)); font-weight: 600; }
+.composer-model-caption > span { font-size: calc(11px * var(--text-scale, 1)); color: var(--soft); }
+.composer-model-choice .ico { width: 16px; height: 16px; }
+.composer-model-choice:has(input:not(:checked)) .ico { visibility: hidden; }
+.power-header { display: grid; grid-template-columns: 28px minmax(0, 1fr) 28px; align-items: center; gap: 8px; margin-bottom: 12px; }
 .power-caption { grid-column: 2; display: flex; flex-direction: column; align-items: center; min-width: 0; gap: 3px; }
 .power-header .model-reload { grid-column: 3; }
 .power-caption strong { font-size: calc(14px * var(--text-scale, 1)); font-weight: 600; }
