@@ -14,7 +14,7 @@ export interface EmbeddedCuaCatalog { generation: number; tools: readonly Tool[]
 export interface EmbeddedCuaExpectation { schemaHash: string; generation: number }
 export interface EmbeddedCuaLocation { binaryPath: string; sdkModule: string }
 type Host = EmbeddedCuaDriverHost;
-type Live = { host: Host; client: Client; transport: StdioClientTransport; generation: number; hostGeneration: string; tools: Tool[]; users: number; drain: Array<() => void>; verifiedHost: boolean };
+type Live = { host: Host; client: Client; transport: StdioClientTransport; generation: number; tools: Tool[]; users: number; drain: Array<() => void>; verifiedHost: boolean };
 
 const validator = new AjvJsonSchemaValidator() as unknown as { getValidator(schema: Tool['inputSchema']): (args: unknown) => { valid: boolean; errorMessage?: string } };
 let live: Live | null = null;
@@ -109,7 +109,7 @@ async function create(): Promise<void> {
           !('identity_source' in detail) || detail.identity_source !== 'parent_application')
         throw new Error('Driver bundle identity does not belong to this app.');
     }
-    const owner: Live = { host, client, transport, generation: ++generation, hostGeneration: connection.generation,
+    const owner: Live = { host, client, transport, generation: ++generation,
       tools, users: 0, drain: [], verifiedHost: process.platform !== 'darwin' };
     live = owner;
     error = null;
@@ -117,17 +117,13 @@ async function create(): Promise<void> {
       const status = await readEmbeddedCuaPermissions();
       if (!owner.verifiedHost) throw new Error(status?.error ?? 'Driver did not verify app TCC responsibility.');
     }
+    // The MCP proxy closes with the child; pending SDK exit waiters leak native callbacks.
     client.onclose = () => {
       if (live !== owner) return;
       live = null; error = 'Bundled CUA Driver connection closed.'; permissionStatus = unavailableStatus(error); changed();
       void enqueue(() => retire(owner));
     };
     changed();
-    void host.waitForExit(connection.generation).then(() => {
-      if (live !== owner) return;
-      live = null; error = 'Bundled CUA Driver exited unexpectedly.'; permissionStatus = unavailableStatus(error); changed();
-      void enqueue(() => retire(owner));
-    }).catch(() => undefined);
   } catch (cause) {
     live = null;
     permissionStatus = null;

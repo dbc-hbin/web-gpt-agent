@@ -3,7 +3,7 @@ import type { Tool } from '@modelcontextprotocol/client';
 import { externalSchemaHash } from '../src/main/plugins/external-declaration.js';
 
 type Connection = { generation: string; mcp: { command: string; args: string[]; environment: Array<{ name: string; value: string }> } };
-type HostFixture = { stopCount: number; destroyed: boolean; exit: PromiseWithResolvers<void> };
+type HostFixture = { stopCount: number; destroyed: boolean; waitForExitCalls: number };
 type ClientFixture = { onclose?: () => void; closeCount: number };
 const state = vi.hoisted(() => ({
   hosts: [] as HostFixture[], clients: [] as ClientFixture[],
@@ -21,7 +21,7 @@ vi.mock('@trycua/cua-driver/embedded', () => ({
   EmbeddedCuaDriverHost: class {
     stopCount = 0;
     destroyed = false;
-    exit = Promise.withResolvers<void>();
+    waitForExitCalls = 0;
     constructor(_binary: string, _bundleId: string) { state.hosts.push(this); }
     async start(): Promise<Connection> {
       state.startEntered?.resolve();
@@ -29,8 +29,11 @@ vi.mock('@trycua/cua-driver/embedded', () => ({
       if (state.failStart) throw new Error('child could not start');
       return { generation: 'child-1', mcp: { command: 'fake-proxy', args: [], environment: [] } };
     }
-    async stop(): Promise<void> { this.stopCount++; this.exit.resolve(); }
-    waitForExit(_generation: string): Promise<void> { return this.exit.promise; }
+    async stop(): Promise<void> { this.stopCount++; }
+    waitForExit(_generation: string): Promise<void> {
+      this.waitForExitCalls++;
+      return Promise.withResolvers<void>().promise;
+    }
     uniffiDestroy(): void { this.destroyed = true; }
   }
 }));
@@ -59,7 +62,7 @@ vi.mock('@modelcontextprotocol/client', () => ({
       await state.actionGate?.promise;
       return { content: [{ type: 'text', text: 'window details' }] };
     }
-    async close(): Promise<void> { this.closeCount++; }
+    async close(): Promise<void> { this.closeCount++; this.onclose?.(); }
   }
 }));
 
@@ -78,6 +81,27 @@ beforeEach(() => {
   state.startGate = null; state.startEntered = null;
   state.actionGate = null; state.actionEntered = null; state.failStart = false;
   state.actionCalls = 0;
+});
+
+it('does not arm a polling SDK exit waiter on startup or restart', async () => {
+  const runtime = await import('../src/main/cua/runtime.js');
+  await runtime.startEmbeddedCua(location);
+  await runtime.restartEmbeddedCua();
+  await runtime.stopEmbeddedCua();
+  expect(state.hosts).toHaveLength(2);
+  expect(state.hosts.map(host => host.waitForExitCalls)).toEqual([0, 0]);
+});
+
+it('ignores a retired connection close after its replacement is ready', async () => {
+  const runtime = await import('../src/main/cua/runtime.js');
+  await runtime.startEmbeddedCua(location);
+  const oldClose = state.clients[0]!.onclose!;
+  await runtime.restartEmbeddedCua();
+  const generation = runtime.embeddedCuaCatalog()!.generation;
+  oldClose();
+  expect(runtime.embeddedCuaCatalog()?.generation).toBe(generation);
+  expect(state.hosts[1]).toMatchObject({ stopCount: 0, destroyed: false });
+  await runtime.stopEmbeddedCua();
 });
 
 it('stops an app-owned child that finishes startup only after shutdown begins', async () => {
@@ -133,14 +157,18 @@ it('publishes unknown/error on failure or child exit, then recovers on explicit 
   expect(runtime.getEmbeddedCuaPermissions()).toMatchObject({ screen: 'granted', accessibility: 'granted', error: null });
   const crashed = Promise.withResolvers<void>();
   const unsubscribe = runtime.onEmbeddedCuaChanged(() => {
-    if (runtime.embeddedCuaStatus().error?.includes('exited unexpectedly')) crashed.resolve();
+    if (runtime.embeddedCuaStatus().error?.includes('connection closed')) crashed.resolve();
   });
-  state.hosts.at(-1)!.exit.resolve();
+  const oldHost = state.hosts.at(-1)!;
+  const oldClient = state.clients.at(-1)!;
+  oldClient.onclose!();
   await crashed.promise;
   unsubscribe();
   expect(runtime.embeddedCuaCatalog()).toBeNull();
-  expect(runtime.getEmbeddedCuaPermissions()).toMatchObject({ screen: 'unknown', accessibility: 'unknown', error: expect.stringContaining('exited unexpectedly') });
+  expect(runtime.getEmbeddedCuaPermissions()).toMatchObject({ screen: 'unknown', accessibility: 'unknown', error: expect.stringContaining('connection closed') });
   await runtime.restartEmbeddedCua();
+  expect(oldHost).toMatchObject({ stopCount: 1, destroyed: true });
+  expect(oldClient.closeCount).toBe(1);
   expect(runtime.embeddedCuaCatalog()).not.toBeNull();
   expect(runtime.getEmbeddedCuaPermissions()).toMatchObject({ screen: 'granted', accessibility: 'granted', error: null });
   await runtime.stopEmbeddedCua();

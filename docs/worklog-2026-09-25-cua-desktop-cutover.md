@@ -1,5 +1,30 @@
 # Cua Driver Desktop cutover, 2026-09-25
 
+## Exit-waiter leak removal, 2026-10-12
+
+Removed the process-lifetime `EmbeddedCuaDriverHost.waitForExit()` subscription:
+the bundled UniFFI runtime creates retained native callback trampolines on every
+50 ms polling wakeup. The existing MCP proxy connection-close handler is the
+single loss notification, retaining exact-generation fencing, authority withdrawal
+and draining of admitted calls before SDK stop/destruction. Removed its unused
+host-generation projection; no dependency, timer or replacement watcher was added.
+
+The exit-waiter regression failed before the source fix (`[1, 1]` instead of
+`[0, 0]`). The final lifecycle/Desktop/managed-gateway/recording run passed all
+51 tests, including late old-connection closure and explicit restart after loss.
+`npm run verify` passed privacy, license/native-source inventory, TypeScript,
+5,962 main-suite tests (84 existing skips) and six isolated shutdown tests.
+`npm run build` passed; its dynamic-import chunking and dependency PURE-comment
+warnings remain outside this fix. A real isolated SDK child was deliberately
+terminated after subscribing to MCP close; the proxy closed without an exit waiter.
+The fixed built backend also ran inside the unchanged packaged Electron executable
+against its real embedded SDK, with fresh isolated data and ephemeral bridge ports.
+GC-root callback references stayed at eight across the two heap snapshots; the
+original waiter grew from 184 to 1,918 in the comparison run. A real owned-driver
+crash withdrew the catalog and permission authority, then explicit restart produced
+a ready generation 2. The assertions and raw JSON output remain under ignored
+`outputs/memory-investigation-20261012/`; no installed payload or user data changed.
+
 ## 0.31.0 engine and cursor update, 2026-10-01
 
 Upgraded the SDK, all six executable target pins and corresponding source/license

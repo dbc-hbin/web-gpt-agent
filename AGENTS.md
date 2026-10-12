@@ -3128,6 +3128,11 @@ Electron backend startup/shutdown owns this runtime; PATH, an external CuaDriver
 its default socket are never alternatives. Core retains its managed `mcp_tools` / `mcp_call`
 route under reserved `cua-driver`, without a Plugins record. Old preset configuration is
 retired, not migrated into authority over an external daemon.
+The embedded MCP proxy closes when its owned driver exits. Its existing connection-close
+handler retires that exact runtime, clears native authority and drains accepted calls before
+cleanup. Do not keep SDK `waitForExit()` pending: the bundled UniFFI runtime leaks native
+callback trampolines on every polling wakeup. Old connection-close events cannot retire a
+replacement generation; explicit restart and backend shutdown retain their existing owners.
 The Electron backend supplies the executable and SDK module locations at startup. Shared
 MCP/native discovery imports no Electron runtime, so the plain Node daemon can still start
 without Electron installed. Packaged native startup and explicit permission requests load
