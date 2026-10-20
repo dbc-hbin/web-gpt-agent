@@ -15,7 +15,7 @@ import { getChatModels, startChatModelDiscovery, configureChatModelDiscovery } f
 import { releaseSessionFinish, requestSessionFinishGoal } from './session/finish.js';
 import { GOAL_MARKER_INSTRUCTION } from '../shared/goal-templates.js';
 import { validateInputImages } from './session/input-images.js';
-import { stageInputAttachment, type AttachmentSource } from './session/input-attachments.js';
+import { discardInputAttachments, stageInputAttachment, stageInputAttachments, type AttachmentSource } from './session/input-attachments.js';
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
 import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
 import { usageOverview } from './session/usage.js';
@@ -938,9 +938,7 @@ export function registerIpc(
 
   const stageFiles = async (sources: AttachmentSource[]) => {
     const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
-    const result = [];
-    for (const source of sources) result.push(await stageInputAttachment(source, retained));
-    return result;
+    return stageInputAttachments(sources, retained);
   };
   handle('sessions:files', async () => {
     const chosen = await dialog.showOpenDialog({ title: 'Attach files', properties: ['openFile', 'multiSelections'] });
@@ -954,6 +952,12 @@ export function registerIpc(
       z.object({ name: z.string().min(1).max(255), bytes: z.instanceof(Uint8Array).refine(bytes => bytes.byteLength > 0 && bytes.byteLength <= 12 * 1024 * 1024) }).strict()
     ])).min(1).max(20) }).strict().parse(payload);
     return stageFiles(files);
+  });
+  handle('sessions:discardFiles', async payload => {
+    const { ids } = z.object({ ids: z.array(z.string().uuid()).max(20) }).strict().parse(payload);
+    const retained = new Set((await listInputs()).filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).flatMap(row => row.attachments?.map(file => file.id) ?? []));
+    await discardInputAttachments(ids, retained);
+    return true;
   });
   handle('sessions:attachText', async payload => {
     const { text } = z.object({ text: z.string().min(1).max(4 * 1024 * 1024) }).parse(payload);
