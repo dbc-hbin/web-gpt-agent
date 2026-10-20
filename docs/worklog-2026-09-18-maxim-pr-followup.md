@@ -153,8 +153,8 @@ directory for local inspection.
 
 ## Attribution and delivery boundary
 
-Behavior and reproductions adapted from Maxim / @Maximapple, especially #295 and #284; `CONTRIBUTORS.md` is updated. Required trailer for a later integration commit:
+Behavior and reproductions adapted from Maxim / @Maximapple, especially #295 and #284. Required trailer for a later integration commit:
 
 `Co-authored-by: Maxim <5410641+Maximapple@users.noreply.github.com>`
 
-This task edits `src/main/bridge.ts`, its existing test suite, the applicable in-place `AGENTS.md` sections, `CONTRIBUTORS.md`, and this worklog. It does not claim a release installation, native macOS acceptance, or unchanged merging of upstream PR branches. Existing unrelated changes are retained. No public PR comment or status change is required for the local adaptation.
+This task edits `src/main/bridge.ts`, its existing test suite, the applicable in-place `AGENTS.md` sections, and this worklog. It does not claim a release installation, native macOS acceptance, or unchanged merging of upstream PR branches. Existing unrelated changes are retained. No public PR comment or status change is required for the local adaptation.

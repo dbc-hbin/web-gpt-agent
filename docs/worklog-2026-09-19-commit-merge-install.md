@@ -22,7 +22,7 @@ reasons. Completed response sections reconcile to their exact current question. 
 keeps its response grouping in history, while cancelled automatic drafts retain their chronology.
 
 The integration retains the adapted contributions from PRs #298, #299, #305 and #308, with
-GitHub-linked co-author trailers and the existing CONTRIBUTORS explanation. It does not include
+GitHub-linked co-author trailers and the integration history. It does not include
 the separate macOS proposal in #309.
 
 ## Candidate preparation evidence

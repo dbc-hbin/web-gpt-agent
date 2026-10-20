@@ -134,6 +134,6 @@ behavior is claimed by these source-level results.
 Adapted code/design: Maxim, `5410641+Maximapple@users.noreply.github.com`
 (#298, #299, #305), and Masatoshi Shisaka,
 `313313203+okayamajwcc-coder@users.noreply.github.com` (#308).
-`CONTRIBUTORS.md` records the incorporated portions. Future integration commits
+The integration commit records the incorporated portions. Future integration commits
 should retain those public co-author identities. No commit, push, PR closure,
 merge, package installation or release was performed by this review.

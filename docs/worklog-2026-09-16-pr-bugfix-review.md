@@ -11,7 +11,7 @@ Fetched exact PR heads and diffs into isolated review worktrees. Never checked o
 - **#268**, head `e420bc82a75c55e40a81aa4fb505054b4cf56af2`, merged as `31589c1d15569886751a07203139562b9bae506b`: npm plugin installation now passes the exact generation directory through `--prefix`. The current installer previously relied on cwd, allowing npm to choose an ancestor project while subsequent manifest reads still expected generation-local files. Reproduced with a real offline local tarball: before, the package existed only under the parent; after, it existed under the generation. This retains script suppression and argument-array invocation on Windows.
 - **#265**, head `09f18496865ddd05bd8195f84bc79e5a813aad91`, merged as `4e30b62e0adbccaf5741a34bfb67ca8f44df61ab`: manual continuation expiry uses one hour during `awaiting-summary` only for the frozen, confirmed Pro selection. Restore uses the corresponding retention window. Ordinary/unobserved selections and captured/claimed phases retain ten minutes. Checked the bridge destination deadline separately: it governs the later claimed phase and does not cancel the writing window. New Pro expiry/restart tests fail against unmodified main and pass with the patch.
 
-The four changed implementation/test files are identical between merged public main and the local tree after application. Original authorship is retained in the GitHub squash commits, merge messages and CONTRIBUTORS.md.
+The four changed implementation/test files are identical between merged public main and the local tree after application. Original authorship is retained in the GitHub squash commits and merge messages.
 
 ## Every PR decision
 

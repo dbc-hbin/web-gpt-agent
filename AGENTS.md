@@ -3251,7 +3251,7 @@ The prime independently verifies important claims; parallel reports are hypothes
 
 When integrating external PRs, preserve original authorship. Adapted or snapshot-integrated
 work must name the original PR/author and carry appropriate GitHub-linked `Co-authored-by`
-trailers; update `CONTRIBUTORS.md` and distinguish incorporated code from reports/proposals.
+trailers in the integration commit, and distinguish incorporated code from reports/proposals.
 Closing a PR or rewriting its implementation does not remove the contributor's credit.
 
 Record changes and actual checks in a focused worklog. Keep security reproductions/private

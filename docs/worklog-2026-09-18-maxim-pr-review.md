@@ -6,7 +6,7 @@ not merge the seven branches unchanged or publish the unrelated local work.
 
 Original contribution credit: **Maxim / @Maximapple**. Public co-author identity for a future
 integration commit: `Maxim <5410641+Maximapple@users.noreply.github.com>`.
-The maintained attribution record is in `CONTRIBUTORS.md`.
+The maintained attribution record is in the integration commits and worklogs.
 
 ## Reviewed source and decisions
 

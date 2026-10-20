@@ -9,7 +9,7 @@ The busy-tab/deadline fixes in #317 did not teach the recorder the alternate pag
 @ehkogh's draft #318, inspected at `c18f289c14f7237810ac1b5b91409d07a08d72b9`, provided concrete
 editor, turn, picker and stream fixtures. This change adapts that contribution rather than
 merging the entire draft. @redzrush101 supplied the original report, structural screenshot and
-unsuccessful retest. Both contributions are credited in CONTRIBUTORS.md.
+unsuccessful retest. Both contributions are credited in the integration history.
 
 ## Narrow repair
 
