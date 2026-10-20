@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { createServer } from 'node:http';
-import { Client } from '@modelcontextprotocol/client';
+import { Client, SdkError, SdkErrorCode } from '@modelcontextprotocol/client';
 import { zipSync, strToU8 } from 'fflate';
 import sharp from 'sharp';
 import { makeTempDir, removeTempDir } from './helpers.js';
@@ -144,6 +144,23 @@ describe('external plugin authority', () => {
     expect(disabled).toContain('This call was not dispatched.');
     expect(disabled).not.toContain('Restart this plugin');
     expect(upstream).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['timeout', 'abort'] as const)('keeps a plugin ready after SDK %s and cancels only that request', async (failure) => {
+    const row = (await manager.install({ source: { kind: 'command', command: process.execPath, args: [entry] } })).plugins[0]!;
+    const upstream = vi.spyOn(Client.prototype, 'callTool')
+      .mockRejectedValueOnce(new SdkError(SdkErrorCode.RequestTimeout, failure))
+      .mockResolvedValue({ content: [{ type: 'text', text: 'after cancellation' }], structuredContent: { value: 'after cancellation' } });
+    const outcome = vi.fn();
+    const timedOut = await manager.call('Echo.Mixed', { value: failure }, outcome);
+    expect(timedOut.isError).toBe(true);
+    expect(JSON.stringify(timedOut)).toContain('PLUGIN_CALL_TIMEOUT');
+    expect(JSON.stringify(timedOut)).toContain('may have completed');
+    expect(outcome).toHaveBeenCalledExactlyOnceWith('tool_execution_error', true);
+    expect(manager.snapshot().plugins[0]?.status).toBe('ready');
+    expect((await manager.call('Echo.Mixed', { value: 'after cancellation' })).structuredContent).toEqual({ value: 'after cancellation' });
+    expect(manager.snapshot().plugins[0]?.id).toBe(row.id);
+    expect(upstream).toHaveBeenCalledTimes(2);
   });
 
   it('preserves accepted protocol results and treats upstream error text only as execution output', async () => {

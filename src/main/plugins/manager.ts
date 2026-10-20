@@ -2,7 +2,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ToolSchema } from '@modelcontextprotocol/core';
-import { Client, StreamableHTTPClientTransport, UnauthorizedError, type Tool, type CallToolResult } from '@modelcontextprotocol/client';
+import { Client, SdkError, SdkErrorCode, StreamableHTTPClientTransport, UnauthorizedError, type Tool, type CallToolResult } from '@modelcontextprotocol/client';
 import { StdioClientTransport } from '@modelcontextprotocol/client/stdio';
 import { AjvJsonSchemaValidator } from '@modelcontextprotocol/client/validators/ajv';
 import { getMcpConfigForManifest, vAny } from '@anthropic-ai/mcpb/browser';
@@ -1175,6 +1175,9 @@ export class PluginManager {
       if (result.isError) onOutcome?.('tool_execution_error');
       return this.redactResult(result);
     } catch (error) {
+      // A request deadline cancels only this call; the transport remains usable.
+      if (error instanceof SdkError && error.code === SdkErrorCode.RequestTimeout)
+        return errorResult('PLUGIN_CALL_TIMEOUT: The call timed out or was cancelled. The operation may have completed; inspect its state before retrying. Web GPT Agent did not retry.', 'tool_execution_error', true);
       // A failed/ambiguous call must not leave a broken process running idle.
       if (this.live.get(row.id) === live && this.records.includes(row)) {
         const needsAuth = error instanceof PluginNeedsAuth || error instanceof UnauthorizedError;
