@@ -1837,8 +1837,9 @@ var CLF_DOM = (() => {
       const sections = turnNodes(turn);
       if (!sections.length) return false;
       for (const section of sections) {
-        if (replaced) section.setAttribute('data-clf-turn-replaced', '1');
-        else section.removeAttribute('data-clf-turn-replaced');
+        if (replaced) {
+          if (section.getAttribute('data-clf-turn-replaced') !== '1') section.setAttribute('data-clf-turn-replaced', '1');
+        } else if (section.hasAttribute('data-clf-turn-replaced')) section.removeAttribute('data-clf-turn-replaced');
       }
       if (replaced && root) {
         const anchor = placement && placement.anchor;
