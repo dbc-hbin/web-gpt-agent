@@ -2,6 +2,8 @@ import { beforeEach, afterEach, expect, it, vi } from 'vitest';
 import { JSDOM } from 'jsdom';
 import { invokedSkills } from '../src/shared/skill-invocation.js';
 import type { LibrarySkill, SkillLibrary } from '../src/shared/skills.js';
+import { skillCompletion } from '../src/renderer/skills.js';
+import type { ProjectDirectoryListing } from '../src/shared/project-files.js';
 
 let dom: JSDOM;
 beforeEach(() => {
@@ -20,17 +22,26 @@ async function fixture() {
   const button = document.getElementById('skills')!;
   const host = document.getElementById('picker')!;
   let owner = 'a:1';
+  let projectId: string | null = 'project-a';
   const drafts = new Map<string, string>();
   const key = () => owner.split(':')[0]!;
   const list = vi.fn(async () => ({ ok: true as const, data: library() }));
+  const listFiles = vi.fn(async (id: string, directory: string): Promise<ProjectDirectoryListing> => ({
+    projectId: id, projectName: 'Project', directory,
+    entries: directory ? [{ name: 'main.ts', path: `${directory}/main.ts`, kind: 'file', bytes: 20 }] : [
+      { name: 'src', path: 'src', kind: 'directory', bytes: null },
+      { name: 'README.md', path: 'README.md', kind: 'file', bytes: 20 }
+    ], truncated: false
+  }));
   const command = vi.fn();
   const picker = initSkills({ input, host, selectedHost: document.getElementById('selected')!, owner: () => owner,
     openButton: button, addButton: document.getElementById('add')!,
-    scope: () => ({ sessionId: key() }), draft: () => drafts.get(key()), saveDraft: text => drafts.set(key(), text), list });
+    scope: () => ({ sessionId: key(), projectId }), draft: () => drafts.get(key()), saveDraft: text => drafts.set(key(), text), list, listFiles });
   const type = (value: string) => { input.value = value; input.setSelectionRange(value.length, value.length); input.dispatchEvent(new Event('input')); };
   const press = (value: string) => picker.keydown(new dom.window.KeyboardEvent('keydown', { key: value, cancelable: true }));
   const replace = (value: string) => { drafts.set(key(), value); input.value = value; picker.restore(); };
-  return { input, button, host, list, command, picker, type, key: press, replace,
+  return { input, button, host, list, listFiles, command, picker, type, key: press, replace,
+    project: (value: string | null) => { projectId = value; },
     owner: (value: string) => { owner = value; input.value = drafts.get(key()) ?? ''; picker.restore(); } };
 }
 const settle = async () => { await new Promise(resolve => setTimeout(resolve, 0)); };
@@ -41,6 +52,65 @@ it('parses only leading commands, supports /prompt, and deduplicates without con
   expect(invokedSkills('```\n/review\n```')).toEqual([]);
   expect(invokedSkills('/project/file.md')).toEqual([]);
   expect(() => invokedSkills('/prompt')).toThrow(/Choose/);
+});
+
+it('keeps leading slash commands literal while offering safe file references', () => {
+  expect(skillCompletion('/project/file.md', '/project/file.md'.length)).toBeNull();
+  expect(skillCompletion('Use /review', 'Use /review'.length)).toBeNull();
+  expect(skillCompletion('Use @src/ma', 'Use @src/ma'.length)).toMatchObject({ kind: 'file', directory: 'src', query: 'ma' });
+  expect(skillCompletion('Contact @alice@example.com', 'Contact @alice@example.com'.length)).toBeNull();
+  expect(skillCompletion('Read [file](@src', 'Read [file](@src'.length)).toBeNull();
+});
+
+it('offers file references after a closed fenced code block', () => {
+  const text = '```\ncode\n```\nRead @src/ma';
+  expect(skillCompletion(text, text.length)).toMatchObject({ kind: 'file', directory: 'src', query: 'ma' });
+});
+
+it('finds references in linear time after a long escaped prefix', () => {
+  const pasted = 'x ' + '@\\ '.repeat(12_000) + 'x y';
+  const startedAt = performance.now();
+  expect(skillCompletion(pasted, pasted.length)).toBeNull();
+  const reference = `${pasted}\nsee @src/ma`;
+  expect(skillCompletion(reference, reference.length)).toMatchObject({ kind: 'file', directory: 'src', query: 'ma' });
+  expect(performance.now() - startedAt).toBeLessThan(1000);
+});
+
+it('inserts project files and directories without changing the authored draft', async () => {
+  const f = await fixture();
+  f.type('Inspect @'); await settle();
+  expect(f.listFiles).toHaveBeenLastCalledWith('project-a', '');
+  (f.host.querySelector('[data-file-path="src"]') as HTMLButtonElement).click(); await settle();
+  expect(f.input.value).toBe('Inspect @src/');
+  expect(f.listFiles).toHaveBeenLastCalledWith('project-a', 'src');
+  (f.host.querySelector('[data-file-path="src/main.ts"]') as HTMLButtonElement).click(); await settle();
+  expect(f.input.value).toBe('Inspect @src/main.ts ');
+  expect(f.picker.authoredText()).toBe('Inspect @src/main.ts ');
+  expect(f.key('Enter')).toBe(false);
+});
+
+it('discards stale project listings after the composer changes projects', async () => {
+  const f = await fixture();
+  let resolveOld!: (listing: ProjectDirectoryListing) => void;
+  f.listFiles.mockImplementationOnce((_id, _directory) => new Promise(resolve => { resolveOld = resolve; }));
+  f.type('@');
+  f.project('project-b'); f.type('@'); await settle();
+  resolveOld({ projectId: 'project-a', projectName: 'Old project', directory: '', truncated: false,
+    entries: [{ name: 'old.txt', path: 'old.txt', kind: 'file', bytes: 1 }] });
+  await settle();
+  expect(f.listFiles).toHaveBeenLastCalledWith('project-b', '');
+  expect(f.host.querySelector('[data-file-path="old.txt"]')).toBeNull();
+  expect(f.host.querySelector('[data-file-path="src"]')).not.toBeNull();
+});
+
+it('does not claim a truncated project listing is empty', async () => {
+  const f = await fixture();
+  f.listFiles.mockResolvedValueOnce({
+    projectId: 'project-a', projectName: 'Project', directory: '', truncated: true,
+    entries: [],
+  });
+  f.type('@'); await settle();
+  expect(f.host.textContent).toContain('More files are not shown');
 });
 
 it('projects /prompt completion into chips while preserving the existing authored draft', async () => {

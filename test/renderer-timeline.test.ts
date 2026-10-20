@@ -1186,6 +1186,29 @@ it('shows five project chats initially and reveals eight more per click', async 
   await append([]);
   expect(section().querySelectorAll(':scope > .sess')).toHaveLength(22);
 });
+it('does not allocate hidden project rows during an activity refresh', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Busy project', path: '/project', createdAt: 1 };
+  const tasks = Array.from({ length: 240 }, (_, index): SessionSummary => ({
+    ...summary([]), id: `task-${index}`, conversationId: `chat-${index}`,
+    title: `Task ${index}`, projectId: project.id
+  }));
+  const { w, append } = await boot([], false, [], [project], { sessions: tasks });
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+  expect(w.document.querySelector<HTMLElement>('.project-group .sess')?.tabIndex).toBe(0);
+  expect(w.document.querySelector<HTMLElement>('.project-group .sess')?.dataset.sortScope).toBe(project.id);
+
+  const created: Element[] = [];
+  const create = w.document.createElement.bind(w.document);
+  const spy = vi.spyOn(w.document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
+    const node = create(tag, options);
+    created.push(node);
+    return node;
+  }) as typeof w.document.createElement);
+  try { await append([]); }
+  finally { spy.mockRestore(); }
+  expect(created.filter(node => node.classList.contains('sess'))).toHaveLength(5);
+  expect(w.document.querySelectorAll('.project-group .sess')).toHaveLength(5);
+});
 
 it('shows original user text while retaining transport instructions outside the visible bubble', async () => {
   const { w } = await boot([{ seq: 1, time: T0, source: 'app', kind: 'user_message', messageId: 'native-one', inputId: 'one', authoredText: 'hello', message: text('hello\n\nTransport-only control instruction') }]);

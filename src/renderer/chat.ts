@@ -633,7 +633,9 @@ function paintSessions(): void {
   }
   const rows: HTMLElement[] = [];
   // A task and its expanded workers are one sidebar item for project pagination.
-  const projectRows = new Map<string, Array<{ rows: HTMLElement[]; selected: boolean }>>();
+  // Keep session summaries until the visible project page is known. Older project
+  // rows are not part of the DOM and should not be built on each activity refresh.
+  const projectRows = new Map<string, Array<{ entry: SessionSummary; workers?: SessionSummary[]; selected: boolean }>>();
   const diagnostics: SessionSummary[] = [];
   const group = (key: string, workers: SessionSummary[], parentRow?: HTMLElement, target = rows): void => {
     const button = el('button', 'worker-toggle');
@@ -645,22 +647,32 @@ function paintSessions(): void {
     if (parentRow) { parentRow.append(button); parentRow.title += ` · ${button.title}`; } else target.push(button);
     if (expandedWorkers.has(key)) { const box = el('div', 'worker-group'); box.append(...workers.map(sessionRow)); target.push(box); }
   };
-  const orderedSessions = sidebarOrder
-    ? [...new Set(sessions.map(entry => projectGroup(entry.projectId) ?? ''))].flatMap(scope =>
-      sidebarOrder!.ordered(scope, sessions.filter(entry => (projectGroup(entry.projectId) ?? '') === scope)))
-    : sessions;
+  // Resolve project membership once for this paint. Repeated project catalog lookups
+  // multiplied work while a busy chat refreshed the sidebar.
+  const ungrouped = new Set(projects.filter(project => project.ungrouped).map(project => project.id));
+  const groupOf = (id: string | null | undefined): string | null => id && !ungrouped.has(id) ? id : null;
+  const scoped = new Map<string, SessionSummary[]>();
+  for (const entry of sessions) {
+    const scope = groupOf(entry.projectId) ?? '';
+    const group = scoped.get(scope);
+    if (group) group.push(entry);
+    else scoped.set(scope, [entry]);
+  }
+  const orderedSessions = [...scoped].flatMap(([scope, members]) =>
+    sidebarOrder ? sidebarOrder.ordered(scope, members) : members);
   for (const entry of orderedSessions) {
     if (entry.origin?.kind === 'worker') continue;
     if (!entry.conversationId && entry.origin?.kind !== 'desktop') { diagnostics.push(entry); continue; }
-    const projectId = projectGroup(entry.projectId);
-    const target: HTMLElement[] = projectId ? [] : rows;
-    const row = sessionRow(entry); target.push(row);
-    row.dataset.sortScope = projectId ?? ''; row.tabIndex = 0;
-    const workers = children.get(entry.id); if (workers) group(entry.id, workers, row, target);
+    const projectId = groupOf(entry.projectId);
+    const workers = children.get(entry.id);
     if (projectId) {
       const tasks = projectRows.get(projectId) ?? [];
-      tasks.push({ rows: target, selected: entry.id === selectedId || workers?.some(worker => worker.id === selectedId) === true });
+      tasks.push({ entry, workers, selected: entry.id === selectedId || workers?.some(worker => worker.id === selectedId) === true });
       projectRows.set(projectId, tasks);
+    } else {
+      const row = sessionRow(entry); rows.push(row);
+      row.dataset.sortScope = ''; row.tabIndex = 0;
+      if (workers) group(entry.id, workers, row, rows);
     }
   }
   const otherWorkers = children.get('other-workers') ?? [];
@@ -734,7 +746,14 @@ function paintSessions(): void {
     const tasks = projectRows.get(id) ?? [];
     const count = projectVisibleCounts.get(id) ?? PROJECT_TASK_PAGE_SIZE;
     const shown = tasks.filter((task, index) => index < count || task.selected);
-    section.append(...shown.flatMap(task => task.rows));
+    const shownRows: HTMLElement[] = [];
+    for (const task of shown) {
+      const row = sessionRow(task.entry);
+      row.dataset.sortScope = id; row.tabIndex = 0;
+      shownRows.push(row);
+      if (task.workers) group(task.entry.id, task.workers, row, shownRows);
+    }
+    section.append(...shownRows);
     if (shown.length < tasks.length) {
       const more = el('button', 'btn project-show-more', () => t("Show more")) as HTMLButtonElement;
       more.type = 'button'; ui(more, 'aria-label', () => t("Show more tasks in {0}", [project?.name ?? t("this project")]));
@@ -4184,7 +4203,13 @@ export function initChat(next: Deps): void {
     selectedHost: $('composerSelectedSkills'), owner: () => `${draftKey()}:${composerDraftGeneration}`,
     scope: () => ({ sessionId: selectedId, projectId: selectedLocalProject()?.id ?? selectedProjectId }),
     draft: () => inputDrafts.get(draftKey()), saveDraft: text => inputDrafts.set(draftKey(), text),
-    list: scope => api.skillLibrary(scope), command: name => {
+    list: scope => api.skillLibrary(scope),
+    listFiles: async (projectId, directory) => {
+      const result = await api.listProjectFiles(projectId, directory);
+      if (!result.ok) throw new Error(result.error);
+      return result.data;
+    },
+    command: name => {
       if (name === 'plan') { $('createPlan').click(); return; }
       if (name === 'compact') { $('compactSession').click(); return; }
       const automation = $<HTMLSelectElement>('chatAutomation'); automation.value = name;
