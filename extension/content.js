@@ -10903,7 +10903,10 @@
     // New chats can receive their stream id before /c/<id>. The existing observer
     // drains a bounded set when that exact route appears; navigation retires it.
     for (const requestId of requestIds) {
-      if (requestOwnersConfirmed.get(requestId) === claimed || pendingStreamOrigins.has(requestId) || pendingStreamOrigins.size >= 16) continue;
+      if (requestOwnersConfirmed.get(requestId) === claimed || pendingStreamOrigins.has(requestId)) continue;
+      // Sixteen at most. The newest is the turn running now; an old one the app could not place
+      // yet gives way instead of the current turn's id being dropped.
+      if (pendingStreamOrigins.size >= 16) pendingStreamOrigins.delete(pendingStreamOrigins.keys().next().value);
       pendingStreamOrigins.set(requestId, { conversationId: claimed, observedAt, epoch, deadline: Date.now() + 15 * 60_000 });
     }
     flushStreamRequestOrigins();

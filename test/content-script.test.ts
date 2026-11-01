@@ -10298,6 +10298,23 @@ describe('evidence from the page context', () => {
     expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({ requestId: null, trace: [] });
   });
 
+  it('still reports the newest stream request when sixteen older ones wait unconfirmed', async () => {
+    // Upstream #1865: the current turn's id must evict the oldest pending id, not be dropped.
+    const page = live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    page.reply.set('correlate', () => ({ ok: true, status: 200, data: { ok: true, conversationId, confirmed: [], complete: false } }));
+    const origin = (requestId: string) => page.window.dispatchEvent(new page.window.MessageEvent('message', {
+      source: page.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-request-origin', conversationId, requestIds: [requestId], observedAt: 1_700_000_001_000 }
+    }));
+    for (let i = 0; i < 16; i++) { origin(`wfr_waiting_${i}`); await settle(); }
+    origin('wfr_current_turn');
+    await settle();
+    const asked = page.sent.filter((message) => message.type === 'correlate')
+      .flatMap((message) => message.calls.map((call: { requestId: string }) => call.requestId));
+    expect(asked).toContain('wfr_current_turn');
+  });
+
   it('keeps a fresh-chat stream identity until the address bar publishes its exact route', async () => {
     live = await harness('https://chatgpt.com/?cos-input=aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee');
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';

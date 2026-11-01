@@ -231,12 +231,19 @@ describe('MAIN-world usage projection', () => {
     h.hide(); h.request();
     expect(h.posts).toHaveLength(2);
   });
-  it('bounds concurrent response clones and releases them on page exit', async () => {
+  it('bounds concurrent response clones, reads the newest by letting go of the oldest, and releases them on page exit', async () => {
+    // Upstream #1865: two earlier responses that stay open must not blind the reader to the
+    // current turn's request; the newest response is the live one.
     const h = harness();
     const a = await h.openSse(), b = await h.openSse(), c = await h.openSse();
-    expect([a.clones, b.clones, c.clones]).toEqual([1, 1, 0]);
+    expect([a.clones, b.clones, c.clones]).toEqual([1, 1, 1]);
+    expect([a.cancelled, b.cancelled, c.cancelled]).toEqual([true, false, false]);
+    const conversationId = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    c.push({ conversation_id: conversationId, metadata: { request_id: 'wfr_newest_turn' } });
+    await Promise.resolve(); await Promise.resolve();
+    expect(h.posts).toContainEqual({ type: 'cos-request-origin', conversationId, requestIds: ['wfr_newest_turn'], observedAt: expect.any(Number) });
     h.hide();
-    expect(a.cancelled && b.cancelled).toBe(true);
+    expect(b.cancelled && c.cancelled).toBe(true);
   });
   it('retains supported model counts without requiring a reset timestamp', async () => {
     const h = harness();
