@@ -4393,7 +4393,11 @@
 
         const message = item.value;
         if (message.role === 'user') {
-          if (!message.createTime && !message.attachments?.length && renderedUserTexts.get(message.messageId) === message.rawText) continue;
+          // The DOM pass reports a question the page shows as written, but not where it sits in
+          // ChatGPT's message tree: only this report carries that, so a question whose place is not
+          // reported yet goes out from here too. The occurrence key below keeps it once.
+          if (!message.createTime && !message.attachments?.length && renderedUserTexts.get(message.messageId) === message.rawText &&
+            !message.parentId) continue;
           // The tree place is part of the occurrence: ChatGPT shows its versions control only once a
           // second version exists, so an edit re-emits the question it replaced.
           const key = occurrenceKey(message.messageId, message.rawText + (message.attachments?.length ? JSON.stringify(message.attachments) : '') +

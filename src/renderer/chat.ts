@@ -1013,6 +1013,9 @@ function dockAction(label: string | (() => string), symbol: string, click: (even
 function paintEditNotice(): void {
   const notice = $('editDraft');
   const editing = editingQuestion && !newChatSelected && selectedId === editingQuestion.sessionId ? editingQuestion : null;
+  // The question being edited is marked in the chat, so an earlier one is easy to find.
+  for (const row of $('timeline').querySelectorAll<HTMLElement>('.ev-user_message[data-question-id]'))
+    row.classList.toggle('is-being-edited', row.dataset.questionId === editing?.messageId);
   notice.hidden = !editing;
   if (!editing) { delete notice.dataset.editFor; notice.replaceChildren(); return; }
   if (notice.dataset.editFor === `${editing.messageId}:${editing.later}`) return;
@@ -2865,7 +2868,11 @@ function paintDetail(followBottom = historyBefore === null): void {
     }
     const row = item.kind === 'compaction' ? compactionRow(item.block, cached?.row)
       : item.kind === 'earlier' ? earlierVersionsRow(item.fold, key) : eventRow(item.event);
-    if (item.kind === 'event' && editableQuestion(item.event, events)) row.querySelector('.ev-body')?.append(questionActions(item.event, laterMessages.get(item.event.seq) ?? 0));
+    if (item.kind === 'event' && editableQuestion(item.event, events)) {
+      row.querySelector('.ev-body')?.append(questionActions(item.event, laterMessages.get(item.event.seq) ?? 0));
+      row.dataset.questionId = item.event.messageId;
+      row.classList.toggle('is-being-edited', editingQuestion?.sessionId === selectedId && editingQuestion?.messageId === item.event.messageId);
+    }
     row.dataset.timelineKey = key;
     row.dataset.activityBoundary = activityBoundary;
     paintInputReceipt(row, item);
