@@ -258,6 +258,34 @@ describe('request correlation ownership', () => {
     }
   });
 
+  it('joins a UUID request id whose version digit differs, across a restart and a legacy row', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-uuid-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(dir);
+      const page = '93ff44d2-cfea-4f32-8ea7-7a991c9cfe49', call = '93FF44D2-cfea-9f32-8ea7-7a991c9cfe49';
+      observeRequestCorrelation({ requestId: page, conversationId: 'conv-a', sessionId: 'session-a',
+        messageId: 'msg-a', tool: 'read', observedAt: 1 });
+      expect(requestCorrelation(call)?.conversationId).toBe('conv-a');
+      // Another digit outside the version slot is another request.
+      expect(requestCorrelation('93ff44d2-cfea-4f32-8ea7-7a991c9cfe48')).toBeNull();
+      resetCorrelationRegistryForTests();
+      expect(requestCorrelation(call)?.conversationId).toBe('conv-a');
+      // A row an earlier version stored under its exact id is still found by that id.
+      const legacy = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+      const db = new DatabaseSync(path.join(dir, 'state', 'request-correlations.sqlite'));
+      db.prepare('INSERT INTO request_owners(request_id,payload) VALUES (?,?)').run(legacy, JSON.stringify({
+        requestId: legacy, conversationId: 'conv-legacy', sessionId: 'session-legacy', messageId: 'msg-l', tool: '', observedAt: 2 }));
+      db.close();
+      resetCorrelationRegistryForTests();
+      expect(requestCorrelation(legacy)?.conversationId).toBe('conv-legacy');
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('restores proven request ownership from durable state after an app restart', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-'));
     try {

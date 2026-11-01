@@ -70,6 +70,7 @@ import {
 } from './store.js';
 import {
   awaitRequestCorrelation,
+  joinKey,
   observeRequestCorrelations,
   requestCorrelation,
   resetCorrelationRegistryForTests,
@@ -907,7 +908,7 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
     if (summary.conversationId !== null || summary.title !== 'Unattributed activity') continue;
     const cached = repairBuckets.get(summary.id);
     if (affected && cached?.toolCalls === summary.toolCalls && cached.updatedAt === summary.updatedAt &&
-        ![...affected].some((id) => cached.requestIds.has(id))) continue;
+        ![...affected].some((id) => cached.requestIds.has(joinKey(id)))) continue;
     const events = await readEvents(summary.id);
     const scannedThroughSeq = events.reduce((highest, event) => Math.max(highest, event.seq), 0);
     const tools = events.filter(
@@ -915,7 +916,7 @@ export async function repairDeterministicAttribution(affected?: ReadonlySet<stri
     );
     const requestIds = new Set<string>();
     for (const event of tools) {
-      if (event.call.requestId) requestIds.add(event.call.requestId);
+      if (event.call.requestId) requestIds.add(joinKey(event.call.requestId));
       if (requestIds.size > MAX_REPAIR_REQUEST_IDS) break;
     }
     repairBuckets.delete(summary.id);

@@ -102,10 +102,22 @@ interface PersistedCorrelations {
   entries: RequestCorrelation[];
 }
 
-function wake(requestId: string): void {
-  const held = waiters.get(requestId);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * The key a request id is joined and stored under. ChatGPT can report a tool call's request
+ * id with a different UUID version digit than the page's message metadata (upstream #1752:
+ * 93ff44d2-cfea-4f32-... on the page, 93ff44d2-cfea-9f32-... on the calls). The other 31 hex
+ * digits are random, so they still name exactly one request. The version slot becomes `x`,
+ * which no hex id contains; other ids are keyed as written.
+ */
+export function joinKey(requestId: string): string {
+  return UUID.test(requestId) ? `${requestId.slice(0, 14)}x${requestId.slice(15)}`.toLowerCase() : requestId;
+}
+
+function wake(key: string): void {
+  const held = waiters.get(key);
   if (!held) return;
-  waiters.delete(requestId);
+  waiters.delete(key);
   for (const resolve of held) resolve();
 }
 
@@ -174,14 +186,16 @@ export function closeCorrelationStore(): void {
 
 function lookup(requestId: string): RequestCorrelation | null {
   ownershipDatabase();
-  const cached = byRequest.get(requestId);
+  const key = joinKey(requestId);
+  const cached = byRequest.get(key);
   if (cached) return cached;
-  const row = selectOwner?.get(requestId);
+  // Rows written before joinKey are stored under their exact id.
+  const row = selectOwner?.get(key) ?? (key === requestId ? undefined : selectOwner?.get(requestId));
   if (!row) return null;
   if (typeof row.payload !== 'string') throw new Error('Invalid request ownership row');
   const owner = storedOwner(JSON.parse(row.payload));
-  if (!owner || owner.requestId !== requestId) throw new Error('Invalid request ownership proof');
-  byRequest.set(requestId, owner);
+  if (!owner || joinKey(owner.requestId) !== key) throw new Error('Invalid request ownership proof');
+  byRequest.set(key, owner);
   trim();
   return owner;
 }
@@ -262,13 +276,14 @@ function merge(input: RequestCorrelation): 'stored' | 'same' | 'refused' {
   else if (owner.questionId && input.questionId && owner.questionId !== input.questionId) owner.questionConflict = true;
   owner.observedAt = Math.max(owner.observedAt, input.observedAt);
   if (!previous || proofChanged || owner.observedAt !== previous.observedAt) {
-    saveOwner?.run(owner.requestId, JSON.stringify(owner));
-    byRequest.delete(owner.requestId);
-    byRequest.set(owner.requestId, owner);
+    const key = joinKey(owner.requestId);
+    saveOwner?.run(key, JSON.stringify(owner));
+    byRequest.delete(key);
+    byRequest.set(key, owner);
     trim();
-    if (!previous) evidenceWindowStarts.delete(owner.requestId);
-    changedOwners.set(owner.requestId, { owner, proofChanged: proofChanged ||
-      Boolean(!previous && owner.questionId) || changedOwners.get(owner.requestId)?.proofChanged === true });
+    if (!previous) evidenceWindowStarts.delete(key);
+    changedOwners.set(key, { owner, proofChanged: proofChanged ||
+      Boolean(!previous && owner.questionId) || changedOwners.get(key)?.proofChanged === true });
   }
   return previous ? 'same' : 'stored';
 }
@@ -284,7 +299,7 @@ function mergeBatch(inputs: readonly RequestCorrelation[]): Array<'stored' | 'sa
     const changes = [...changedOwners.values()];
     changedOwners.clear();
     for (const { owner, proofChanged } of changes) {
-      wake(owner.requestId);
+      wake(joinKey(owner.requestId));
       if (proofChanged) notifyProof(owner);
     }
     return results;
@@ -419,7 +434,7 @@ export function requestCorrelation(requestId: string | null | undefined): Reques
 }
 
 /**
- * Waits only for this exact id. Late Fiber evidence is allowed; no other request or page
+ * Waits only for this request (see joinKey). Late Fiber evidence is allowed; no other request or page
  * state can wake this into a successful ownership decision.
  */
 export async function awaitRequestCorrelation(requestId: string | null | undefined, timeoutMs: number): Promise<RequestCorrelation | null> {
@@ -428,9 +443,10 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
   if (immediate || timeoutMs <= 0) return immediate;
 
   const now = performance.now();
-  const startedAt = evidenceWindowStarts.get(requestId) ?? now;
-  if (!evidenceWindowStarts.has(requestId)) {
-    evidenceWindowStarts.set(requestId, startedAt);
+  const key = joinKey(requestId);
+  const startedAt = evidenceWindowStarts.get(key) ?? now;
+  if (!evidenceWindowStarts.has(key)) {
+    evidenceWindowStarts.set(key, startedAt);
     if (evidenceWindowStarts.size > MAX_EVIDENCE_WINDOWS) {
       evidenceWindowStarts.delete(evidenceWindowStarts.keys().next().value!);
     }
@@ -440,12 +456,12 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
 
   let timer: NodeJS.Timeout | null = null;
   await new Promise<void>((resolve) => {
-    const set = waiters.get(requestId) ?? new Set<() => void>();
+    const set = waiters.get(key) ?? new Set<() => void>();
     set.add(resolve);
-    waiters.set(requestId, set);
+    waiters.set(key, set);
     timer = setTimeout(() => {
       set.delete(resolve);
-      if (set.size === 0) waiters.delete(requestId);
+      if (set.size === 0) waiters.delete(key);
       resolve();
     }, remainingMs);
     timer.unref?.();
@@ -462,5 +478,5 @@ export function resetCorrelationRegistryForTests(): void {
   evidenceWindowStarts.clear();
   restored = false;
   restoring = null;
-  for (const requestId of [...waiters.keys()]) wake(requestId);
+  for (const key of [...waiters.keys()]) wake(key);
 }
