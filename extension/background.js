@@ -3060,6 +3060,15 @@ const HANDLERS = {
     if (body.length > 24000) return { ok: false };
     return call('/usage', { method: 'POST', body });
   },
+  /** A ChatGPT announcement the page closed (CLF_DOM.dismissAnnouncements), for one app log line. */
+  async page_note(message) {
+    if (message?.note !== 'announcement-closed') return { ok: false };
+    const heading = typeof message.heading === 'string' ? message.heading.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+    // Best effort, and never in the tab's queue: a claim or receipt behind it must not wait on a log line.
+    void call('/page-note', { method: 'POST',
+      body: JSON.stringify({ note: 'announcement-closed', heading, conversationId: cleanConversationId(message.conversationId) }) }).catch(() => undefined);
+    return { ok: true };
+  },
   async desktop_input(message, sender, source) {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const id = String(message.id || '');
@@ -4101,6 +4110,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'stop_redeem',
     'stop_ack',
     'desktop_input',
+    'page_note',
     'model_catalog',
     'plugin_refresh',
     'usage_observation',

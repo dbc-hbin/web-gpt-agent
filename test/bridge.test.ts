@@ -1393,6 +1393,26 @@ describe('work continuity over the bridge', () => {
 // ------------------------------------------------------------------ events
 
 describe('observations', () => {
+  it('logs a ChatGPT announcement a page closed, once a minute per chat and heading, and refuses any other note', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      await pair();
+      const chat = 'f0f00003-1111-4111-8111-11111111111a';
+      const lines = () => getLog().filter(entry => entry.message.includes("closed ChatGPT's announcement")).map(entry => entry.message);
+      const before = lines().length;
+      const note = (body: unknown) => request('POST', '/page-note', { body });
+      expect((await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat })).body).toEqual({ ok: true });
+      expect((await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat })).body).toEqual({ ok: true });
+      expect(lines().slice(before)).toEqual([`bridge: the page of ${chat} closed ChatGPT's announcement "Premium seats just got better" that covered it, by Escape`]);
+      vi.setSystemTime(Date.now() + 60_000);
+      await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat });
+      // No quotes or control characters from the page reach the log line.
+      await note({ note: 'announcement-closed', heading: 'A "new"\nfeature', conversationId: null });
+      expect(lines().slice(before)).toHaveLength(3);
+      expect(lines().at(-1)).toBe('bridge: a ChatGPT page closed ChatGPT\'s announcement "A new feature" that covered it, by Escape');
+      expect((await note({ note: 'something-else' })).status).toBe(400);
+    } finally { vi.useRealTimers(); }
+  });
   it('persists bounded native reactions on the exact canonical user message and preserves sparse replays', async () => {
     await pair();
     const conversationId = 'f0f00003-1111-4111-8111-111111111119';

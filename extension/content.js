@@ -10293,6 +10293,30 @@
    */
   let commandJournalGate = false;
 
+  /** The chat whose history ChatGPT last limited on this page, and when; see closeAnnouncements. */
+  let historyLimitSeen = null;
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) && CLF_DOM.conversationId() === claimed)
+      historyLimitSeen = { conversationId: claimed, at: Date.now() };
+  });
+  /**
+   * Closes ChatGPT announcements over this page (CLF_DOM.dismissAnnouncements) and tells the app which.
+   * Not on a chat whose history ChatGPT limited in the last 10 minutes: its access-limit notice is a
+   * dialog like any other, recognized by wording in only some languages, and must stay for the person.
+   */
+  async function closeAnnouncements(stillCurrent = () => true) {
+    const chat = CLF_DOM.conversationId();
+    if (historyLimitSeen && historyLimitSeen.conversationId === chat && Date.now() - historyLimitSeen.at < 10 * 60_000) return [];
+    const closed = await CLF_DOM.dismissAnnouncements(stillCurrent).catch(() => []);
+    // Reported for the chat it was closed on; a page that moved on meanwhile says nothing.
+    if (stillCurrent() && CLF_DOM.conversationId() === chat) {
+      for (const heading of closed) void ask({ type: 'page_note', note: 'announcement-closed', heading, conversationId: chat }).catch(() => undefined);
+    }
+    return closed;
+  }
+
   /**
    * Waits for ChatGPT to expose a connected composer without putting bootstrap delivery
    * behind a chain of timer samples.
@@ -10523,11 +10547,18 @@
     // The composer is the readiness signal. Page-level `readyState` says whether every
     // resource finished loading, not whether this editing host is usable, and waiting on it
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
-    const readyComposer = await waitForComposer();
+    // A ChatGPT announcement over the fresh page hides the message box behind its modal.
+    if (!CLF_DOM.composerVisible()) await closeAnnouncements(stillOnTarget);
+    let readyComposer = await waitForComposer();
+    // One that opened after the page loaded gets the same treatment, once.
+    if (!readyComposer && (await closeAnnouncements(stillOnTarget)).length) readyComposer = await waitForComposer(5_000);
     if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
     if (await failIfRetargeted()) return;
 
-    if ((boot.model || boot.reasoningEffort) && !(await CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget))) {
+    // An announcement that opened over the picker refuses the choice; closing it earns one more try.
+    const chooseModel = () => CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget);
+    if ((boot.model || boot.reasoningEffort) && !(await chooseModel()) &&
+        !((await closeAnnouncements(stillOnTarget)).length && stillOnTarget() && await chooseModel())) {
       return void (await fail('The requested model or reasoning is unavailable or could not be confirmed in ChatGPT'));
     }
     const selectionConfirmedAt = Date.now();
@@ -11146,6 +11177,8 @@
       // Settings/plan dialogs retain the editor behind aria-hidden/inert. Claiming
       // that editor turns ordinary page unavailability into a false model failure.
       // Keep the input queued until this same document exposes its composer again.
+      // An announcement is not a dialog the person is using: close it so the message is not held behind it.
+      if (!CLF_DOM.composerVisible()) await closeAnnouncements(onTarget);
       const composer = await waitPageView(() => (message.directTurn || !CLF_DOM.generating()) && CLF_DOM.composerVisible() && CLF_DOM.composer(),
         () => onTarget() && (message.directTurn || silencePickup || !generating) && pendingTools === 0, 15000);
       if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {

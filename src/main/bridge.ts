@@ -584,6 +584,8 @@ const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
 let versionWarned = false;
 let latestCompanionDiagnostics: CompanionDiagnostics | null = null;
+/** When each page note was last logged, by chat and heading (see `/page-note`). */
+const pageNotesLogged = new Map<string, number>();
 let companionDiagnosticsRevision = 0;
 const companionDiagnosticsWaiters = new Set<() => void>();
 
@@ -2606,6 +2608,31 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       observeUsage(body?.rows, body?.observedAt);
       return json(res, 200, { ok: true }, origin);
     } catch { return json(res, 400, { error: 'invalid_usage' }, origin); }
+  }
+
+  // A ChatGPT announcement a page closed before it could use its message box. Only the dialog's
+  // heading, ChatGPT's own words, is logged; once a minute per chat and heading.
+  if (route === '/page-note' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (body?.['note'] !== 'announcement-closed') return json(res, 400, { error: 'bad_request' }, origin);
+    const heading = typeof body['heading'] === 'string'
+      ? body['heading'].replace(/[\u0000-\u001f\u007f"]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+    const chat = conversationId(body['conversationId']);
+    const key = `${chat ?? ''}|${heading}`;
+    const now = Date.now();
+    if (now - (pageNotesLogged.get(key) ?? 0) >= 60_000) {
+      pageNotesLogged.set(key, now);
+      if (pageNotesLogged.size > 200) pageNotesLogged.delete(pageNotesLogged.keys().next().value!);
+      logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} closed ChatGPT's announcement` +
+        `${heading ? ` "${heading}"` : ''} that covered it, by Escape`);
+    }
+    return json(res, 200, { ok: true }, origin);
   }
 
   /**
@@ -9714,6 +9741,7 @@ export async function restoreCommands(): Promise<void> {
 /** Test seam. */
 export function resetBridgeForTests(): void {
   clearCompanionDiagnostics();
+  pageNotesLogged.clear();
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;

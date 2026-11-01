@@ -1034,7 +1034,20 @@ or fresh-chat ownership. New-chat reuse requires a visible composer before elect
 native preparation; unavailable surfaces are skipped so the first send can open one clean chat.
 A failed native preparation can grant the existing pre-send fallback, before marking readiness.
 Before claiming an input it waits for a visible composer; a mounted
-editor hidden behind a dialog leaves the input queued in its elected tab. It confirms
+editor hidden behind a dialog leaves the input queued in its elected tab. ChatGPT announcements
+over a page are the exception: `CLF_DOM.dismissAnnouncements` gives a visible `[role="dialog"]`
+the extension did not open, that is not an access-limit notice `errors()` reads, the model picker
+or the Temporary Chat introduction, and has nothing to type into (no text input, textarea, select,
+contenteditable, textbox, combobox or searchbox), one synthetic Escape; no button in it is pressed.
+Bootstrap runs it before waiting for the composer, again once if no composer appeared, and once
+before retrying a refused model choice; queued input runs it before its visible-composer wait.
+None of this runs while the composer is visible, nor for 10 minutes on a chat whose history the
+page saw limited (`cos-history-rate-limit`; the access-limit notice is a dialog too, recognized by
+wording in only some languages). Each closed dialog is reported, only while the page is still on
+the chat it was closed on, as the owned message `page_note` `{ note: 'announcement-closed', heading,
+conversationId }`; the worker answers at once and posts `POST /page-note` outside the tab's queue,
+which logs ChatGPT's heading (≤ 80 characters, no quotes or control characters) at most once a
+minute per chat and heading. A dialog with a field (Settings, Rename, a form) keeps holding input. It confirms
 model/effort, inserts the full text, uploads native files,
 rechecks composer and attachment nodes, crosses app authorization, then **rechecks again after
 every await before Send**. Native stable user-message and conversation identity establish

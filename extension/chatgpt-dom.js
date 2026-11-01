@@ -2548,6 +2548,40 @@ var CLF_DOM = (() => {
     });
   }
 
+  /**
+   * ChatGPT's own announcements over a page (upstream #1939: "Premium seats just got better" over
+   * a fresh chat stopped Compact & Resume and a worker's model choice). Closed here: a visible
+   * dialog this extension did not open, that is not the access-limit notice `errors()` reads, the
+   * model picker or the Temporary Chat introduction, and that has nothing to type into, so a
+   * Settings dialog or a form is never touched. Closed only by Escape, the way a person dismisses
+   * it: no button in it is pressed, so nothing is chosen. Returns the headings it closed.
+   */
+  function announcementDialogs() {
+    const notices = new Set(errors().map(error => error.node));
+    return safe(() => [...document.querySelectorAll('[role="dialog"]')].filter(node =>
+      !node.closest(`${OWN_SURFACES}, [data-clf-menu], [class*="clf-"]`) && !node.closest('[hidden],[inert],[aria-hidden="true"]') &&
+      node.getClientRects().length > 0 && node.getAttribute('data-state') !== 'closed' && !notices.has(node) &&
+      !node.querySelector(PICKER) &&
+      ![...node.querySelectorAll('h1,h2,[role="heading"]')].some(heading => text(heading, 100) === 'Temporary Chat') &&
+      !node.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select, ' +
+        '[contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="searchbox"]')), []);
+  }
+  async function dismissAnnouncements(stillCurrent = () => true, waitMs = 1500) {
+    const closed = [];
+    for (const dialog of announcementDialogs()) {
+      if (!stillCurrent()) break;
+      const heading = ((dialog.querySelector('h1,h2,h3,[role="heading"]')?.textContent || dialog.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ').trim()).slice(0, 80);
+      dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+      const until = Date.now() + waitMs;
+      while (dialog.isConnected && dialog.getClientRects().length > 0 && Date.now() < until) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!dialog.isConnected || dialog.getClientRects().length === 0) closed.push(heading);
+    }
+    return closed;
+  }
+
   async function newChatControl(stillCurrent = () => true) {
     const shown = node => node && !node.closest(OWN_SURFACES) && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
     // @ehkogh/#318 shell: a translated sidebar button; MAIN stamps its typed owner per route.
@@ -2650,6 +2684,7 @@ var CLF_DOM = (() => {
     thoughtActivityRows,
     toolLabel,
     errors,
+    dismissAnnouncements,
     composer,
     composerSubmitReady,
     composerBox,
