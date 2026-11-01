@@ -4244,7 +4244,20 @@ export function initChat(next: Deps): void {
   });
   reviewPanel = createFilePanel({
     host: document.querySelector<HTMLElement>('[data-panel="chat"]')!, toggle: reviewToggle, reviewOnly: true,
-    onShow: () => { filePanel?.hide(); agentPanel?.hide(); workPanel?.hide(); }
+    onShow: () => { filePanel?.hide(); agentPanel?.hide(); workPanel?.hide(); },
+    // A new message for the person to read and send; the request never sends itself.
+    onAskChat: request => {
+      // Send submits a prepared plan, not what the composer shows, so the request would sit there unsent.
+      if (currentPreparedPlan()) { toast(t("Start or cancel the prepared plan first, then ask again.")); return; }
+      // A narrow window shows the pane instead of the chat; it closes so the composer is in view.
+      if (window.matchMedia?.('(max-width: 850px)').matches) reviewPanel?.hide();
+      const input = $<HTMLTextAreaElement>('chatInput');
+      const rest = input.value.trim();
+      input.value = rest ? `${request}\n\n${rest}` : request;
+      input.setSelectionRange(input.value.length, input.value.length);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus();
+    }
   });
   filePanel.update(selectedLocalProject());
   reviewPanel.update(selectedLocalProject());
