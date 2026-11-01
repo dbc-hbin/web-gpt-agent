@@ -29,7 +29,9 @@ vi.mock('../src/main/goal-reviewer.js', async (original) => ({
 
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
-const { initDurableStore } = await import('../src/main/durable.js');
+const durable = await import('../src/main/durable.js');
+const { initDurableStore } = durable;
+const realWrite = durable.writeDurableNow;
 const logger = await import('../src/main/logger.js');
 const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests, readRecentEvents } = await import('../src/main/session/store.js');
 const goal = await import('../src/main/goal.js');
@@ -116,6 +118,27 @@ it('does not start a review once Goal was switched off while the step was being 
       .toContainEqual(expect.stringContaining('step g-late-off in c-late-off no longer owes its Goal reply')), { timeout: 5_000 });
     expect(review.started).toEqual([]);
   } finally { logged.mockRestore(); }
+});
+
+// A failed switch write is not a pause: the timeline says what really happened.
+it('says Goal could not be switched off when the pause after a blocking finding fails to save', async () => {
+  const sessionId = await seed('c-pause-fail');
+  await goal.setGoalSwitchNow('c-pause-fail', 'goal', true);
+  await goal.acceptGoalReplyNow({ conversationId: 'c-pause-fail', sessionId, replyId: 'assistant-c-pause-fail', turnId: 'g-1', eventSeq: 3, blocked: false });
+  review.current = { text: 'BLOCKING: the migration drops the users table.' };
+  const warned = vi.spyOn(logger, 'logWarn');
+  const write = vi.spyOn(durable, 'writeDurableNow').mockImplementation(async (key: string, value: unknown) => {
+    if (key === 'goal-switches') throw new Error('disk full');
+    return realWrite(key, value);
+  });
+  try {
+    goal.startGoalDraft({ sessionId, conversationId: 'c-pause-fail', turnId: 'g-1' });
+    expect((await settled('c-pause-fail')).stage).toBe('no-reply');
+    const notes = JSON.stringify((await readRecentEvents(sessionId, 20)).filter(event => event.kind === 'note'));
+    expect(notes).toContain('Goal could not be switched off');
+    expect(notes).not.toContain('Goal paused');
+    expect(warned.mock.calls.map(([line]) => String(line))).toContainEqual(expect.stringContaining('could not switch Goal off in c-pause-fail'));
+  } finally { write.mockRestore(); warned.mockRestore(); }
 });
 
 it('puts the reviewer\'s findings after the helper\'s message, and tells the helper they are there', async () => {

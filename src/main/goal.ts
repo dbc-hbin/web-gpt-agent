@@ -1030,7 +1030,8 @@ export async function setGoalSwitchNow(
     // Goal stopped here, or turned to Loop: a step review in progress is cancelled (#1832).
     // goal-reviewer.ts imports this module, hence the late import.
     if (!next.enabled || next.mode !== 'goal') void import('./goal-reviewer.js')
-      .then(({ cancelStepReview }) => cancelStepReview(conversationId)).catch(() => undefined);
+      .then(({ cancelStepReview }) => cancelStepReview(conversationId))
+      .catch(error => logWarn(`goal review: could not cancel the review in progress for ${conversationId}: ${error instanceof Error ? error.message : String(error)}`));
     return { enabled: next.enabled, mode: next.mode };
   });
 }
@@ -1678,11 +1679,16 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
  */
 async function pauseForReview(draft: GoalDraft, finding: string): Promise<void> {
   logInfo(`goal: the reviewer found a problem Goal cannot safely go past in ${draft.conversationId}; pausing Goal`);
-  await setGoalSwitchNow(draft.conversationId, 'goal', false).catch(() => undefined);
+  const paused = await setGoalSwitchNow(draft.conversationId, 'goal', false).then(() => true, (error: unknown) => {
+    logWarn(`goal: could not switch Goal off in ${draft.conversationId} after the reviewer's finding: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  });
   const plain = finding.replace(/^BLOCKING:\s*/i, '');
   const shown = plain.length > 300 ? `${plain.slice(0, 297)}...` : plain;
-  await recordNote(draft.sessionId, `Goal paused: the reviewer found a problem Goal cannot safely go past ("${shown}"). ` +
-    'Check it, then send a message or switch Goal back on.').catch(() => undefined);
+  await recordNote(draft.sessionId, paused
+    ? `Goal paused: the reviewer found a problem Goal cannot safely go past ("${shown}"). Check it, then send a message or switch Goal back on.`
+    : `The reviewer found a problem Goal cannot safely go past ("${shown}"), and Goal could not be switched off. Nothing was sent for this step; switch Goal off before it continues.`)
+    .catch((error: unknown) => logWarn(`goal: could not record the reviewer's finding in ${draft.conversationId}: ${error instanceof Error ? error.message : String(error)}`));
   draft.reply = '';
   settle(draft, 'no-reply');
 }
