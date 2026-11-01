@@ -1767,6 +1767,16 @@ messages. Two transport slots, one batch per conversation and fair batch electio
 hot/stalled chat blocking another. Command ACK custody precedes later observations from that
 route. Reconnection restores eligible documents before creating new work; browser restart is
 a different lifetime from MV3 suspension (§2).
+Request-id traces (diagnostics only): usage.js also walks every frame of a chat's response stream
+(HTTP and socket) for id-named fields holding a request-id-shaped value that is neither the chat's
+id nor an origin it already published, and posts `cos-request-trace` with each id's field path
+(`<delta p>:<key path>`, never content; 8 per frame, 64 per response, read on after the 16 published
+origins). content.js forwards them once per id as `request_trace` (`traces: [{ requestId, path }]`),
+only for the chat the tab shows, takes none while its queue holds 300 or more entries, and drops
+queued traces first, without a gap marker, when it must evict. The bridge never stores them as
+transcript; `session/request-trace.ts` keeps 256 and adds "the stream of <chat> named it at
+<path>" to the "no page evidence" warning, or logs one line when the trace arrives after a call ran
+out of time. Attribution never uses them.
 Journal writes are serialized whole snapshots taken when each write starts; observations that
 arrive while one write is in flight share the single next write, and each reply waits for a
 write containing its own observations.

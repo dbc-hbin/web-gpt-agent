@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest';
 const script = readFileSync(new URL('../extension/usage.js', import.meta.url), 'utf8');
 function harness() {
   const posts: Array<Record<string, any>> = [];
+  // Request-id trace diagnostics have their own list: the other tests are about what the page trusts.
+  const traces: Array<Record<string, any>> = [];
   let now = Date.parse('2026-09-05T12:00:00Z');
   class Clock extends Date { static override now() { return now; } }
   let response: unknown;
@@ -23,7 +25,7 @@ function harness() {
   const window = {
     WebSocket: Socket,
     fetch: (..._args: unknown[]) => Promise.resolve(response),
-    postMessage: (data: unknown) => posts.push(JSON.parse(JSON.stringify(data))),
+    postMessage: (data: any) => (data?.type === 'cos-request-trace' ? traces : posts).push(JSON.parse(JSON.stringify(data))),
     addEventListener: (type: string, handler: (event: unknown) => void, options?: { once?: boolean }) => {
       const rows = listeners.get(type) ?? [];
       rows.push({ handler, once: options?.once === true });
@@ -76,6 +78,7 @@ function harness() {
   }
   return {
     posts,
+    traces,
     nativeSocket: Socket,
     socket: (url = 'wss://ws.chatgpt.com/ws') => new window.WebSocket(url),
     feed,
@@ -230,6 +233,31 @@ describe('MAIN-world usage projection', () => {
     expect(stream.cancelled).toBe(true);
     h.hide(); h.request();
     expect(h.posts).toHaveLength(2);
+  });
+  // Upstream #1908: the calls of a turn can carry a request id the page never reported as the
+  // turn's own. Where the stream did name it is reported for the app's log, by path only, never trusted.
+  it('traces request ids in fields it does not trust, by path and without content', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', request_id = '11111111-2222-4333-8444-555555555555';
+    const trusted = '22222222-2222-4333-8444-555555555555';
+    await h.feedSse([`data: ${JSON.stringify({ p: '', o: 'add', v: { conversation_id, message: { metadata: { request_id: trusted } } } })}\n\n` +
+      `data: ${JSON.stringify({ p: '/message', o: 'add', v: { conversation_id, metadata: { request_id, note: 'PRIVATE_TEST_TEXT' } } })}\n\n` +
+      `data: ${JSON.stringify({ p: '/message', o: 'add', v: { conversation_id, metadata: { request_id } } })}\n\n`], { method: 'POST' });
+    expect(h.posts.map(post => post.requestIds)).toEqual([[trusted]]);
+    expect(h.traces).toEqual([{ type: 'cos-request-trace', conversationId: conversation_id,
+      traces: [{ requestId: request_id, path: '/message:v.metadata.request_id' }] }]);
+    expect(JSON.stringify(h.traces)).not.toContain('PRIVATE_TEST_TEXT');
+    // An event naming no chat in a response that named none either is not traced.
+    await h.feedSse([`data: ${JSON.stringify({ p: '/metadata', o: 'add', v: { request_id: '33333333-2222-4333-8444-555555555555' } })}\n\n`], { method: 'POST' });
+    expect(JSON.stringify(h.traces)).not.toContain('33333333-2222');
+  });
+  it('keeps tracing after a response published its sixteen origins', async () => {
+    const h = harness(), conversation_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const id = (n: number) => `${String(n).padStart(8, '0')}-2222-4333-8444-555555555555`;
+    const frames = Array.from({ length: 16 }, (_, n) => `data: ${JSON.stringify({ p: '', o: 'add', v: { conversation_id, message: { metadata: { request_id: id(n + 1) } } } })}\n\n`);
+    frames.push(`data: ${JSON.stringify({ p: '/message', o: 'add', v: { conversation_id, metadata: { request_id: id(99) } } })}\n\n`);
+    await h.feedSse([frames.join('')], { method: 'POST' });
+    expect(h.posts.flatMap(post => post.requestIds)).toHaveLength(16);
+    expect(h.traces.flatMap(trace => trace.traces.map((entry: any) => entry.requestId))).toEqual([id(99)]);
   });
   it('bounds concurrent response clones, reads the newest by letting go of the oldest, and releases them on page exit', async () => {
     // Upstream #1865: two earlier responses that stay open must not blind the reader to the

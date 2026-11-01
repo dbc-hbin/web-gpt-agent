@@ -100,6 +100,7 @@ import {
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
+import { noteRequestTraces, type RequestTrace } from './session/request-trace.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -1091,7 +1092,9 @@ const OBSERVATION_KINDS = new Set([
   'chat_error',
   // Not stored as transcript content. These request records populate the exact
   // requestId -> conversationId correlation registry.
-  'tool_evidence'
+  'tool_evidence',
+  // Where a chat's stream named request ids (session/request-trace.ts); diagnostics only.
+  'request_trace'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
 const MAX_OBSERVATIONS = 200;
@@ -1255,6 +1258,18 @@ function parseObservations(input: unknown): ChatObservation[] {
       kind: kind as ChatObservation['kind'],
       time: time > now + 60_000 || time < earliestChatGpt ? now : time
     };
+    if (kind === 'request_trace') {
+      const traces: RequestTrace[] = [];
+      for (const rawTrace of Array.isArray(item['traces']) ? item['traces'].slice(0, 16) : []) {
+        const trace = rawTrace && typeof rawTrace === 'object' ? rawTrace as Record<string, unknown> : null;
+        const requestId = typeof trace?.['requestId'] === 'string' ? trace['requestId'] : '';
+        const path = typeof trace?.['path'] === 'string' ? trace['path'] : '';
+        if (/^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(requestId) && /^[A-Za-z0-9_./:[\]-]{1,200}$/.test(path)) traces.push({ requestId, path });
+      }
+      observation.traces = traces;
+      out.push(observation);
+      continue;
+    }
     if (item['authoredTime'] === true) observation.authoredTime = true;
     if ((kind === 'assistant_message' || kind === 'user_message') && typeof item['authoredAt'] === 'number' &&
         Number.isFinite(item['authoredAt']) && item['authoredAt'] >= earliestChatGpt && item['authoredAt'] <= now + 60_000) {
@@ -2915,7 +2930,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // This reports attachment only. The recorder below owns actual work and replay deduplication.
     const revived = noteAgentAlive(id, 'page');
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
-    const observations = parseObservations(body['events']);
+    const parsed = parseObservations(body['events']);
+    const traces = parsed.flatMap(item => item.kind === 'request_trace' ? item.traces ?? [] : []);
+    if (traces.length) noteRequestTraces(id, traces);
+    const observations = parsed.filter(item => item.kind !== 'request_trace');
+    if (!observations.length && parsed.length) return json(res, 200, { ok: true, stored: 0 }, origin);
     observationWritesInFlight += 1;
     let committed: { sessionId: string | null; stored: number; wake: boolean } | undefined;
     try {

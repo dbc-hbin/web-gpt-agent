@@ -1420,6 +1420,23 @@ describe('work continuity over the bridge', () => {
 // ------------------------------------------------------------------ events
 
 describe('observations', () => {
+  it('logs where the page saw a request id it could not place, and stores no transcript for it', async () => {
+    // Upstream #1908.
+    await pair();
+    const { requestTraceNote, resetRequestTracesForTests } = await import('../src/main/session/request-trace.js');
+    resetRequestTracesForTests();
+    const before = getLog().length;
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000c1d3', placed = '7482f9cb-689d-4ad0-aa6a-b7196a699840';
+    expect(requestTraceNote(placed)).toBe('');
+    await request('POST', '/events', { body: { conversationId, events: [{ kind: 'request_trace', time: Date.now(), traces: [
+      { requestId: placed, path: '/message:v.metadata.request_id' }, { requestId: 'not an id', path: 'x' }, { requestId: '11111111-2222-4333-8444-555555555555', path: 'bad path!' }
+    ] }] } });
+    expect(getLog().slice(before).map(entry => entry.message).filter(line => line.includes(placed))).toEqual([
+      `request attribution: ${placed} had no page evidence in time; the stream of ${conversationId} names it at /message:v.metadata.request_id`]);
+    expect(requestTraceNote(placed)).toBe(`; the stream of ${conversationId} named it at /message:v.metadata.request_id`);
+    expect(requestTraceNote('11111111-2222-4333-8444-555555555555')).toBe('');
+    expect(await findSessionByConversation(conversationId)).toBeNull();
+  });
   it('logs a ChatGPT announcement a page closed, once a minute per chat and heading, and refuses any other note', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
     try {
