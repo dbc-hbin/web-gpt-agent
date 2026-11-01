@@ -2351,6 +2351,16 @@ custody; status polling does not issue a fresh token. Startup restores eligible 
 with the normal first grace period. A twelve-hour source age retires automatic pickup authority
 without deleting queued text. Newer questions veto older Goal debt. Fresh
 source/session/stop/block/continuation and listening checks apply again at repair handout.
+A queued input the app itself does not offer to pages (`input.ts::queuedInputOfferBlocker`
+names the first gate, in `pendingBrowserInputs` order) spends no pickup reload: the bridge logs
+`next automation/input step in <chat> is not offered to the page — <gate>; no reload is spent on it`
+once per chat/input/gate/minute (upstream #1960). Upstream's conversion of an untaken automatic
+Continue into an ordinary message is not ported. A retried pickup that reaches its twelve-hour
+lifetime logs one warning and writes one timeline progress row saying recovery ended and the
+step stays saved. Compaction `writing`/`opening` tickets past their quick pickups keep one pickup
+every 15 minutes within the ticket's own lifetime (the pickup is idempotent: stable marker or the
+destination pre-Send checkpoint) and keep one mutable timeline row saying so; the `asking`
+abandonment after five unsent pickups is unchanged and already writes its abandonment note.
 Publishing a repair wakes the extension over the existing authenticated socket; due repairs run
 before window layout, input preparation and idle-tab pruning. The MV3 30-second maintenance
 alarm remains a recovery cadence, not the normal pickup path.

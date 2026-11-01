@@ -19,7 +19,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, queuedInputOfferBlocker, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -8079,6 +8079,11 @@ const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
  * Page activity never pushes any of these; `since` is when the phase began (the ticket's
  * opening, the prompt's durable dispatch) or when it was last picked up. A phase change resets
  * the count — the writing phase's three do not include the two the asking phase spent.
+ *
+ * Past its quick pickups a `writing` or `opening` ticket is still owed and its pickup is
+ * idempotent (the stable marker; the destination pre-Send checkpoint), so it keeps one every
+ * fifteen minutes (`COMPACTION_SLOW_PICKUP_MS`) for the ticket's own lifetime instead of
+ * stopping silently with the source's tools fenced. Its timeline row says so.
  */
 type CompactionPhase = 'asking' | 'writing' | 'opening';
 const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: number }> = {
@@ -8086,6 +8091,7 @@ const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: num
   writing: { every: 5 * 60_000, attempts: 3 },
   opening: { every: 15 * 60_000, attempts: 3 }
 };
+const COMPACTION_SLOW_PICKUP_MS = 15 * 60_000;
 const compactionWatch = new Map<string, { token: string; phase: CompactionPhase; since: number; attempts: number }>();
 
 function compactionPhaseOf(entry: ContinuationView): CompactionPhase {
@@ -8140,8 +8146,8 @@ function notePickupActivity(conversationId: string): void {
 /** One pickup tree for authored input, unfinished Continue and final-driven Goal/Loop.
  * Their durable owners retain text/decision debt; this projection elects one source per
  * chat and shares its reload budget. A reload never generates a second obligation. */
-async function owedPickups(now: number): Promise<Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean }>> {
-  const owed = new Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean }>();
+async function owedPickups(now: number): Promise<Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean; inputId?: string }>> {
+  const owed = new Map<string, { conversationId: string; sessionId: string; replyId: string; acceptedAt: number; listenUntil: number; pro: boolean; queued: boolean; inputId?: string }>();
   for (const reply of pendingGoalReplies(now)) {
     const pending = goalPendingReplyFor(reply.conversationId);
     if (!pending) continue;
@@ -8171,6 +8177,16 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
   return owed;
 }
 
+/** One timeline row and one log line when a retried pickup reaches its twelve-hour lifetime. */
+async function noticePickupExpired(conversationId: string, watch: { replyId: string; attempts: number }): Promise<void> {
+  logWarn(`bridge: automatic pickup for ${conversationId} ended after ${watch.attempts} reload(s) at its twelve-hour lifetime; the next step stays saved for the user`);
+  const session = await findSessionByConversation(conversationId, { requireUnique: true }).catch(() => null);
+  if (!session) return;
+  await recordProgress(session.id, `pickup-expired:${conversationId}:${watch.replyId}`,
+    `Automatic recovery ended: no page collected the next step within 12 hours (${watch.attempts} reloads). ` +
+      'Any queued message is still saved; send it or Continue from the composer.');
+}
+
 async function inspectOwedPickups(now: number): Promise<boolean> {
   const floor = pickupWatchFloor;
   if (floor === null) return false;
@@ -8179,7 +8195,11 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
   // Keep the spent episode while its source is absent: cancellation/reordering must not
   // refund retries if another queue item or Goal later uses that same boundary.
   for (const [conversationId, watch] of pickupWatch) {
-    if (now >= watch.expiresAt) pickupWatch.delete(conversationId);
+    if (now >= watch.expiresAt) {
+      pickupWatch.delete(conversationId);
+      // The lifetime is the last bound on an unfinished step; it must not end silently.
+      if (watch.attempts > 0) void noticePickupExpired(conversationId, watch).catch(() => undefined);
+    }
     if (now < watch.expiresAt && owed.get(conversationId)?.replyId === watch.replyId) continue;
     const repair = repairsInFlight.get(conversationId);
     if (repair?.reason === 'goal' && (now >= watch.expiresAt || repair.state !== 'handed' || owed.has(conversationId))) repairsInFlight.delete(conversationId);
@@ -8220,6 +8240,16 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     const held = repairsInFlight.get(reply.conversationId);
     if (held?.state === 'done' && held.reason === 'goal') repairsInFlight.delete(reply.conversationId);
     else if (held && held.state !== 'done') continue;
+    // A page cannot claim what the app itself does not offer: reloading it then changes nothing
+    // and only spends the budget (upstream #1960). Say which gate holds it, once a minute.
+    if (reply.queued && reply.inputId) {
+      const blocker = await queuedInputOfferBlocker(reply.inputId);
+      if (blocker) {
+        noticeRefusal(`pickup-withheld:${reply.conversationId}:${reply.inputId}:${blocker}`,
+          `bridge: next automation/input step in ${reply.conversationId} is not offered to the page — ${blocker}; no reload is spent on it`);
+        continue;
+      }
+    }
     if (!queueBrowserRecovery(reply.conversationId, reply.sessionId,
       `goal:${reply.replyId}:${watch.attempts}`, 'goal', 0, now)) continue;
     watch.attempts += 1;
@@ -8266,9 +8296,9 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
       compactionWatch.set(entry.from, watch);
     }
     const schedule = COMPACTION_PICKUPS[phase];
-    if (now < watch.since + schedule.every) continue;
-    if (watch.attempts >= schedule.attempts) {
-      if (phase !== 'asking') continue;
+    const slow = watch.attempts >= schedule.attempts;
+    if (now < watch.since + (slow && phase !== 'asking' ? Math.max(schedule.every, COMPACTION_SLOW_PICKUP_MS) : schedule.every)) continue;
+    if (slow && phase === 'asking') {
       // Ten minutes and five raised reloads without the prompt ever reaching ChatGPT. The
       // chat's tools were never fenced (that starts at the send), so nothing is stranded by
       // letting go; what would be stranded is the chat under a ticket it can never discharge.
@@ -8314,9 +8344,19 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
     watch.attempts += 1;
     watch.since = now;
     queued = true;
-    logInfo(
-      `bridge: compaction ticket ${entry.token.slice(0, 8)} ${phase} pickup ${watch.attempts} of ${schedule.attempts}`
-    );
+    if (watch.attempts <= schedule.attempts) {
+      logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} ${phase} pickup ${watch.attempts} of ${schedule.attempts}`);
+    } else {
+      logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} ${phase} pickup ${watch.attempts} (slow retry)`);
+    }
+    if (phase !== 'asking' && watch.attempts >= schedule.attempts) {
+      // One mutable timeline row for the slow cadence: the chat is still owed its handoff.
+      if (watch.attempts === schedule.attempts)
+        logWarn(`bridge: compaction ticket ${entry.token.slice(0, 8)} for ${entry.from} is still ${phase} after ${schedule.attempts} quick pickups — retrying every 15 minutes`);
+      void recordProgress(entry.sessionId, `compaction-slow:${entry.token}`,
+        `Compact & Resume is still ${phase === 'writing' ? 'writing its handoff' : 'opening the new chat'} after ${watch.attempts} automatic pickups. ` +
+          'It keeps trying every 15 minutes until the handoff lands or you cancel it.').catch(() => null);
+    }
   }
   return queued;
 }
