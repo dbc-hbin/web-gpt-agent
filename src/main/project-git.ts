@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { statSync, watch as watchFs, type FSWatcher } from 'node:fs';
-import type { Stats } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ProjectGitChange, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot, ProjectGitStatus } from '../shared/project-git.js';
@@ -9,7 +8,7 @@ import { CHECKPOINT_REF_PREFIX } from '../shared/project-git.js';
 import { findCheckpoint, listCheckpoints } from './checkpoints/store.js';
 import { getConfig } from './config.js';
 import { rawPromises as fs } from './rawfs.js';
-import { projectFileTarget } from './project-files.js';
+import { projectFileTarget, sameFile } from './project-files.js';
 import { approvedRootContaining } from './sandbox.js';
 import { logInfo, logWarn } from './logger.js';
 
@@ -23,11 +22,6 @@ const CHANGE_DEBOUNCE_MS = 180;
 
 interface GitResult { code: number; stdout: Buffer; stderr: string; }
 export interface RepositoryContext { projectId: string; projectReal: string; root: string; gitDir: string; commonDir: string; prefix: string; }
-
-function sameFile(left: Stats, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
-    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
-}
 
 async function readWorkingBytes(projectId: string, relative: string, limit: number): Promise<{ bytes: Buffer; tooLarge: boolean }> {
   const target = await projectFileTarget(projectId, relative, { allowRoot: false });
@@ -514,7 +508,7 @@ export async function readProjectGitSnapshot(projectId: string, baseRef?: string
   }
 }
 
-function repositoryPath(context: RepositoryContext, relative: string): string {
+export function repositoryPath(context: RepositoryContext, relative: string): string {
   return context.prefix ? `${context.prefix}/${relative}` : relative;
 }
 
@@ -648,6 +642,7 @@ export class ProjectGitWatchSet {
     this.projectId = projectId;
     if (!projectId) return;
     let context: RepositoryContext | null;
+    // An unavailable project or repository has nothing to watch; the next snapshot read reports why.
     try { context = await repositoryContext(projectId); } catch { return; }
     if (!context || generation !== this.generation || this.projectId !== projectId) return;
     // One native recursive watch covers working-tree writes even when their folders are not

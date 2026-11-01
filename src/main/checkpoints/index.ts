@@ -11,7 +11,7 @@ import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { currentCall } from '../mcp/call-context.js';
 import { projectRestoreTarget, revalidateProjectRestoreTarget } from '../project-files.js';
-import { decode, readProjectGitSnapshot, repositoryContext, runGit, withTemporaryIndex, type RepositoryContext } from '../project-git.js';
+import { decode, readProjectGitSnapshot, repositoryContext, repositoryPath, runGit, withTemporaryIndex, type RepositoryContext } from '../project-git.js';
 import { rawPromises as fs } from '../rawfs.js';
 import { isContained } from '../sandbox.js';
 import { getSession } from '../session/store.js';
@@ -199,10 +199,6 @@ async function hashFile(git: Git, repoPath: string, real: string): Promise<strin
   const oid = decode(hashed.stdout).trim();
   if (hashed.code !== 0 || !OID.test(oid)) throw new Error(hashed.stderr || 'Git could not hash the file');
   return oid;
-}
-
-function repositoryPath(context: RepositoryContext, relative: string): string {
-  return context.prefix ? context.prefix + '/' + relative : relative;
 }
 
 /**
