@@ -8,25 +8,16 @@
  * PATH/common locations remain a fallback for development or a damaged/missing bundle.
  */
 
-import { accessSync, constants, existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathEntries } from '../env.js';
+import { isExecutableFile, pathEntries } from '../env.js';
 
 export type BinaryName = 'tunnel-client' | 'cloudflared';
 
 const locateCache = new Map<string, string | null>();
 const bundledVersionCache = new Map<string, string | null>();
 
-function isExecutableFile(candidate: string): boolean {
-  try {
-    if (!existsSync(candidate) || !statSync(candidate).isFile()) return false;
-    if (process.platform !== 'win32') accessSync(candidate, constants.X_OK);
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 export function tunnelExecutableName(name: BinaryName, platform: NodeJS.Platform = process.platform): string {
   return platform === 'win32' ? `${name}.exe` : name;
