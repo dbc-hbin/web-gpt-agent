@@ -1492,5 +1492,7 @@
   "Editing your message": "正在编辑你的消息",
   "An edit changes only the text. Send files in a new message.": "编辑只会更改文本。请在新消息中发送文件。",
   "An edit is sent as one message, not as a plan.": "编辑会作为一条消息发送，而不是计划。",
-  "Editing your message · replaces {0} later messages": "正在编辑你的消息 · 将替换之后的 {0} 条消息"
+  "Editing your message · replaces {0} later messages": "正在编辑你的消息 · 将替换之后的 {0} 条消息",
+  "That message can no longer be edited, so this is restored as a new message.": "此消息已无法再编辑，因此已作为新消息恢复。",
+  "Scroll up to the message you edited, then retry.": "请向上滚动到你编辑的消息，然后重试。"
 }

@@ -1492,5 +1492,7 @@
   "Editing your message": "Editando tu mensaje",
   "An edit changes only the text. Send files in a new message.": "Una edición cambia solo el texto. Envía los archivos en un mensaje nuevo.",
   "An edit is sent as one message, not as a plan.": "Una edición se envía como un solo mensaje, no como un plan.",
-  "Editing your message · replaces {0} later messages": "Editando tu mensaje · reemplaza {0} mensajes posteriores"
+  "Editing your message · replaces {0} later messages": "Editando tu mensaje · reemplaza {0} mensajes posteriores",
+  "That message can no longer be edited, so this is restored as a new message.": "Este mensaje ya no se puede editar, así que se restaura como un mensaje nuevo.",
+  "Scroll up to the message you edited, then retry.": "Desplázate hacia arriba hasta el mensaje que editaste y vuelve a intentarlo."
 }

@@ -1528,5 +1528,7 @@
   "Editing your message": "メッセージを編集中",
   "An edit changes only the text. Send files in a new message.": "編集で変更できるのはテキストのみです。ファイルは新しいメッセージで送信してください。",
   "An edit is sent as one message, not as a plan.": "編集はプランではなく 1 件のメッセージとして送信されます。",
-  "Editing your message · replaces {0} later messages": "メッセージを編集中 · 後続の {0} 件のメッセージを置き換えます"
+  "Editing your message · replaces {0} later messages": "メッセージを編集中 · 後続の {0} 件のメッセージを置き換えます",
+  "That message can no longer be edited, so this is restored as a new message.": "このメッセージはもう編集できないため、新しいメッセージとして復元しました。",
+  "Scroll up to the message you edited, then retry.": "編集したメッセージまで上にスクロールしてから、もう一度試してください。"
 }
