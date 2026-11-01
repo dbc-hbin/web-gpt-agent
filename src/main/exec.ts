@@ -146,24 +146,6 @@ function windowsPowerShellPath(): string {
   return path.join(windowsRoot(), 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
 }
 
-let cachedWindowsPowerShell: string | null | undefined;
-
-/**
- * Windows PowerShell 5.1 specifically, by absolute path.
- *
- * Two reasons it is not simply `findPowerShell()`. The computer helper is written against
- * 5.1 — it loads System.Drawing and the UIAutomation assemblies, which PowerShell 7 does
- * not offer on the same terms — and it must not be located by searching PATH. That helper
- * is one of the things the app uses to explain failures, and a broken PATH was the failure
- * it was most often asked about while being unable to start for exactly that reason.
- */
-export function findWindowsPowerShell(): string | null {
-  if (cachedWindowsPowerShell !== undefined) return cachedWindowsPowerShell;
-  const candidate = windowsPowerShellPath();
-  cachedWindowsPowerShell = existsSync(candidate) ? candidate : null;
-  return cachedWindowsPowerShell;
-}
-
 /**
  * `env` is the environment the child will actually receive, not this process's own.
  *

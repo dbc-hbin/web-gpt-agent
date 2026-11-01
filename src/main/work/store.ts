@@ -1,7 +1,6 @@
 import { DatabaseSync } from 'node:sqlite';
 import { chmodSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
-import { randomUUID } from 'node:crypto';
 import {
   WORK_ERROR_CODES,
   WORK_EVENT_KINDS,
@@ -2286,9 +2285,4 @@ export function createWorkStore(options: WorkStoreOptions): WorkStore {
   sealFile(file);
 
   return store;
-}
-
-/** A random UUID for any ledger identity. Kept here so callers never invent their own. */
-export function newLedgerId(): string {
-  return randomUUID();
 }

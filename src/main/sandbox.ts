@@ -432,16 +432,6 @@ export function toVirtualPath(root: Root, rootReal: string, realPath: string): s
 }
 
 /**
- * Resolves a root by name only, for tools that operate on a whole root.
- * Returns the canonical root path.
- */
-export async function resolveRoot(roots: readonly Root[], name: string): Promise<{ root: Root; real: string }> {
-  const root = roots.find((r) => r.name.toLowerCase() === name.toLowerCase());
-  if (!root) throw new SandboxError(`Unknown root "/${name}"`);
-  return { root, real: await realRoot(root) };
-}
-
-/**
  * The approved root whose canonical tree contains an existing native directory, if any.
  *
  * For host-owned native paths only. `resolvePath` would read `/tmp/...` as the virtual root

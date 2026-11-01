@@ -1662,7 +1662,6 @@ export function createWorkService(deps: WorkServiceDependencies): WorkServiceHan
 // -----------------------------------------------------------------------------------------
 
 let current: WorkServiceHandle | null = null;
-const serviceListeners = new Set<(service: WorkServiceHandle | null) => void>();
 const changeListeners = new Set<(change: WorkChange) => void>();
 
 /**
@@ -1672,35 +1671,10 @@ const changeListeners = new Set<(change: WorkChange) => void>();
  */
 export function setWorkService(service: WorkServiceHandle | null): void {
   current = service;
-  for (const listener of serviceListeners) {
-    try {
-      listener(service);
-    } catch {
-      /* A broken listener must not break the host. */
-    }
-  }
 }
 
 export function getWorkServiceOrNull(): WorkServiceHandle | null {
   return current;
-}
-
-/** Throws a typed error so an adapter can report "host unavailable" instead of crashing. */
-export function getWorkService(): WorkServiceHandle {
-  if (!current) {
-    throw new WorkServiceError(
-      WORK_ERROR_CODES.hostUnavailable,
-      'HOST_UNAVAILABLE: the host has not started its work ledger yet. Start the app (or run `wgpt host start`) and try again.'
-    );
-  }
-  return current;
-}
-
-export function onWorkServiceChange(listener: (service: WorkServiceHandle | null) => void): () => void {
-  serviceListeners.add(listener);
-  return () => {
-    serviceListeners.delete(listener);
-  };
 }
 
 /**

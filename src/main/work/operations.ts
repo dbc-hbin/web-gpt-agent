@@ -627,17 +627,5 @@ export function createMemoryOperationPort(seed: OperationAdmissionContext[] = []
     admissionContext: (agentId) => contexts.get(agentId) ?? null,
     appendEvent: () => (sequence += 1)
   };
-  // A test may register an agent/work context after construction; the port is the only place
-  // that knows the projection, so it carries its own seeding seam.
-  Object.defineProperty(port, '__seed', {
-    value: (context: OperationAdmissionContext) => { contexts.set(context.agent_id, context); },
-    enumerable: false
-  });
   return port;
-}
-
-/** Registers a fake agent/work context. Tests and the in-memory host only. */
-export function seedOperationContext(port: OperationLedgerPort, context: OperationAdmissionContext): void {
-  const internal = port as OperationLedgerPort & { __seed?: (c: OperationAdmissionContext) => void };
-  internal.__seed?.(context);
 }
