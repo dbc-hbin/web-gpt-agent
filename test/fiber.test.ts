@@ -18,7 +18,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
-import { beforeAll, describe, expect, it } from 'vitest';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
 
 let source = '';
 
@@ -304,6 +304,7 @@ async function scan(
   thoughtStamps: Array<string | null>;
   imageStamps: Array<string | null>;
   repeatedStampMutations: number;
+  parsedJson: string[];
   turns: TurnEvidence[];
 }> {
   const dom = new JSDOM('<!doctype html><html><body></body></html>', {
@@ -313,6 +314,7 @@ async function scan(
   });
   const window = dom.window as unknown as Window & typeof globalThis & Record<string, any>;
   const document = window.document;
+  const parse = vi.spyOn(window.JSON, 'parse');
 
   for (const turn of turnSections) {
     const section = document.createElement('section');
@@ -410,6 +412,8 @@ async function scan(
   const turnStamps = [...document.querySelectorAll('[data-testid^="conversation-turn-"]')].map((section) =>
     section.getAttribute('data-clf-fiber-turn')
   );
+  const parsedJson = parse.mock.calls.map(([value]) => value);
+  parse.mockRestore();
   dom.window.close();
   return {
     rows: data.rows as Descriptor[],
@@ -421,6 +425,7 @@ async function scan(
     thoughtStamps,
     imageStamps,
     repeatedStampMutations,
+    parsedJson,
     turns: (data.turns ?? []) as TurnEvidence[]
   };
 }
@@ -700,9 +705,11 @@ describe('the calls a turn says it made', () => {
     // `request()` puts a real file path and an 80-character note in the payload. Neither
     // may appear anywhere in what crosses back into the isolated world.
     const messages = [request('req-secret', 'read_file'), answer('res-secret', 'req-secret', 'read_file')];
-    const { turns } = await scan([], [{ id: 'turn-secret', messages }]);
+    const { turns, parsedJson } = await scan([], [{ id: 'turn-secret', messages }]);
 
     const wire = JSON.stringify(turns);
+    expect(turns[0]!.calls[0]).toMatchObject({ messageId: 'req-secret', tool: 'read_file', answered: true });
+    expect(parsedJson).not.toContain(messages[0]!.content!.text);
     expect(wire).not.toContain('secret.txt');
     expect(wire).not.toContain('xxxx');
     expect(wire).not.toContain(LINK);

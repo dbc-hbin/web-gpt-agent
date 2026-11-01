@@ -9007,7 +9007,11 @@
         Boolean(existing && (existing.textContent || '').trim()) &&
         squeeze(existing?.textContent) !== squeeze(prompt);
       let insertionFailure = '';
-      if (squeeze(existing?.textContent) !== squeeze(prompt) && !CLF_DOM.insertPrompt(prompt, false, reason => { insertionFailure = reason; })) {
+      const matchesPrompt = squeeze(existing?.textContent) === squeeze(prompt);
+      const restoredShellDraft = matchesPrompt && Boolean(existing?.closest('form[data-chatgpt-composer]'));
+      // A restored shell draft has not acquired this operation's native plaintext mode.
+      // Prepare its exact text before reserving/arming Send, not after dispatch authority.
+      if ((!matchesPrompt || restoredShellDraft) && !CLF_DOM.insertPrompt(prompt, restoredShellDraft, reason => { insertionFailure = reason; })) {
         return void (await abandonBeforeSend(
           occupiedByOtherDraft
             ? 'A draft is already in ChatGPT; clear the message box before requesting the handoff.'

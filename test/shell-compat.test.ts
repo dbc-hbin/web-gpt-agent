@@ -119,13 +119,35 @@ it('retires cloned shell proof but preserves a replacement with readable Fiber',
 
 function editing(f: ReturnType<typeof fixture>) {
   const box = f.api.composer() as HTMLElement;
-  const serialize = (node: Node, literal = false, display = false): string => {
-    if (node.nodeType === 3) return literal || display ? node.textContent || '' : (node.textContent || '').replace(/[\\*_`#]/g, '\\$&');
+  const text = (node: Node, markdown = false): string => {
+    if (node.nodeType === 3) return markdown ? (node.textContent || '').replace(/[\\*_`#]/g, '\\$&') : node.textContent || '';
     if (!(node instanceof f.win.HTMLElement)) return '';
-    if (node.tagName === 'BR') return literal || display ? '\n' : '\\\n';
-    return [...node.childNodes].map(child => serialize(child, literal || node.matches('span[data-prompt-literal-paste]'), display)).join('');
+    if (node.tagName === 'BR') return markdown ? '\\\n' : '\n';
+    return [...node.childNodes].map(child => text(child, markdown)).join('');
   };
-  Object.defineProperty(box, 'innerText', { get: () => serialize(box, false, true) });
+  const raw = () => box.textContent === '' ? '' : text(box);
+  const controller = {
+    plainTextMode: false,
+    view: { dom: box, isDestroyed: false },
+    setPlainTextMode(plain: boolean) {
+      if (plain === this.plainTextMode) return;
+      // Native Markdown -> plain conversion serializes a populated document first.
+      // The atomic action must replace it from the original authorized bytes.
+      if (plain && raw()) box.textContent = text(box, true);
+      this.plainTextMode = plain;
+      box.toggleAttribute('data-composer-markdown', !plain);
+    },
+    getChatGptPrompt() {
+      const value = raw();
+      // Native B(doc) recognizes even code-looking relative links such as
+      // tools["name"](value), strips literalPaste from a CLONE and serializes
+      // every hard break/punctuation. A short plain sample bypasses that branch.
+      const rich = /\[[^\]\n]+\]\([^\n)]+\)/.test(value);
+      return { prompt: this.plainTextMode || !rich ? value : text(box, true) };
+    }
+  };
+  Reflect.set(box, '__reactFiber$editor', f.chain({ value: controller }, f.top));
+  Object.defineProperty(box, 'innerText', { get: raw });
   f.doc.execCommand = vi.fn((command, _ui, html) => {
     const selection = f.doc.getSelection();
     if (f.doc.activeElement !== box || !selection) return false;
@@ -137,7 +159,7 @@ function editing(f: ReturnType<typeof fixture>) {
     }
     return true;
   });
-  return { box, serialize: () => serialize(box) };
+  return { box, controller, serialize: () => controller.getChatGptPrompt().prompt };
 }
 
 async function recorder(f: ReturnType<typeof fixture>, replies: Record<string, (m: any) => any> = {}) {
@@ -639,13 +661,123 @@ it('treats a shown shell attachment tray with tiles as an unsent draft', () => {
   expect(f.api.hasComposerAttachments()).toBe(true);
   tray.replaceChildren(); tray.hidden = true; expect(f.api.hasComposerAttachments()).toBe(false);
 });
-it('preserves prepared multiline text through the shell editor serializer', () => {
+it.each([true, 'append'] as const)('preserves original shell bytes through native rich-link serialization (mode=%s)', mode => {
   const f = fixture(), edit = editing(f);
-  const value = '[[COS_CONTEXT:42]]\n# Worker instructions\n- Keep **literal** text, C:\\work and `<tag>`.\n[[/COS_CONTEXT]]\n\nContinue the task.';
-  expect(f.api.insertPrompt(value, true)).toBe(true);
-  expect(edit.serialize()).toBe(value);
+  edit.box.textContent = 'Restored draft.';
+  const value = '[[COS_CONTEXT:42]]\n# Worker instructions\n- Keep tools["name"](value), **literal** C:\\work and `<tag>`.\n[[/COS_CONTEXT]]\n\nKeep this backslash: \\\nContinue the task.';
+  expect(f.api.insertPrompt(value, mode)).toBe(true);
+  expect(edit.serialize()).toBe(mode === 'append' ? 'Restored draft.\n' + value : value);
+  expect(edit.controller.plainTextMode).toBe(true);
+  expect(f.api.composer()).toBe(edit.box); // Plain mode removes data-composer-markdown.
   expect(f.doc.execCommand).toHaveBeenCalledOnce();
   expect(edit.box.querySelector('tag')).toBeNull();
+});
+it.each([false, true])('allows ordinary shell insertion only into an empty draft (occupied=%s)', occupied => {
+  const f = fixture(), edit = editing(f);
+  edit.box.textContent = occupied ? 'A user draft.' : '';
+  const value = 'Use tools["name"](value)\nKeep **literal** text.';
+  expect(f.api.insertPrompt(value)).toBe(!occupied);
+  expect(edit.serialize()).toBe(occupied ? 'A user draft.' : value);
+  expect(edit.controller.plainTextMode).toBe(!occupied);
+});
+it.each([false, 'append'] as const)('refuses an empty shell insertion without changing the draft (mode=%s)', mode => {
+  const f = fixture(), edit = editing(f);
+  edit.box.textContent = mode === 'append' ? 'A user draft.' : '';
+  const before = edit.box.textContent;
+  expect(f.api.insertPrompt('', mode)).toBe(false);
+  expect(edit.box.textContent).toBe(before);
+  expect(edit.controller.plainTextMode).toBe(false);
+  expect(f.doc.execCommand).not.toHaveBeenCalled();
+});
+it('refuses oversized shell text without changing the native editor mode or draft', () => {
+  const f = fixture(), edit = editing(f);
+  edit.box.textContent = 'A user draft.';
+  expect(f.api.insertPrompt('x'.repeat(240001), true)).toBe(false);
+  expect(edit.box.textContent).toBe('A user draft.');
+  expect(edit.controller.plainTextMode).toBe(false);
+  expect(f.doc.execCommand).not.toHaveBeenCalled();
+});
+it.each(['unknown', 'ambiguous', 'changed-draft', 'changed-route', 'replaced', 'mode-refused'] as const)(
+  'refuses a shell insertion before native editing when its owner is %s', reason => {
+    const f = fixture(), edit = editing(f);
+    edit.box.textContent = 'Untouched draft.';
+    if (reason === 'unknown') Reflect.deleteProperty(edit.box, '__reactFiber$editor');
+    if (reason === 'ambiguous') Reflect.set(edit.box, '__reactFiber$editor', f.chain({ value: edit.controller },
+      f.chain({ composerController: { ...edit.controller } }, f.top)));
+    if (reason === 'mode-refused') edit.controller.setPlainTextMode = () => undefined;
+    if (reason === 'changed-draft' || reason === 'changed-route' || reason === 'replaced') {
+      f.doc.addEventListener('clf-composer-edit', () => {
+        if (reason === 'changed-draft') edit.box.textContent = 'New user draft.';
+        if (reason === 'changed-route') f.win.history.pushState({}, '', `/c/${OTHER}`);
+        if (reason === 'replaced') edit.box.replaceWith(edit.box.cloneNode(true));
+      }, { capture: true, once: true });
+      f.win.eval(fiberSource); // Put the native action after the intervening page listener.
+    }
+    expect(f.api.insertPrompt('Replacement tools["name"](value)', true)).toBe(false);
+    expect(f.doc.execCommand).not.toHaveBeenCalled();
+    expect(edit.controller.plainTextMode).toBe(false);
+    expect(edit.box.textContent).toBe(reason === 'changed-draft' ? 'New user draft.' : 'Untouched draft.');
+  }
+);
+it.each([false, true])('restores only the exact empty shell editor to its prior mode (%s)', async prior => {
+  const f = fixture(), edit = editing(f);
+  if (prior) edit.controller.setPlainTextMode(true);
+  expect(f.api.insertPrompt('tools["name"](value)\nExact text', true)).toBe(true);
+  edit.box.textContent = 'A user changed this draft.';
+  await f.ask('clf-picker-ask');
+  expect(edit.controller.plainTextMode).toBe(true);
+  expect(edit.box.textContent).toBe('A user changed this draft.');
+  edit.box.replaceChildren(); // Native Send/clear retired the exact draft.
+  await f.ask('clf-picker-ask');
+  expect(edit.controller.plainTextMode).toBe(prior);
+});
+it('does not restore a replaced shell editor or reparse a nonempty draft during helper replacement', async () => {
+  const f = fixture(), edit = editing(f);
+  expect(f.api.insertPrompt('tools["name"](value)\nExact text', true)).toBe(true);
+  f.win.eval(fiberSource);
+  expect(edit.serialize()).toBe('tools["name"](value)\nExact text');
+  expect(edit.controller.plainTextMode).toBe(true);
+  edit.box.replaceWith(edit.box.cloneNode(true));
+  await f.ask('clf-picker-ask');
+  expect(edit.controller.plainTextMode).toBe(true);
+});
+it('retains the original editor mode through helper replacement until the same draft retires', async () => {
+  const f = fixture(), edit = editing(f);
+  const value = 'tools["name"](value)\nExact text';
+  expect(f.api.insertPrompt(value, true)).toBe(true);
+  f.win.eval(fiberSource);
+  expect(edit.serialize()).toBe(value);
+  edit.box.replaceChildren();
+  await f.ask('clf-picker-ask');
+  expect(edit.controller.plainTextMode).toBe(false);
+});
+it('refuses Send when native mode changed after shell insertion', async () => {
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  await f.ask();
+  const clicked = vi.fn(); f.doc.querySelector('button[type="submit"]')!.addEventListener('click', clicked);
+  expect(f.api.insertPrompt('tools["name"](value)\nExact text', true)).toBe(true);
+  edit.controller.plainTextMode = false; edit.box.setAttribute('data-composer-markdown', '');
+  expect(await f.api.send()).toBe(false);
+  expect(clicked).not.toHaveBeenCalled();
+});
+it('adds the offline Goal marker synchronously before native human Send serializes a shell draft', async () => {
+  const f = fixture(), edit = editing(f);
+  f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
+  await recorder(f, { activity: () => ({ ok: true, data: {
+    entries: [], stream: [], goal: { enabled: true, own: true, backend: 'templates', mode: 'goal' }
+  } }) });
+  const original = 'Inspect tools["name"](value)\nKeep **literal** C:\\work.';
+  edit.box.textContent = original;
+  let submitted = '';
+  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+    event.preventDefault(); submitted = edit.serialize();
+  });
+  f.doc.querySelector<HTMLButtonElement>('button[type="submit"]')!.click();
+  expect(submitted.startsWith(original + '\n\n')).toBe(true);
+  expect(submitted).toContain('[[GOAL:COMPLETE]]');
+  expect(submitted).toContain('[[GOAL:CONTINUE]]');
+  (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 });
 it('hides only a verified shell prompt frame and restores a recycled user bubble', async () => {
   const f = fixture(), unit = f.doc.querySelector('[data-content-search-unit-key$=":user"]')!;
@@ -734,23 +866,27 @@ it.each([false, true])('bootstraps a shell worker with literal instructions and 
   expect(r.sent.filter(m => m.type === 'ack' && m.status === 'failed')).toEqual([]);
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
-it('opens a local project from a cold shell page and binds its exact first send before recording', async () => {
+it('opens a local project from a cold shell page and owns an answer completed before its first receipt', async () => {
   const f = fixture(), edit = editing(f), inputId = '88888888-1111-4111-8111-000000000001';
   const options = f.props.modelListConfig; f.props.modelListConfig = null;
   const missing = firstMissingPicker(f);
   f.doc.querySelector('[data-thread-find-target]')!.replaceChildren();
   page.reconfigure({ url: `https://chatgpt.com/?cos-input=${inputId}` });
-  const setup = '# Project instructions\n' + 'Preserve **literal** paths and project ownership.\n'.repeat(300);
+  const setup = '# Project instructions\nUse tools["name"](value).\n' + 'Preserve **literal** paths and project ownership.\n'.repeat(300);
   const text = `[[COS_CONTEXT:${setup.length}]]\n${setup}\n[[/COS_CONTEXT]]\n\nInspect the project.`;
   const input = { id: inputId, owner: 'project-owner', opening: true, projectId: OTHER, text,
     model: 'gpt-5-6-thinking', reasoningEffort: 'high', purpose: 'user', images: [] };
   const submitted: string[] = [];
-  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
-    event.preventDefault(); submitted.push(edit.serialize());
-    const exchange = addExchange(f, 7, submitted[0]!);
-    exchange.entry.conversationId = `local-chatgpt:${OTHER}`;
-    f.queries.push({ queryKey: ['chatgpt-conversation-details', { clientConversationId: exchange.entry.conversationId, serverConversationId: THREAD }] });
-    edit.box.replaceChildren(); f.win.history.pushState({}, '', `/c/${THREAD}`);
+  const nativeSend = new Promise<string>(resolve => {
+    f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+      event.preventDefault(); submitted.push(edit.serialize());
+      const exchange = addExchange(f, 7, submitted[0]!);
+      exchange.entry.conversationId = `local-chatgpt:${OTHER}`;
+      f.queries.push({ queryKey: ['chatgpt-conversation-details', { clientConversationId: exchange.entry.conversationId, serverConversationId: THREAD }] });
+      exchange.finish();
+      edit.box.replaceChildren(); f.win.history.pushState({}, '', `/c/${THREAD}`);
+      resolve(exchange.answerId);
+    });
   });
   const r = await recorder(f, {
     desktop_input: m => ({ ok: true, data: m.authorize || m.ack || m.fail ? { ok: true } : { input } }),
@@ -759,9 +895,10 @@ it('opens a local project from a cold shell page and binds its exact first send 
   const delivery = r.runtime({ type: 'clf-desktop-input', id: inputId, conversationId: null });
   await missing; expect(submitted).toEqual([]);
   f.props.modelListConfig = options; f.trigger.setAttribute('data-state', 'closed');
-  await vi.waitFor(() => expect(submitted).toHaveLength(1));
+  const answerId = await nativeSend;
   await r.hook.refreshFiber(); r.hook.observe();
   expect(await delivery).toEqual({ ok: true });
+  r.hook.observe(); await r.hook.refreshFiber(); r.hook.observe(); await r.hook.flush();
   expect(submitted).toEqual([text]);
   expect(r.sent.filter(m => m.type === 'desktop_input' && m.authorize)).toHaveLength(1);
   expect(r.sent.filter(m => m.type === 'desktop_input' && m.ack)).toHaveLength(1);
@@ -769,6 +906,15 @@ it('opens a local project from a cold shell page and binds its exact first send 
   expect(r.sent.filter(m => m.type === 'bind')).toContainEqual(expect.objectContaining({
     conversationId: THREAD, projectInput: { id: inputId, owner: 'project-owner' }
   }));
+  const starts = r.events().filter((event: { kind: string }) => event.kind === 'turn_start');
+  expect(starts).toHaveLength(1);
+  expect(r.events()).toContainEqual(expect.objectContaining({
+    kind: 'assistant_message', providerMessageId: answerId, final: true, turnId: starts[0].turnId
+  }));
+  expect(r.events().filter((event: { kind: string }) => event.kind === 'turn_end')).toMatchObject([
+    { turnId: starts[0].turnId, outcome: 'completed' }
+  ]);
+  expect(f.doc.querySelector('[data-clf-user-text]')?.textContent).toBe('Inspect the project.');
   expect(r.hook.desktopProjectInputForTest()).toBeNull();
   (f.win as any).__CLF_CONTENT_RECORDER__.stop();
 }, 10000);
@@ -793,31 +939,37 @@ it('correlates an early shell stream request through the real observer and recor
   expect(JSON.stringify(r.sent)).not.toContain('NEVER_COPY_STREAM_TEXT');
   win.__CLF_CONTENT_RECORDER__.stop();
 });
-it('sends a marked shell handoff once and captures its exact completed brief instead of the preceding answer', async () => {
+it.each([false, true])('sends a marked shell handoff once and captures its exact completed brief (restored=%s)', async restored => {
   const f = fixture(), edit = editing(f), token = '0123456789abcdef0123456789abcdef';
   f.entry.turn.status = 'complete'; f.entry.turn.items[2].completed = true;
-  const prompt = `[[CLF-HANDOFF:${token}]]\n\nWrite the brief. Keep **Markdown** and C:\\work intact.`;
+  const prompt = `[[CLF-HANDOFF:${token}]]\n\nWrite the brief. Keep tools["name"](value), **Markdown** and C:\\work intact.`;
+  if (restored) edit.box.textContent = prompt;
   const brief = 'TASK: retain the requested project. RESULT: completed the first change. NEXT: verify the remaining work.';
   const submitted: string[] = [], summaries: string[] = [];
   let source: ReturnType<typeof addExchange>, state = 'not-attempted';
-  f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
-    event.preventDefault(); submitted.push(edit.serialize()); source = addExchange(f, 8, submitted[0]!); edit.box.replaceChildren();
+  const nativeSend = new Promise<void>(resolve => {
+    f.doc.querySelector('button[type="submit"]')!.addEventListener('click', event => {
+      event.preventDefault(); submitted.push(edit.serialize()); source = addExchange(f, 8, submitted[0]!); edit.box.replaceChildren();
+      resolve();
+    });
   });
+  let signalSummary: () => void;
+  const summaryReady = new Promise<void>(resolve => { signalSummary = resolve; });
   const r = await recorder(f, { compact: m => {
     if (m.sourceAttempt) { state = 'attempted-unresolved'; return { ok: true, data: { allowed: true } }; }
     if (m.sourceDispatch) { state = 'dispatched-unresolved'; return { ok: true, data: { armed: true } }; }
     if (m.sourceMessageId) { state = 'sent'; return { ok: true, data: {} }; }
-    if (typeof m.summary === 'string') { summaries.push(m.summary); return { ok: true, data: { job: { stage: 'opening', busy: true } } }; }
+    if (typeof m.summary === 'string') { summaries.push(m.summary); signalSummary(); return { ok: true, data: { job: { stage: 'opening', busy: true } } }; }
     return { ok: true, data: { token, ...(m.ticket ? {} : { prompt }), sourceSend: { state },
       job: { stage: 'handoff-pending', busy: true, automatic: false, sourceSend: { state } } } };
   } });
   const pending = r.hook.startCompact();
-  await vi.waitFor(() => expect(submitted).toEqual([prompt]), { timeout: 3000 });
+  await Promise.race([nativeSend, pending.then(() => expect(submitted).toEqual([prompt]))]);
   await r.hook.refreshFiber(); r.hook.observe(); await pending;
   expect(summaries).toEqual([]);
   source!.finish(); source!.entry.turn.items[1]!.content = brief;
   await r.hook.refreshFiber(); r.hook.observe();
-  await vi.waitFor(() => expect(summaries).toEqual([brief]));
+  await summaryReady;
   expect(r.sent.filter(m => m.sourceDispatch)).toHaveLength(1);
   expect(r.sent).toContainEqual(expect.objectContaining({ type: 'compact', token, sourceMessageId: source!.userId }));
   await r.hook.refreshFiber(); r.hook.observe();

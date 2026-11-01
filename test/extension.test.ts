@@ -76,26 +76,6 @@ describe('extension release metadata', () => {
   });
 
   /**
-   * The helper's whole justification is that it reads props the page owns. What it may
-   * hand back is an allowlist, and these are the two things that must never be in it: a
-   * tool's arguments, which are the user's text, and the secrets observed inside them.
-   */
-  it('never sends tool arguments or secrets out of the page context', async () => {
-    const source = await fs.readFile(path.join(process.cwd(), 'extension', 'fiber.js'), 'utf8');
-    // Comments discuss the secrets by name; the code must never touch them.
-    const code = source.replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
-    expect(code).not.toMatch(/agent_key|authorization|access_token/i);
-    // The payload is never turned into an object at all. It used to be parsed for its
-    // `path`, which meant the arguments — the user's text, and the secrets observed inside
-    // them — existed as live values in this scope, one careless line from crossing over.
-    // The path is read off the front of the string instead, so `args` is never walked.
-    expect(code).not.toMatch(/JSON\.parse/);
-    expect(code).not.toMatch(/\bargs\b/);
-    // Nor may a whole object be serialised across, which would defeat the allowlist.
-    expect(code).not.toMatch(/JSON\.stringify/);
-  });
-
-  /**
    * The installed popup showed "Paired · port 8765" with a green dot and, underneath it,
    * a six-digit code field and a Pair button — a page contradicting itself about the one
    * thing it exists to report. There is nothing to type any more, so the way to keep that

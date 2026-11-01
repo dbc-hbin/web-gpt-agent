@@ -1233,12 +1233,24 @@ delivery. Every model's automatic Goal pickup, draft and final Send authorizatio
 or claimed user input. Send authorization spends that exact source's Goal obligation durably;
 pre-authorization withdrawal preserves it. A later source can independently earn its next step.
 
-Prepared text enters the native editor in one native `execCommand('insertHTML')` operation,
-with inline text nodes and BR line breaks, without an extra outer paragraph. Select the replacement/append range and
-recheck editor, focus and selection ownership before insertion. Synthetic clipboard events can
-be consumed without inserting into a cold editor; per-line `insertText` freezes large project
-frames and plain-text paste can turn them into file attachments. Verify the same editor's
-normalized text after insertion; do not add a second bootstrap insertion attempt.
+Prepared composer text enters through one native `execCommand('insertHTML')` operation with
+inline text nodes and BR line breaks, without an extra outer paragraph. The shell first switches
+only its exact native editor controller to plain-text mode. Its Markdown serializer can recognize
+code such as `tools["name"](value)` as a link and escape the whole message even when `literalPaste`
+marks survive; those marks alone do not prove the submitted bytes. `chatgpt-dom.js` uses
+`fiber.js`'s bounded synchronous composer action to prove the current editor/controller,
+route and existing text, change the editor-local mode, insert the authorized original and
+read back the native submission text. The synchronous boundary also preserves human Send's
+capture-phase Goal marker insertion. Unknown or ambiguous controllers fail before Send.
+The same exact native text is rechecked immediately before a programmatic click; receipt
+matching remains strict. An already-matching restored shell handoff draft takes this preparation
+before its source Send is reserved or armed. This changes no saved ChatGPT preference. The helper retains the
+original mode for that editor through helper replacement and restores it only when the same
+editor is empty, through existing scan/clear lifecycle. A changed or nonempty draft is never
+reparsed for cleanup. Classic and inline-editor insertion retain their existing path.
+Synthetic clipboard events can be consumed without inserting into a cold editor; per-line
+`insertText` freezes large project frames and plain-text paste can become a file attachment.
+Do not add a second bootstrap insertion attempt.
 Provider paragraph normalization alone does not revoke the draft lease; trusted edits, changed
 editor/route identity and attachment changes still do.
 
@@ -1735,7 +1747,7 @@ while leaving ChatGPT's messages, model execution and account permissions with t
 | Component | Responsibility |
 | --- | --- |
 | `chatgpt-dom.js` | All provider selectors and DOM-shape assumptions, composer/upload/model/turn primitives. |
-| `fiber.js` | Bounded MAIN-world React evidence: messages, request ids, generation/model state and installed connector declarations. |
+| `fiber.js` | Bounded MAIN-world React evidence: messages, request ids, generation/model state and installed connector declarations; the exact editor-local composer action described in §11. |
 | `usage.js` | Bounded account-usage and exact live stream request-origin observation. |
 | `content.js` | Isolated-world recording, exact turn/navigation ownership, input/command execution, native-page companion UI. |
 | `background.js` | MV3 journal and HTTP transport, tab/document registry, command elections and durable ACK custody. |
@@ -2052,8 +2064,9 @@ answers a call. `f/conversation/resume` streams feed request origins too. Typed 
 accept the provider's exact underscore recipient spelling as well as the original app name.
 Only the latest exchange's running hint describes the composer; unfinished historical exchanges
 cannot block a completed current answer. UUID workflow ids and complete root-add stream envelopes
-feed the existing request-origin owner. The shell's Markdown editor receives prepared text through
-its native literalPaste mark in the same single HTML edit, preserving punctuation and line breaks.
+feed the existing request-origin owner. Prepared shell composer text uses the exact native
+controller's editor-local plain-text mode and one HTML edit (§11), not `literalPaste` as proof
+against the provider's whole-document Markdown serialization.
 Classic editor insertion is unchanged. Shell prompt presentation requires the current exact
 message stamp and the same strict context-frame parser, retaining original recording bytes.
 The shell keeps its native activity/answer presentation; no alternate Overwrite or upload owner is added.

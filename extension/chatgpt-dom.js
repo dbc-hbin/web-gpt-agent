@@ -1891,7 +1891,32 @@ var CLF_DOM = (() => {
    * not a reason to hold a finished Goal reply at "sending" (2026-09-03: one letter did).
    */
   function insertPrompt(value, mode = false, failure = () => undefined) {
-    return insertIntoEditor(composer(), value, mode, failure, box => composer() === box);
+    const box = composer();
+    if (!box?.closest('form[data-chatgpt-composer]')) return insertIntoEditor(box, value, mode, failure, editor => composer() === editor);
+    const result = nativeComposerEdit(box, 'insert', value, mode);
+    if (result !== 'ok') { safe(() => failure(result), undefined); return false; }
+    return composer() === box;
+  }
+
+  /** Primitive synchronous bridge, including native human Send's capture-phase Goal insertion. */
+  function nativeComposerEdit(box, operation, value = '', mode = false) {
+    const nonce = crypto.randomUUID();
+    try {
+      box.setAttribute('data-clf-composer-edit', nonce);
+      box.removeAttribute('data-clf-composer-edit-result');
+      box.dispatchEvent(new CustomEvent('clf-composer-edit', { bubbles: true, detail: JSON.stringify({
+        v: 1, nonce, operation, href: location.href, expected: box.textContent || '', value, mode
+      }) }));
+      const result = box.getAttribute('data-clf-composer-edit-result');
+      return result?.startsWith(`${nonce}:`) ? result.slice(nonce.length + 1) : 'native_editor_unavailable';
+    } catch {
+      return 'native_edit_failed';
+    } finally {
+      if (box.getAttribute('data-clf-composer-edit') === nonce) {
+        box.removeAttribute('data-clf-composer-edit');
+        box.removeAttribute('data-clf-composer-edit-result');
+      }
+    }
   }
 
   /**
@@ -1962,6 +1987,7 @@ var CLF_DOM = (() => {
       document.execCommand('selectAll', false);
       document.execCommand('delete', false);
       box.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'deleteContentBackward', data: null }));
+      if (box.textContent === '' && box.closest('form[data-chatgpt-composer]')) nativeComposerEdit(box, 'retire');
       return (box.textContent || '').trim() === '';
     }, false);
   }
@@ -2064,6 +2090,7 @@ var CLF_DOM = (() => {
                 !box.isConnected || draftText() !== submitted || busy() || sendButton() !== button ||
                 !sendButtonEnabled(button) || box.getAttribute('aria-disabled') === 'true' ||
                 box.getAttribute('contenteditable') === 'false') return finish(false);
+            if (box.closest('form[data-chatgpt-composer]') && nativeComposerEdit(box, 'verify', submitted) !== 'ok') return finish(false);
             attempted = true;
             // The deadline bounds readiness, not an already-dispatched receipt.
             // Keep this same observer and exact send lifetime until the provider

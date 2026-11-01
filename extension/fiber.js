@@ -9,8 +9,9 @@
  * no amount of DOM reading from the isolated world can recover the ones it folded away.
  * The same bounded bridge also reads account-evaluated model choices and the installed
  * connector's public tool declarations. Neither path exports account/session objects or
- * invokes React action callbacks; the named serverId$ signal is read only for durable
- * conversation identity. The isolated world owns UI actions and operation claims.
+ * invokes arbitrary React action callbacks; the named serverId$ signal is read only for durable
+ * conversation identity. The one explicit composer action below changes only an exact native
+ * editor's local input mode and text. The isolated world still owns Send and operation claims.
  *
  * Everything here is written on the assumption that it is the least trusted code in the
  * extension:
@@ -175,6 +176,9 @@
   // at load time there is nothing to be done about it, but it cannot do so afterwards.
   const post = window.postMessage.bind(window);
   const own = Object.prototype.hasOwnProperty;
+  const parseComposerRequest = JSON.parse.bind(JSON);
+  const COMPOSER_EDIT = 'clf-composer-edit';
+  let composerModeLease = null;
 
   /** A short, plain string or null. Never a number, object, or anything with a toString. */
   function str(value) {
@@ -2034,6 +2038,7 @@
    * them onto the exact node for the isolated world; every scan clears any other node, so a
    * stamp is a routed projection, never authority. Ambiguity leaves every stamp unset. */
   function shellControlStamps() {
+    retireComposerMode();
     const shown = node => node.getClientRects().length > 0 && !node.closest(`${OWN_SURFACES},[hidden],[aria-hidden="true"],[inert]`);
     const stamp = (attribute, node, value) => {
       for (const old of document.querySelectorAll(`[${attribute}]`)) if (old !== node) old.removeAttribute(attribute);
@@ -2082,6 +2087,114 @@
       fiberOf(button)?.return?.memoizedProps?.animatedIcon === 'sidebar-new-chat');
     stamp('data-clf-new-chat', newChat.length === 1 ? newChat[0] : null, newChat.length === 1 ? location.pathname : null);
   }
+  /** One visible native shell editor, including its plaintext mode (which removes the Markdown attribute). */
+  function shellComposerEditor() {
+    const candidates = [...document.querySelectorAll('form[data-chatgpt-composer] [contenteditable="true"][role="textbox"]')].filter(node => {
+      if (!node.isConnected || !node.getClientRects().length ||
+          node.closest(`${OWN_SURFACES},[data-turn-key],.markdown,[hidden],[aria-hidden="true"],[inert]`)) return false;
+      for (let at = node; at; at = at.parentElement) {
+        const style = getComputedStyle(at);
+        if (style.display === 'none' || style.visibility === 'hidden' || style.visibility === 'collapse') return false;
+      }
+      return true;
+    });
+    return candidates.length === 1 ? candidates[0] : null;
+  }
+  /** KidQ's provider value / composerController prop, joined by the actual native view DOM. */
+  function shellComposerController(editor) {
+    const found = new Set();
+    for (let node = editor, depth = 0; node && depth < 8; depth++, node = node.parentElement) {
+      for (let fiber = fiberOf(node), up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
+        const props = fiber.memoizedProps;
+        for (const candidate of [props?.composerController, props?.value]) {
+          if (candidate?.view?.dom === editor && candidate.view.isDestroyed === false &&
+              typeof candidate.plainTextMode === 'boolean' && typeof candidate.setPlainTextMode === 'function' &&
+              typeof candidate.getChatGptPrompt === 'function') found.add(candidate);
+        }
+      }
+    }
+    return found.size === 1 ? [...found][0] : null;
+  }
+  /** No timer or observer: ordinary scans and exact clear/Send receipts retire only an empty editor. */
+  function retireComposerMode() {
+    const lease = composerModeLease;
+    if (!lease) return;
+    if (!lease.editor.isConnected || lease.controller.view.isDestroyed || lease.controller.view.dom !== lease.editor) {
+      composerModeLease = null;
+      return;
+    }
+    if (lease.editor.textContent !== '' || shellComposerEditor() !== lease.editor ||
+        shellComposerController(lease.editor) !== lease.controller || lease.controller.getChatGptPrompt()?.prompt !== '') return;
+    if (lease.controller.plainTextMode === true && lease.priorMode === false) lease.controller.setPlainTextMode(false);
+    if (lease.controller.plainTextMode === lease.priorMode) composerModeLease = null;
+  }
+  /**
+   * Synchronous primitive-only handshake: human Send interception must finish before the
+   * native click/Enter handler runs. No extension, settings, filesystem or tool authority.
+   */
+  const composerEditListener = event => {
+    const editor = event.target;
+    if (!(editor instanceof HTMLElement) || typeof event.detail !== 'string' || event.detail.length > 3_000_000) return;
+    let request;
+    try { request = parseComposerRequest(event.detail); } catch { return; }
+    if (!request || request.v !== 1 || typeof request.nonce !== 'string' || !/^[a-zA-Z0-9-]{1,64}$/.test(request.nonce) ||
+        editor.getAttribute('data-clf-composer-edit') !== request.nonce) return;
+    const reply = result => editor.setAttribute('data-clf-composer-edit-result', `${request.nonce}:${result}`);
+    try {
+      if (request.href !== location.href || typeof request.expected !== 'string' || request.expected.length > 240000 ||
+          editor.textContent !== request.expected || shellComposerEditor() !== editor) return reply('editor_changed');
+      const controller = shellComposerController(editor);
+      if (!controller) return reply('controller_unknown');
+      if (request.operation === 'retire') {
+        retireComposerMode();
+        return reply('ok');
+      }
+      if (typeof request.value !== 'string' || request.value.length > 240000) return reply('text_invalid');
+      if (request.operation === 'verify') {
+        const expected = composerModeLease?.editor === editor && composerModeLease.controller === controller
+          ? composerModeLease.text : request.value;
+        return reply(controller.plainTextMode === true && controller.getChatGptPrompt()?.prompt === expected ? 'ok' : 'native_text_mismatch');
+      }
+      if (request.operation !== 'insert' || ![false, true, 'append'].includes(request.mode)) return reply('mode_invalid');
+      if (request.value === '' && request.mode !== true) return reply('text_invalid');
+      if (request.mode === false && request.expected.trim()) return reply('existing_draft');
+      retireComposerMode();
+      if (composerModeLease && (composerModeLease.editor !== editor || composerModeLease.controller !== controller)) return reply('editor_changed');
+      const before = controller.getChatGptPrompt()?.prompt;
+      if (typeof before !== 'string' || before.length > 240000) return reply('text_invalid');
+      const value = request.mode === 'append' && request.expected.trim() ? `${before}\n${request.value}` : request.value;
+      if (value.length > 240000) return reply('text_invalid');
+      editor.focus();
+      if (request.href !== location.href || editor.textContent !== request.expected ||
+          document.activeElement !== editor || shellComposerEditor() !== editor ||
+          shellComposerController(editor) !== controller) return reply('editor_changed');
+      composerModeLease ||= { editor, controller, priorMode: controller.plainTextMode, text: before };
+      // Conversion of a restored draft may escape it. The authorized replacement below
+      // always uses the captured original, never that conversion's intermediate text.
+      controller.setPlainTextMode(true);
+      if (controller.plainTextMode !== true || request.href !== location.href || !editor.isConnected ||
+          shellComposerEditor() !== editor || shellComposerController(editor) !== controller) return reply('mode_refused');
+      const selection = document.getSelection();
+      if (!selection || document.activeElement !== editor) return reply('selection_changed');
+      selection.selectAllChildren(editor);
+      const paragraph = document.createElement('p');
+      value.split('\n').forEach((line, index) => {
+        if (index) paragraph.append(document.createElement('br'));
+        paragraph.append(document.createTextNode(line));
+      });
+      if (value === '') paragraph.append(document.createElement('br'));
+      if (!document.execCommand('insertHTML', false, paragraph.innerHTML)) return reply('native_edit_rejected');
+      // Flush native DOM reconciliation through its existing selectionchange handler.
+      document.dispatchEvent(new Event('selectionchange'));
+      if (request.href !== location.href || shellComposerEditor() !== editor || shellComposerController(editor) !== controller ||
+          controller.plainTextMode !== true || controller.getChatGptPrompt()?.prompt !== value) return reply('native_text_mismatch');
+      composerModeLease.text = value;
+      retireComposerMode();
+      return reply('ok');
+    } catch {
+      reply('native_edit_failed');
+    }
+  };
   // The native closed picker does not mount composerIntelligencePickerState.
   // Its own ancestor carries the current execution model; its visible label
   // carries the selected effort. These are observation, never catalog discovery.
@@ -2351,6 +2464,19 @@
   // Re-execution is a repair, not a marker check. A stale primitive marker could survive
   // while its listener did not, so keep the actual listener and always replace it.
   const prior = window[ACTIVE_HELPER];
+  if (prior && typeof prior.composerEditListener === 'function') document.removeEventListener(COMPOSER_EDIT, prior.composerEditListener, true);
+  if (prior && typeof prior.retireComposerMode === 'function') {
+    try { prior.retireComposerMode(); } catch { /* A nonempty or changed editor remains untouched. */ }
+  }
+  if (prior && typeof prior.takeComposerModeLease === 'function') {
+    try {
+      const lease = prior.takeComposerModeLease();
+      if (lease?.editor instanceof HTMLElement && lease.editor.isConnected &&
+          shellComposerController(lease.editor) === lease.controller &&
+          typeof lease.priorMode === 'boolean' && typeof lease.text === 'string' && lease.text.length <= 240000)
+        composerModeLease = lease;
+    } catch { /* An unproved prior owner cannot change an editor's mode. */ }
+  }
   if (prior && typeof prior.listener === 'function') {
     try {
       window.removeEventListener('message', prior.listener);
@@ -2359,5 +2485,13 @@
     }
   }
   window.addEventListener('message', listener);
-  window[ACTIVE_HELPER] = { version: VERSION, listener };
+  document.addEventListener(COMPOSER_EDIT, composerEditListener, true);
+  window[ACTIVE_HELPER] = {
+    version: VERSION, listener, composerEditListener, retireComposerMode,
+    takeComposerModeLease: () => {
+      const lease = composerModeLease;
+      composerModeLease = null;
+      return lease;
+    }
+  };
 })();
