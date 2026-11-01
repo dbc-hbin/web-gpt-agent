@@ -412,22 +412,22 @@ export async function flushSessions(): Promise<void> {
 }
 
 /**
- * Waits only for mutations that belong to one session, then makes its summary current on disk.
+ * Waits until every append already queued for one session is in events.jsonl, without
+ * writing its summary.
  *
- * A read of session A must not become a global write barrier for every other open session.
- * Besides the avoidable latency, the old `flushSessions()` call meant polling one chat could
- * force metadata churn for dozens of unrelated generating chats. The per-session queue already
- * is the serialization boundary, so joining that target queue is both sufficient and stronger:
- * it also waits for an in-flight reconstruction of this exact session before deciding whether
- * there is anything live to flush.
+ * Event readers need only that: an open session's summary is read from memory, and
+ * meta.json stays batched by scheduleMeta. Forcing the summary write here made every
+ * recorded tool call pay a meta.json replacement before ChatGPT received its result.
+ * A read of session A is not a barrier for any other session; it also waits for an
+ * in-flight reconstruction of this exact session.
  */
-async function flushSession(sessionId: string): Promise<void> {
+async function settleSessionWrites(sessionId: string): Promise<void> {
   let entry = open.get(sessionId);
   if (!entry) {
     const reconstructing = opening.get(sessionId);
     if (reconstructing) entry = await reconstructing;
   }
-  if (entry) await flushSessionEntry(entry);
+  if (entry) await entry.queue;
 }
 
 async function flushSessionEntry(entry: OpenSession): Promise<void> {
@@ -1523,7 +1523,7 @@ export interface ReadOptions {
  */
 export async function readEvents(sessionId: string, options: ReadOptions = {}): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const from = options.from ?? 0;
   const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
 
@@ -1653,7 +1653,7 @@ export async function readRecentEvents(
   options: Pick<ReadOptions, 'kinds' | 'agent'> & { maxBytes?: number; before?: number; after?: number; orderByOrigin?: boolean } = {}
 ): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   return readRecentEventsFromDisk(sessionId, limit, options);
 }
 
@@ -1661,7 +1661,7 @@ export async function readRecentEvents(
  * which have no native user bubble and cannot grant another error reload. */
 export async function readLatestUserMessage(sessionId: string, _turnId?: string | null): Promise<Extract<SessionEvent, { kind: 'user_message' }> | undefined> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const summary = await readAuthoritativeSummary(sessionId);
   const [message] = await readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
     before: Number.POSITIVE_INFINITY, acceptEvent: (event: SessionEvent) => !injectedUserMessage(event, summary?.timelineTurns) });
@@ -1678,7 +1678,7 @@ export async function readLatestUserMessage(sessionId: string, _turnId?: string 
 export async function readUserMessageByMessageId(sessionId: string, messageId: string): Promise<Extract<SessionEvent, { kind: 'user_message' }> | null> {
   if (!messageId) return null;
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const event = entry.messages.get(`user_message\u0000${messageId}`);
   return event?.kind === 'user_message' ? event : null;
 }
@@ -1694,7 +1694,7 @@ function isTurnCorrection(event: SessionEvent, turnId?: string | null, turns?: T
  * retain their authored position so replaying an old question cannot cancel current work. */
 export async function readRecoveryBoundary(sessionId: string, turnId?: string | null): Promise<SessionEvent | undefined> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   // Read under this session's existing queue. Another read or metadata flush
   // must not invalidate the boundary and permanently spend a valid silence grant.
   return enqueueSessionOperation(entry, 'recovery boundary read', async () => {
@@ -1715,7 +1715,7 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   messageId: string; turnId: string | null; completedAt: number; contentSeq: number; text: string;
 } | null> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const revision = entry.nextSeq;
   if (entry.summary.conversationId !== conversationId) return null;
   const [recent, questions] = await Promise.all([
@@ -1767,7 +1767,7 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
 /** Recorded local execution, not a native tool label or a request-id sighting alone. */
 export async function turnHasMcpCall(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   // Attribution repair appends historical calls, often without a known turn. Such a tail
   // cannot erase earlier exact proof. Filter inside one bounded-buffer reverse scan so a
   // missing proof does not repeatedly rescan the journal for each presentation page.
@@ -1803,7 +1803,7 @@ export async function conversationHasMcpCallSince(
   sessionId: string, conversationId: string, startedAt: number, turnId: string | null
 ): Promise<boolean> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const calls = await readRecentEventsFromDisk(sessionId, 1, {
     kinds: ['tool_call'], before: Number.POSITIVE_INFINITY,
     // Repaired calls may lack a local turn id. Exact conversation and original call

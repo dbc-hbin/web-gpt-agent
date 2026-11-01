@@ -48,6 +48,7 @@ import {
   readEvents,
   readActivityEvents,
   readRecentEvents,
+  readCompletedFinal,
   readLatestUserMessage,
   turnHasMcpCall,
   conversationHasMcpCallSince,
@@ -105,6 +106,27 @@ const evidence = (patch: Partial<ReturnType<typeof emptyEvidence>> = {}) => ({ .
 // ------------------------------------------------------------------- store
 
 describe('session store', () => {
+  it('reads queued events without writing the batched summary', async () => {
+    const session = await createSession({ title: 'read barrier', conversationId: 'barrier-chat' });
+    await flushSessions();
+    const meta = path.join(sessionsRoot(), session.id, 'meta.json');
+    const before = await fs.readFile(meta, 'utf8');
+    // Only the summary batch timer is fake; file I/O stays real.
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+    try {
+      await appendEvent(session.id, { time: 100, source: 'extension', kind: 'turn_start', turnId: 'barrier-turn' });
+      await appendEvent(session.id, { time: 101, source: 'extension', kind: 'turn_end', turnId: 'barrier-turn', outcome: 'completed' });
+      expect((await readEvents(session.id)).map(event => event.kind)).toEqual(['turn_start', 'turn_end']);
+      expect((await readRecentEvents(session.id, 1))[0]?.kind).toBe('turn_end');
+      await readCompletedFinal(session.id, 'barrier-chat');
+      expect(await fs.readFile(meta, 'utf8')).toBe(before);
+      await flushSessions();
+    } finally {
+      vi.useRealTimers();
+    }
+    expect(await fs.readFile(meta, 'utf8')).not.toBe(before);
+  });
+
   it('uses original call time and exact conversation for late attribution health proof', async () => {
     const conversationId = 'health-current';
     const session = await createSession({ title: 'attribution health', conversationId });
