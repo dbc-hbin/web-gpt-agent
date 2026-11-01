@@ -3337,7 +3337,9 @@ resolved. Review also projects ancestor-folder markers in the Files tree and bou
 (`createProjectDiffViewer`, `@codemirror/merge`). Review is a second `createFilePanel({ reviewOnly })`
 instance in the same right work slot as Files, Sub-agents and Work, with its own header toggle
 (`reviewPanelToggle`); opening one pane hides the others. The Files toolbar's Changes button opens
-Review. Review adds no second file watcher (it follows `projectGit:changed`) and exposes no
+Review. Review adds no second file watcher: the visible pane (Files or Review) owns the window's
+project watch, and an open Review registers only the project's Git watch (no folder watches), so
+it keeps following `projectGit:changed` after replacing Files. It exposes no
 Files write actions. It names the checked-out branch and offers a searchable, read-only comparison
 against locally known branch refs. Selecting a ref never switches branches or fetches remote
 data. The comparison shows committed changes from the selected ref's merge base to current HEAD,

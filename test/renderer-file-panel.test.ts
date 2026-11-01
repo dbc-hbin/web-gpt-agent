@@ -599,8 +599,36 @@ it('shows Files and the read-only Review projection at once without a second fil
   expect(bottom.querySelector('.file-changes-header-content')?.contains(bottom.querySelector('.file-changes-header-title'))).toBe(true);
   expect(bottom.querySelector('.file-changes-header-content')?.contains(bottom.querySelector('.file-panel-refresh'))).toBe(false);
   expect(window.api.listProjectFiles).toHaveBeenCalledTimes(1);
-  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(fileWatchCalls);
+  // Review watches the project's Git state only; it adds no folder watches of its own.
+  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(fileWatchCalls + 1);
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, []);
   expect(window.api.getProjectGitSnapshot).toHaveBeenCalled();
+});
+
+it('keeps the project Git watch while Review replaces Files in the shared slot, and releases it when Review closes', async () => {
+  // The chat wiring: opening either pane hides the other one.
+  let files: { hide(): void } | null = null;
+  let review: { hide(): void; show(): Promise<void> } | null = null;
+  const reviewToggle = document.createElement('button');
+  const filesPanel = files = createFilePanel({ host, toggle, onShow: () => review?.hide(), onOpenChanges: () => void review?.show() });
+  const reviewPanel = review = createFilePanel({ host, toggle: reviewToggle, reviewOnly: true, onShow: () => files?.hide() });
+  filesPanel.update(projectA); reviewPanel.update(projectA);
+  await filesPanel.show(); await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, ['']);
+
+  await reviewPanel.show(); await tick();
+  expect(filesPanel.visible()).toBe(false);
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, []);
+  const reads = vi.mocked(window.api.getProjectGitSnapshot).mock.calls.length;
+  vi.useFakeTimers();
+  try {
+    projectGitChanged!({ projectId: projectA.id });
+    await vi.advanceTimersByTimeAsync(120);
+  } finally { vi.useRealTimers(); }
+  expect(window.api.getProjectGitSnapshot).toHaveBeenCalledTimes(reads + 1);
+
+  reviewPanel.hide(); await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(null, []);
 });
 
 it('returns a recorded edit to Review rather than exposing Files actions', async () => {

@@ -352,6 +352,7 @@ export function createFilePanel(options: FilePanelOptions) {
   let expanded = new Set<string>(['']);
   const listings = new Map<string, ProjectDirectoryListing>();
   let watchSignature = '';
+  let watchOwned = false;
   let previewHeight: number | null = null;
   try {
     const saved = Number(window.localStorage.getItem(PREVIEW_HEIGHT_KEY));
@@ -1551,12 +1552,16 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function syncWatches(): void {
-    if (options.reviewOnly) return;
     const current = pane.hidden ? null : project;
-    const directories = current ? watchedDirectories() : [];
+    // The visible panel owns the window's project watch. Review registers no folder watches, only
+    // the project's Git watch, so projectGit:changed keeps arriving while it replaces Files. A
+    // hidden panel that owns no watch must not close the one its visible sibling registered.
+    if (!current && !watchOwned) { watchSignature = '<none>'; return; }
+    const directories = current && !options.reviewOnly ? watchedDirectories() : [];
     const signature = current ? `${current.id}\0${directories.join('\0')}` : '<none>';
     if (signature === watchSignature) return;
     watchSignature = signature;
+    watchOwned = current !== null;
     void window.api.watchProjectFiles(current?.id ?? null, directories).then(reply => {
       if (!reply.ok && watchSignature === signature) watchSignature = '';
     });
