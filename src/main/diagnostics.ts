@@ -12,6 +12,7 @@
  */
 
 import { getStatus, isServerRunning, tunnelHealthBase } from './connection.js';
+import { startupLines } from './startup-timing.js';
 
 import { effectiveCapabilities, getConfig } from './config.js';
 import { logInfo, logWarn } from './logger.js';
@@ -367,6 +368,10 @@ export async function runDiagnostics(): Promise<Diagnosis> {
   // 7. The failure that looks exactly like success: ChatGPT connects, this app
   //    answers, and the model is still not allowed to call anything.
   checks.push(developerMode(seen, lastToolCallAt()));
+
+  // Informational: how long this start took, beside earlier starts.
+  const startup = startupLines();
+  if (startup.length) checks.push({ name: 'Startup', status: 'skipped', ok: null, detail: startup.join(' · ') });
 
   const broken = checks.filter((c) => c.status === 'fail');
   const incomplete = checks.filter((c) => c.status === 'not-run');

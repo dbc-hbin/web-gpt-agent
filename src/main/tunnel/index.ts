@@ -19,6 +19,7 @@ import path from 'node:path';
 import type { ConnectionState, TunnelHealth, TunnelSettings } from '../../shared/types.js';
 import { childEnv, terminateProcessTree } from '../exec.js';
 import { logError, logInfo, logWarn } from '../logger.js';
+import { markStartup } from '../startup-timing.js';
 import { ago, POLL_FRESH_MS, readClientStatus, readPollHealth } from './health.js';
 import { locateBinary } from './locate.js';
 
@@ -306,6 +307,7 @@ async function startOpenAiTunnel(opts: TunnelStartOptions): Promise<TunnelHandle
     const first = run.shown !== 'connected';
     run.shown = 'connected';
     if (first) logInfo(`${tag} connected`);
+    if (first && opts.label === 'core') markStartup('tunnel');
     // Re-reported on every tick, so the UI can show how fresh the proof is.
     opts.report({
       state: 'connected',
@@ -737,6 +739,7 @@ async function startCloudflared(opts: TunnelStartOptions): Promise<TunnelHandle>
       settled = true;
       const publicUrl = `${match[0]}${local.pathname}`;
       logInfo('quick tunnel connected');
+      markStartup('tunnel');
       opts.report({
         state: 'connected',
         detail: 'Connected. Paste the URL below into ChatGPT as a custom connector.',

@@ -57,6 +57,8 @@ import {
   type SwarmSnapshot
 } from './agents.js';
 import { flushDurable, initDurableStore, readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
+import { performance } from 'node:perf_hooks';
+import { createStartupTiming, installStartupTiming, markStartup, STARTUP_STATE } from './startup-timing.js';
 import { closeCorrelationStore, restoreRequestCorrelations } from './session/correlation.js';
 import { restoreBlockedChats } from './session/blocked-chats.js';
 import {
@@ -228,6 +230,11 @@ void app.whenReady().then(async () => {
   // The GUI client owns visible macOS application presence. Hiding this windowless host does
   // not disable its native dialogs, notifications, Keychain access, or desktop helper APIs.
   if (process.platform === 'darwin') app.dock?.hide();
+  // Startup timing (ms since the process started); saved and compared once the store is open.
+  const startupTiming = createStartupTiming({ clock: () => performance.now(), now: Date.now, version: app.getVersion(), log: logInfo,
+    save: runs => writeDurableSoon(STARTUP_STATE, runs) });
+  installStartupTiming(startupTiming);
+  markStartup('ready');
   const userData = app.getPath('userData');
   // Read back rather than trusting the set: every store below is rooted here, and a silent
   // disagreement between the directory we resolved and the one Electron reports would be
@@ -264,8 +271,10 @@ void app.whenReady().then(async () => {
   try { await initSkillsPath(userData); }
   catch (error) { logWarn(`Skills library unavailable: ${error instanceof Error ? error.message : String(error)}`); }
   initDurableStore(userData);
+  startupTiming.restore(await readDurable<unknown>(STARTUP_STATE));
   await restoreChatModels();
   await loadConfig();
+  markStartup('config');
   await pluginManager.initialize(userData);
   onEmbeddedCuaChanged(() => {
     forgetExposedSurface();
@@ -485,6 +494,7 @@ void app.whenReady().then(async () => {
   }
 
   logInfo('app started');
+  markStartup('restored');
 
   // Historical Unattributed repair may legitimately scan and rewrite a large legacy bucket.
   // It is maintenance, not a prerequisite for showing the app or accepting new exact-id

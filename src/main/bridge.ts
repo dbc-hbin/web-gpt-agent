@@ -87,6 +87,7 @@ import {
   startGoalDraft
 } from './goal.js';
 import { logInfo, logWarn } from './logger.js';
+import { markStartup } from './startup-timing.js';
 import {
   closeConversation,
   liveConversations,
@@ -2428,6 +2429,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     await setSecret('bridgeToken', token);
     noteBrowserSeen();
     logInfo('bridge: browser extension connected and provisioned');
+    markStartup('extension');
     changed();
     return json(res, 200, { token, installation_id: getInstallationId() }, origin);
   }
