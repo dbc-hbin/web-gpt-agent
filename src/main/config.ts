@@ -135,6 +135,7 @@ const DEFAULT_GOAL: GoalSettings = {
   includeToolCalls: false,
   helperModel: 'gpt-5.6-sol',
   helperReasoning: 'high',
+  reviewerModel: '',
   enabled: false,
   // The mode a fresh install runs the moment somebody flips the switch. Goal, because it is
   // the one that can end by itself: a loop that never stops is a deliberate choice, not a
@@ -372,6 +373,8 @@ const configSchema = z.object({
       loopBackend: z.enum(['api', 'chatgpt']).optional().default('chatgpt'),
       helperModel: z.string().trim().min(1).max(80).optional().default('gpt-5.6-sol').catch('gpt-5.6-sol'),
       helperReasoning: z.enum(REASONING_EFFORTS).optional().default('high').catch('high'),
+      // Off when damaged: a reviewer costs a second model pass per step, so nothing turns it on by guess.
+      reviewerModel: z.string().trim().max(80).optional().default('').catch(''),
       // Repaired rather than rejected for the same reason `reasoning` below is: a config
       // written by a version that knows one more mode than this one must not send every root
       // and permission in the file through conservative recovery over a single word.
@@ -437,7 +440,7 @@ const configSchema = z.object({
         .catch(DEFAULT_GOAL.loopPrompt)
     })
     .optional()
-    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high' }),
+    .default({ ...DEFAULT_GOAL, backend: 'chatgpt', loopBackend: 'chatgpt', impulseMinutes: 0, includeToolCalls: false, helperModel: 'gpt-5.6-sol', helperReasoning: 'high', reviewerModel: '' }),
   mcp: z
     .object({
       // Repaired rather than rejected, like the Goal prompts above: this is free text a person

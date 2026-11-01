@@ -1516,5 +1516,14 @@
   "{0} more not listed": "{0} más sin listar",
   "Touched {0} files, no net change": "{0} archivos tocados, sin cambio neto",
   "Diff unavailable: this edit was not kept": "Diff no disponible: esta edición no se guardó",
-  "The request was not valid.": "La solicitud no era válida."
+  "The request was not valid.": "La solicitud no era válida.",
+  "Review each Goal step's changes": "Revisar los cambios de cada paso de Objetivo",
+  "A reviewer worker checks each Goal step's edits; its findings go into the next step. Uses more of your ChatGPT usage and covers only edits made with the edit tools.": "Un worker revisor comprueba los cambios de cada paso de Objetivo; sus hallazgos pasan al paso siguiente. Usa más de tu uso de ChatGPT y solo cubre los cambios hechos con las herramientas de edición.",
+  "Same model as the Goal chat": "El mismo modelo que el chat de Objetivo",
+  "Sub-agents are off": "Los subagentes están desactivados",
+  "The reviewer runs as a worker chat, so it needs Sub-agents. Nothing is reviewed until they are on.": "El revisor funciona como un chat de subagente, así que necesita Subagentes. No se revisa nada hasta que estén activados.",
+  "Turn on Sub-agents": "Activar Subagentes",
+  "Waiting for the reviewer": "Esperando al revisor",
+  "Continues without the review in {0}": "Continúa sin la revisión en {0}",
+  "Continuing without the review…": "Continuando sin la revisión…"
 }

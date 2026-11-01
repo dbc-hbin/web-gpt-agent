@@ -18593,6 +18593,15 @@ describe('the goal loop', () => {
       stage: 'Waiting for tool inactivity', detail: 'Checking again in 2:05', at: 0
     });
     expect(view({ phase: 'settling', wait: { reason: 'tools' } })).toMatchObject({ stage: 'Waiting for running tools', detail: '' });
+    // #1832: the step reviewer's limit is known, so its countdown shows.
+    expect(view({ phase: 'settling', wait: { reason: 'reviewer', until: live.window.Date.now() + 125_000 } })).toMatchObject({
+      stage: 'Waiting for the reviewer', detail: 'Continues without the review in 2:05'
+    });
+    // The next step's draft waits for the review before it asks the helper.
+    expect(view({ phase: 'requesting', model: MODEL, draft: { stage: 'sending', model: MODEL, text: '', reply: '' },
+      wait: { reason: 'reviewer', until: live.window.Date.now() + 125_000 } })).toMatchObject({
+      stage: 'Waiting for the reviewer', detail: 'Continues without the review in 2:05'
+    });
     expect(view({ phase: 'settling', wait: { reason: 'listening', until: live.window.Date.now() + 60_000 } })).toMatchObject({
       stage: 'Waiting for activity after recovery', detail: 'Checking again in 1:00'
     });

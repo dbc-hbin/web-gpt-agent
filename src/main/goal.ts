@@ -54,6 +54,7 @@ import { writeDurableNow, writeDurableSoon } from './durable.js';
 import { logInfo, logWarn } from './logger.js';
 import { getSecret } from './secrets.js';
 import { findSessionByConversation, getSession, readEvents, readHandoff, readRecentEvents, turnHasMcpCall } from './session/store.js';
+import { recordNote } from './session/recorder.js';
 import { foldProgress, type SessionEvent } from '../shared/session.js';
 import { isAstraModel, isProModel } from '../shared/chat-models.js';
 
@@ -645,6 +646,21 @@ export async function acceptGoalReplyNow(input: {
     persistGoalRepliesSoon();
     throw error;
   }
+  // A Goal step that owes its reply is reviewed if the person asked for that (#1832); never awaited.
+  const accepted = goalReplies.get(input.conversationId);
+  if (accepted?.replyId === input.replyId.slice(0, 200) && accepted.state === 'pending') {
+    void (async () => {
+      // The review scopes the step's edits by its exact turn; a reply alias is resolved, never guessed.
+      const turnId = await goalReplySourceTurn(input.sessionId, input.turnId);
+      if (!turnId) {
+        logInfo(`goal review: step ${input.turnId} in ${input.conversationId} is not tied to a turn yet; not reviewed`);
+        return;
+      }
+      // goal-reviewer.ts imports this module, so it is loaded when used rather than at startup.
+      const { startStepReview } = await import('./goal-reviewer.js');
+      await startStepReview({ conversationId: input.conversationId, sessionId: input.sessionId, turnId });
+    })().catch(() => undefined);
+  }
 }
 
 function handleGoalReply(conversationId: string, turnId?: string): void {
@@ -1002,6 +1018,10 @@ export async function setGoalSwitchNow(
       throw error;
     }
     notifyGoalChange();
+    // Goal stopped here, or turned to Loop: a step review in progress is cancelled (#1832).
+    // goal-reviewer.ts imports this module, hence the late import.
+    if (!next.enabled || next.mode !== 'goal') void import('./goal-reviewer.js')
+      .then(({ cancelStepReview }) => cancelStepReview(conversationId)).catch(() => undefined);
     return { enabled: next.enabled, mode: next.mode };
   });
 }
@@ -1643,6 +1663,21 @@ async function requestGoalDecision(request: GoalRequest): Promise<GoalDecision |
  * Everything else — a provider error, a cut stream, an unreadable shape — is passed straight
  * back, because whether *those* are worth asking again is the page's call and not this one's.
  */
+/**
+ * The step reviewer found a problem Goal cannot safely go past (#1832): switch Goal off for the
+ * chat and say why in its timeline, where the person reads it, instead of typing anything.
+ */
+async function pauseForReview(draft: GoalDraft, finding: string): Promise<void> {
+  logInfo(`goal: the reviewer found a problem Goal cannot safely go past in ${draft.conversationId}; pausing Goal`);
+  await setGoalSwitchNow(draft.conversationId, 'goal', false).catch(() => undefined);
+  const plain = finding.replace(/^BLOCKING:\s*/i, '');
+  const shown = plain.length > 300 ? `${plain.slice(0, 297)}...` : plain;
+  await recordNote(draft.sessionId, `Goal paused: the reviewer found a problem Goal cannot safely go past ("${shown}"). ` +
+    'Check it, then send a message or switch Goal back on.').catch(() => undefined);
+  draft.reply = '';
+  settle(draft, 'no-reply');
+}
+
 async function requestDrivingDecision(
   request: GoalRequest
 ): Promise<GoalDecision | { action: 'http'; error: string; retryAfterMs?: number }> {
@@ -1683,6 +1718,22 @@ async function run(draft: GoalDraft): Promise<void> {
     return settle(draft, 'failed', 'no_conversation');
   }
 
+  // The step reviewer's answer for this step (#1832): a blocking finding pauses Goal; any other goes
+  // after the message, and the helper is told it is there. A review still in progress is waited for,
+  // so the helper does not decide without it.
+  // goal-reviewer.ts imports this module, hence the late import.
+  const { awaitStepReview, reviewNote, reviewBlocks } = await import('./goal-reviewer.js');
+  const reviewTurn = draft.mode === 'goal' ? await goalReplySourceTurn(draft.sessionId, draft.turnId) ?? draft.turnId : draft.turnId;
+  const stepReview = draft.mode === 'goal'
+    ? await awaitStepReview(draft.conversationId, reviewTurn, () => !draft.acknowledged && drafts.get(draft.conversationId) === draft)
+    : null;
+  if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
+  if (stepReview && 'text' in stepReview && reviewBlocks(stepReview)) return pauseForReview(draft, stepReview.text);
+  const reviewLine = reviewNote(stepReview);
+  const reviewContext = reviewLine
+    ? [`A reviewer read the files the last step changed. This line is added after your message exactly as it is, so do not repeat it; act on it if it matters:\n${reviewLine}`]
+    : [];
+
   const abort = new AbortController();
   draft.abort = abort;
   const timer = setTimeout(() => abort.abort(), REQUEST_TIMEOUT_MS);
@@ -1704,8 +1755,8 @@ async function run(draft: GoalDraft): Promise<void> {
             ? [draft.loopSystemPrompt, goalObjectiveMessage(draft.objective)]
             : [draft.loopSystemPrompt]
           : draft.objective
-            ? [draft.objectiveSystemPrompt, goalObjectiveMessage(draft.objective)]
-            : [draft.systemPrompt],
+            ? [draft.objectiveSystemPrompt, goalObjectiveMessage(draft.objective), ...reviewContext]
+            : [draft.systemPrompt, ...reviewContext],
       messages: messages.length > 0 ? messages : [{ role: 'user', content: GOAL_OBJECTIVE_OPENING_TURN }],
       trailer:
         draft.mode === 'loop'
@@ -1737,7 +1788,13 @@ async function run(draft: GoalDraft): Promise<void> {
         logWarn(`goal: the loop would not write a message in ${draft.conversationId} with ${draft.model}`);
         return settle(draft, 'failed', 'loop_stop_refused');
       }
-      logInfo(`goal: ${draft.model} says the goal is met in ${draft.conversationId}; nothing was sent`);
+      logInfo(`goal: ${draft.model} says the goal is met in ${draft.conversationId}; nothing was sent${reviewLine ? ', including the reviewer\'s last findings' : ''}`);
+      // Findings with no next step to carry them are shown in the chat instead (#1832).
+      if (stepReview && 'text' in stepReview && reviewLine.startsWith('Reviewer: ')) {
+        await recordNote(draft.sessionId, `Goal reached. The reviewer's findings on the last step were not sent to ChatGPT: ${reviewLine.slice('Reviewer: '.length)}`)
+          .catch(() => undefined);
+        if (draft.acknowledged || drafts.get(draft.conversationId) !== draft) return;
+      }
       // Reaching the goal ends this Goal run, not the user's saved objective. Keeping the text
       // lets a reopened chat show what it was pursuing and lets a later manual correction such
       // as "that did not work" continue against the same objective. Nothing auto-restarts here:
@@ -1747,7 +1804,10 @@ async function run(draft: GoalDraft): Promise<void> {
     }
     // Typed rather than written. See humanReply: the em dashes go, and a couple of the
     // mistakes a person leaves behind go in. After the NO_REPLY test above, never before it.
-    draft.reply = draft.backend === 'templates' ? humanReply(decision.reply.slice(0, -GOAL_MARKER_INSTRUCTION.length)) + GOAL_MARKER_INSTRUCTION : humanReply(decision.reply);
+    const reviewed = reviewLine ? `\n\n${reviewLine}` : '';
+    draft.reply = draft.backend === 'templates'
+      ? humanReply(decision.reply.slice(0, -GOAL_MARKER_INSTRUCTION.length)) + reviewed + GOAL_MARKER_INSTRUCTION
+      : humanReply(decision.reply) + reviewed;
     logInfo(`goal: drafted ${decision.reply.length} characters for ${draft.conversationId} with ${draft.model}`);
     settle(draft, 'ready');
   } catch (err) {

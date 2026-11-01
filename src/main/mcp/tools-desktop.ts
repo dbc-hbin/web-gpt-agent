@@ -16,7 +16,7 @@ import { isChatBlocked } from '../session/blocked-chats.js';
 import { compactingConversation } from '../session/continuation.js';
 import { dormantWorkerNotice, endedWorkerNotice, retiredWorkerForConversation } from '../agents.js';
 import { noteOutcome, type CallContext } from './call-context.js';
-import { dispatch, fail, type SurfaceRegistrar, type ToolResult } from './kernel.js';
+import { dispatch, fail, reviewerRefusal, type SurfaceRegistrar, type ToolResult } from './kernel.js';
 import { registerBrowserTools } from './tools-browser.js';
 import { markExternalOutcomeUnknown } from './tools-external.js';
 
@@ -162,6 +162,9 @@ function refused(reason: string): ToolResult {
 /** The nested call keeps the upstream MCP envelope, including image blocks and structuredContent. */
 export async function invokeDesktopCua(name: string, value: unknown, parent: CallContext): Promise<ToolResult> {
   return dispatch(name, value, parent.caller.transportKey, parent.caller.requestId, 'desktop', async () => {
+    // The Goal step reviewer does not change things (#1832): native input is refused in its chat.
+    const reviewer = reviewerRefusal(name, isCuaReadOnlyTool(name));
+    if (reviewer) return reviewer;
     if (!desktopAutomationSupported()) return refused('CUA_PLATFORM_UNSUPPORTED: native Desktop requires supported macOS or Windows; browser tools remain available.');
     const catalog = embeddedCuaCatalog();
     if (!catalog) return refused('CUA_DRIVER_UNAVAILABLE: the app-owned bundled CUA Driver is not ready.');

@@ -195,6 +195,7 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | Recover ordinary/agent tabs | Off. | Goal/Loop can independently justify recovery; history alone cannot. |
 | Automatic Continue | On. | Unfinished-response recovery also serves enabled Goal/Loop. This switch controls ordinary chats; explicit Off survives and malformed config disables it. See §14. |
 | Goal / Loop | Off, preferred mode Goal. Both decision backends default to ChatGPT, helper `gpt-5.6-sol` High. | API uses the configured OpenRouter/custom endpoint and stored model. These defaults are not account-availability proof. |
+| Goal step reviewer | Off (`goal.reviewerModel`: `''` off, `'same'` the Goal chat's own model, or a model id). | Missing, too long or non-text values load as Off; an id the account does not offer falls back to the chat's model with one log line. Needs Sub-agents; never reviews Loop. See §17. |
 | Desktop | Windows on; macOS retains its off default and separate native OS consent; Linux supports extension browser control. | Existing screen/control grants also govern browser tools; unsupported native clipboard remains masked. No new per-tab permission dialog. |
 | Shell/UI | Dark theme, minimize to tray, no automatic connector connection/login startup by default. | Optional browser/finish/plan choices are resolved by current config and their consumer, not invented from absent fields. |
 | Plugin auto-refresh | Off. | Local status/discovery never claims ChatGPT refreshed its connector snapshot. |
@@ -2859,6 +2860,15 @@ commit publication gap. Old source requests retain their historical proof and ca
 prime authority in the successor. Distinct fleets remain distinct; process custody stays with
 the same durable session.
 
+The Goal step reviewer (§17) is an ordinary worker in the Goal chat's own family, marked
+`reviewer` on its `AgentInfo` (`reviewAskedAt` is when it was last asked). Only the app sets the
+mark: `spawn` accepts it from `goal-reviewer.ts`, never from the agents tool. It is labelled
+"Reviewer", its brief may be `REVIEW_TEXT_CHARS` long (not the 4,000-character task), and the next
+brief wakes it through `stageMessages(..., { review: true })`, which alone lifts the message limit
+for a reviewer recipient and restamps `reviewAskedAt`. It starts in the Goal chat's folder and gets
+no worktree, so it sees the step's uncommitted changes. `isReviewerConversation` (live or parked)
+drives the kernel's `reviewerRefusal`; `reviewerFor` names the chat's newest usable reviewer.
+
 The app's configurable worker capacity is distinct from the coding agent's delegation policy
 in §19. Do not infer permission to launch development subagents from a product feature toggle.
 
@@ -3037,6 +3047,54 @@ never counts as a source decision. Settled transport/settings failures retain th
 and do not trigger source reloads while awaiting intervention. Normal and restored committed
 resumes share one projection: move objective/switch, retire A's debt, and let B earn its own.
 Current persistence/publication exceptions are in §21.
+
+### Goal step reviewer (upstream #1879)
+
+Off by default (`goal.reviewerModel`, Settings → Agents & automation, under the Goal rows). The row
+names the cost (a second model pass per reviewed step) and the coverage: only edits made with the
+edit tools are reviewed, not files changed by commands, and never in Loop. Chosen while
+Sub-agents are off, a second row offers **Turn on Sub-agents** (Home's own switch, only on the
+person's press; a refused save unticks it again).
+
+When `acceptGoalReplyNow` records a **pending** reply in `goal` mode, `goal-reviewer.ts`
+`startStepReview` (never awaited) resolves the exact turn (`goalReplySourceTurn`; an unresolved
+`reply:` alias is not reviewed), reads that turn's own edits (`session/turn-changes.ts`, the
+"Changed files" records) and, when there are any, writes the brief (`goal-review.ts`): the Goal,
+the step's instruction, each changed file with its state, counts and number of edits, then the
+net unified diffs (`text-diff.ts`) in first-changed order, whole, as many as fit
+`REVIEW_BRIEF_CHARS`; the rest are named for the reviewer to read through Core. One reviewer per
+chat, reused (a sleeping one is woken with the next brief), replaced when it cannot be woken or
+the chosen model changed; an earlier review still running leaves this step unreviewed. Spawn and
+wake use the agents tool's own transaction (stage, `persistCriticalSwarmNow`, commit, then browser
+bootstrap/revival). No free worker slot: retried every 15 s up to `REVIEW_MAX_MS` (10 min).
+
+The reviewer reviews; it does not author. In its own chat the kernel refuses every tool not
+marked read-only before it runs (`reviewerRefusal` in `createRegistrar().register`, so direct and
+nested Core/Desktop tools alike; plugin tools by their plugin's own read-only mark in
+`runPluginTool`; native CUA input in `invokeDesktopCua`). Allowed: read-only tools,
+`exec_command`/`write_stdin` (diffs and tests), the `exec`/`wait` wrappers (each nested call is
+checked again), and the `agents` actions `status` and `finish`. Spawning or messaging a worker is
+refused, so no other chat can write for it. Commands are not read-only, so nothing calls the
+reviewer read-only; its brief asks it not to change files.
+
+There is no worker hold in this fork: the next step's draft (`goal.ts run()`) waits for the review
+itself (`awaitStepReview`, polling `reviewForDraft` every second) while it still looks for a slot
+or runs, up to `REVIEW_MAX_MS` from when it was asked, and no longer once the draft is replaced.
+`goalWaitFor` and a `sending` draft both report `{ reason: 'reviewer', until }`
+(`reviewWaitUntil`), so the app's Goal row and the page's composer status say "Waiting for the
+reviewer · Continues without the review in m:ss" instead of "Preparing a continuation". Workers
+finish under RESULT / CHANGES / VALIDATION / BLOCKERS, so the review is that RESULT
+(`reviewAnswer`), else the whole answer. It goes after the helper's message as `Reviewer: …` and
+the helper is told it is there; "No problems found" adds nothing; an overdue review adds
+"Reviewer did not answer in time."; a reviewer that stopped without answering ends the wait with
+"Reviewer could not review this step." An answer starting `BLOCKING:` pauses Goal instead
+(`pauseForReview`: switch off for the chat, a timeline note with the finding, nothing typed).
+When the helper ends the Goal with findings unsent, they become a timeline note. Switching the
+chat's Goal off or to Loop cancels a review in progress (as the person's own Clear on the
+worker's row); its chat stays. Reviews are in memory: after a restart Goal just goes on.
+Tests: `goal-review`, `goal-reviewer`, `goal-review-flow`, `text-diff`,
+`kernel-reviewer-readonly`, and the reviewer cases in `agents`, `bridge`, `config`, `ipc`,
+`plugins-surface`, `content-script`, `renderer-chat-models`, `renderer-state`, `renderer-timeline`.
 
 ## 18. Desktop workspace, plugins, connection and native control
 

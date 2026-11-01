@@ -8312,12 +8312,15 @@
       // the reply for the same reason — there was never anything to send.
       return { stage: 'Goal reached', detail: 'nothing was sent', body: '', kind: 'goal-done', ...bar(2, true) };
     }
-    if (goal.phase === 'settling' || (!draft && goal.wait)) {
+    // A next step's draft that waits for the Goal step reviewer (#1832) says so, with its deadline.
+    if (goal.phase === 'settling' || (!draft && goal.wait) || (draft?.stage === 'sending' && goal.wait?.reason === 'reviewer')) {
       const wait = goal.wait;
       const seconds = wait?.until ? Math.max(0, Math.ceil((wait.until - Date.now()) / 1000)) : 0;
-      const detail = seconds ? `Checking again in ${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}` : '';
+      const left = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
+      // The reviewer's deadline is when Goal goes on without the review, not another check.
+      const detail = !seconds ? '' : wait?.reason === 'reviewer' ? `Continues without the review in ${left}` : `Checking again in ${left}`;
       const stage = wait?.reason === 'native-busy' ? 'ChatGPT resumed work · waiting before retry' : wait?.reason === 'silence' ? 'Waiting before recovery reload' : wait?.reason === 'quiet' ? 'Waiting for tool inactivity' :
-        wait?.reason === 'tools' ? 'Waiting for running tools' : wait?.reason === 'listening' ? 'Waiting for activity after recovery' : 'Checking the answer is finished';
+        wait?.reason === 'reviewer' ? 'Waiting for the reviewer' : wait?.reason === 'tools' ? 'Waiting for running tools' : wait?.reason === 'listening' ? 'Waiting for activity after recovery' : 'Checking the answer is finished';
       return { stage, detail, body: '', kind: 'goal', ...bar(0) };
     }
     if (goal.phase === 'sending' && draft && draft.reply) {

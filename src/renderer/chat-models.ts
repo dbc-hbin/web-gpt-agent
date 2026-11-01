@@ -248,7 +248,7 @@ function discoverModels(): Promise<void> {
     const result = await run(window.api.requestChatModels()).catch(() => null);
     if (requested !== generation) return;
     catalog = result ?? { ...catalog, state: 'unavailable', error: t("Model discovery could not start.") };
-    for (const [modelId, effortId] of pairs) paintPair(modelId, effortId);
+    for (const [modelId, effortId] of pairs) paintPair(modelId, effortId); paintReviewer();
     paintComposerContext(); paintStatus();
   })();
   discovery = work.finally(() => { discovery = null; });
@@ -268,6 +268,23 @@ export async function ensureComposerModel(refresh = false): Promise<ReturnType<t
   return catalog.state === 'ready' && !catalog.error ? confirmedComposerModel() : null;
 }
 
+/**
+ * Who reviews each Goal step that edited files (#1832): Off, the Goal chat's own model, or one this
+ * account offers. A saved model the account no longer lists stays chosen and marked: the review then
+ * uses the chat's model.
+ */
+let reviewerChoice = '';
+function paintReviewer(value = reviewerChoice): void {
+  reviewerChoice = value;
+  const select = document.getElementById('goalReviewer') as HTMLSelectElement | null;
+  if (!select) return;
+  options(select, [
+    { id: '', label: () => t('Off') },
+    { id: 'same', label: () => t('Same model as the Goal chat') },
+    ...catalog.models.map(model => ({ id: model.id, label: model.label }))
+  ], value);
+}
+
 export function applyChatModels(config: Config, previous?: Config): void {
   // Preserve configured values even before an observation arrives; unrelated saves must not erase them.
   const chosen = (id: string, value: string, prior?: string) => {
@@ -276,12 +293,13 @@ export function applyChatModels(config: Config, previous?: Config): void {
   };
   paintPair('workerModel', 'workerReasoning', chosen('workerModel', config.multiAgent.defaultModel ?? '', previous?.multiAgent.defaultModel), chosen('workerReasoning', config.multiAgent.defaultReasoning ?? '', previous?.multiAgent.defaultReasoning));
   paintPair('helperModel', 'helperReasoning', chosen('helperModel', config.goal.helperModel ?? 'gpt-5.6-sol', previous?.goal.helperModel ?? 'gpt-5.6-sol'), chosen('helperReasoning', config.goal.helperReasoning ?? 'high', previous?.goal.helperReasoning ?? 'high'));
+  paintReviewer(chosen('goalReviewer', config.goal.reviewerModel ?? '', previous?.goal.reviewerModel ?? ''));
   if (catalogSubscribed && catalog.state !== 'unknown') return;
   const requested = ++generation;
   void window.api.getChatModels().then(result => {
     if (requested !== generation || !result?.ok || !result.data) return;
     catalog = result.data;
-    for (const [modelId, effortId] of pairs) paintPair(modelId, effortId);
+    for (const [modelId, effortId] of pairs) paintPair(modelId, effortId); paintReviewer();
     paintComposerContext();
     paintStatus();
   });
@@ -294,7 +312,7 @@ export function initChatModels(onPaint?: () => void): void {
     window.api.onChatModelsChanged(value => {
       // A current push supersedes every older startup/read/refresh response.
       ++generation; catalog = value;
-      for (const [modelId, effortId] of pairs) paintPair(modelId, effortId);
+      for (const [modelId, effortId] of pairs) paintPair(modelId, effortId); paintReviewer();
       paintComposerContext(); paintStatus();
     });
   }
@@ -315,6 +333,6 @@ export function initChatModels(onPaint?: () => void): void {
     });
   }
   for (const id of ['refreshChatModels', 'refreshComposerModels']) document.getElementById(id)?.addEventListener('click', () => { void discoverModels(); });
-  for (const [modelId, effortId] of pairs) paintPair(modelId, effortId);
+  for (const [modelId, effortId] of pairs) paintPair(modelId, effortId); paintReviewer();
   paintStatus();
 }

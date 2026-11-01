@@ -73,6 +73,8 @@ vi.mock('electron', () => ({
 const { safeStorage } = await import('electron');
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { cancelStepReview, startStepReview } = await import('../src/main/goal-reviewer.js');
+const { REVIEW_MAX_MS } = await import('../src/main/agents.js');
 const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('../src/main/secrets.js');
 const {
   bridgePort,
@@ -11670,6 +11672,55 @@ describe('the goal loop over the bridge', () => {
     });
     await setSecret('openRouterApiKey', 'sk-or-bridge');
     resetGoalStateForTests();
+  });
+
+  // #1832: the next step's draft waits for the review; the wait is shown with its deadline even
+  // while the review is still finding a worker slot.
+  it('shows the reviewer wait while the next step\'s draft waits for a review still finding a worker slot', async () => {
+    await pair();
+    const chat = 'cafe0098-0000-4000-8000-000000000098';
+    const turnId = 'g-review-slot';
+    const previous = getConfig();
+    await saveConfig({ ...previous, goal: { ...previous.goal, enabled: true, mode: 'goal' },
+      multiAgent: { ...previous.multiAgent, enabled: true, recoverAgentTabs: false } });
+    const recorded = await request('POST', '/events', { body: { conversationId: chat, events: [
+      { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-review-slot' }
+    ] } });
+    const sessionId = recorded.body.sessionId as string;
+    await recordFinalForTest(chat, turnId);
+    let release!: () => void;
+    const slot = new Promise<void>(resolve => { release = resolve; });
+    const before = Date.now();
+    const reviewing = startStepReview({ conversationId: chat, sessionId, turnId }, {
+      settings: () => ({ reviewerModel: 'same', workersOn: true }),
+      mode: () => 'goal', objective: () => '', offered: () => [], reviewer: () => null,
+      facts: async () => ({ files: [{ path: 'src/a.ts', state: 'edited', added: 1, removed: 1, approximate: false, edits: 1, diff: '' }],
+        more: 0, step: 'keep going', firstRequest: 'keep going', chatModel: null }),
+      spawn: async () => { throw new Error('NO_FREE_SLOT'); },
+      wake: async () => undefined, cancel: async () => undefined, now: () => Date.now(), wait: () => slot
+    });
+    let calls = 0;
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async () => { calls++; return Response.json({ choices: [{ message: { content: JSON.stringify({ action: 'continue', reply: 'Go on.' }) } }] }); }) as never;
+    try {
+      expect((await request('POST', '/goal/draft', { body: { conversationId: chat, turnId, clientId: 'tab-review' } })).status).toBe(200);
+      const held = { reason: 'reviewer', until: expect.any(Number) };
+      await vi.waitFor(async () => {
+        const controls = await sessionControlsFor(sessionId);
+        expect(controls.goalDraft).toMatchObject({ stage: 'sending' });
+        expect(controls.goalWait).toEqual(held);
+        expect((await request('GET', `/activity?conversationId=${chat}&goalClient=tab-review`)).body.goal.wait).toEqual(held);
+      });
+      const until = (await sessionControlsFor(sessionId)).goalWait!.until!;
+      expect(until).toBeGreaterThanOrEqual(before + REVIEW_MAX_MS);
+      expect(until).toBeLessThanOrEqual(Date.now() + REVIEW_MAX_MS);
+      expect(calls).toBe(0);
+    } finally {
+      await cancelStepReview(chat, { reviewer: () => null, cancel: async () => undefined });
+      release();
+      await reviewing;
+      globalThis.fetch = realFetch;
+    }
   });
 
   it('advertises the configured Loop helper rather than the inactive API model', async () => {

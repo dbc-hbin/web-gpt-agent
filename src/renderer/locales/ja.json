@@ -1552,5 +1552,14 @@
   "{0} more not listed": "{0}件は一覧にありません",
   "Touched {0} files, no net change": "{0}件のファイルに触れましたが差分なし",
   "Diff unavailable: this edit was not kept": "差分を表示できません：この編集は保存されていません",
-  "The request was not valid.": "リクエストが無効です。"
+  "The request was not valid.": "リクエストが無効です。",
+  "Review each Goal step's changes": "ゴールの各ステップの変更をレビュー",
+  "A reviewer worker checks each Goal step's edits; its findings go into the next step. Uses more of your ChatGPT usage and covers only edits made with the edit tools.": "レビュー担当のワーカーがゴールの各ステップの変更を確認し、指摘は次のステップに含まれます。ChatGPTの使用量が増え、対象は編集ツールによる変更だけです。",
+  "Same model as the Goal chat": "ゴールのチャットと同じモデル",
+  "Sub-agents are off": "サブエージェントがオフです",
+  "The reviewer runs as a worker chat, so it needs Sub-agents. Nothing is reviewed until they are on.": "レビュー担当はワーカーのチャットとして動くため、サブエージェントが必要です。オンになるまで何もレビューされません。",
+  "Turn on Sub-agents": "サブエージェントをオンにする",
+  "Waiting for the reviewer": "レビュー担当を待っています",
+  "Continues without the review in {0}": "{0} 後にレビューなしで続行",
+  "Continuing without the review…": "レビューなしで続行しています…"
 }

@@ -853,6 +853,54 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
 
 // #1402: long turns continue in a fresh one, every 30 minutes unless changed or off. A value the
 // list does not offer gets its own option, so saving another setting cannot turn fresh turns Off.
+// #1832: the Goal step reviewer is chosen in Settings, off by default, and needs Sub-agents.
+it('saves the Goal step reviewer choice and offers to turn on Sub-agents, never by itself', async () => {
+  const mounted = await mountChat({});
+  const w = mounted.window;
+  const reviewer = w.document.getElementById('goalReviewer') as HTMLSelectElement;
+  const workersRow = w.document.getElementById('goalReviewerWorkersRow') as HTMLElement;
+  const workers = w.document.getElementById('homeMaEnabled') as HTMLInputElement;
+  expect(reviewer.value).toBe('');
+  expect(workersRow.hidden).toBe(true);
+  reviewer.value = 'same';
+  reviewer.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await settle();
+  expect(mounted.calls.at(-1)?.goal.reviewerModel).toBe('same');
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, goal: { ...mounted.state.config.goal, reviewerModel: 'same' } } });
+  await settle();
+  expect(workersRow.hidden).toBe(false);
+  expect(workers.checked).toBe(false);
+  // Workers go on only from the person's own press.
+  const saves = mounted.calls.length;
+  const button = w.document.getElementById('goalReviewerWorkers') as HTMLButtonElement;
+  button.focus();
+  button.click();
+  await settle();
+  expect(mounted.calls).toHaveLength(saves + 1);
+  expect(mounted.calls.at(-1)?.multiAgent.enabled).toBe(true);
+  expect(mounted.calls.at(-1)?.goal.reviewerModel).toBe('same');
+  // The press hides its own row; the keyboard stays on the reviewer choice.
+  expect(workersRow.hidden).toBe(true);
+  expect(w.document.activeElement).toBe(reviewer);
+});
+
+it('unticks Sub-agents again when the save behind the reviewer\'s Turn on Sub-agents is refused', async () => {
+  const mounted = await mountChat({}, [], { saveSettings: () => Promise.resolve({ ok: false, error: 'refused' }) });
+  const w = mounted.window;
+  const workers = w.document.getElementById('homeMaEnabled') as HTMLInputElement;
+  // The app's own state says the reviewer is chosen, so a repaint after the refusal keeps the row.
+  mounted.state.config = { ...mounted.state.config, goal: { ...mounted.state.config.goal, reviewerModel: 'same' } };
+  mounted.push(structuredClone(mounted.state));
+  await settle();
+  const button = w.document.getElementById('goalReviewerWorkers') as HTMLButtonElement;
+  button.focus();
+  button.click();
+  await settle(); await settle();
+  expect(workers.checked).toBe(false);
+  expect((w.document.getElementById('goalReviewerWorkersRow') as HTMLElement).hidden).toBe(false);
+  expect(w.document.activeElement).toBe(button);
+});
+
 it('starts a fresh turn after 30 minutes unless changed, keeps an unlisted value, and saves Off', async () => {
   const mounted = await mountChat();
   const w = mounted.window;

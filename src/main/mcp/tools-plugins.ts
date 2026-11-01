@@ -5,7 +5,7 @@ import { pluginManager } from '../plugins/manager.js';
 import { getConfig } from '../config.js';
 import { noteOutcome } from './call-context.js';
 import { inboundRequestId } from './inbound.js';
-import { dispatch, fail, type ManagedToolInvocation, type ToolResult } from './kernel.js';
+import { dispatch, fail, reviewerRefusal, type ManagedToolInvocation, type ToolResult } from './kernel.js';
 import { markExternalOutcomeUnknown } from './tools-external.js';
 import { codeModeDeclaration, codeModeHandler, codeModeWaitHandler, waitDeclaration, waitSchema } from './code-mode-tool.js';
 import { toolSchema, toolSchemaJson } from './tool-declarations.js';
@@ -20,6 +20,9 @@ const envelope = z.object({
 /** Receipt metadata never enters the upstream server's argument namespace. */
 async function runPluginTool(name: string, args: unknown, identity: NonNullable<ManagedToolInvocation['external']>): Promise<ToolResult> {
   if (getConfig().readOnly) return pluginManager.redactResult(fail('TOOL_DISABLED: external plugins are unavailable while Web GPT Agent read-only mode is on.')) as ToolResult;
+  // The Goal step reviewer does not change things (#1832): a plugin tool its plugin did not mark read-only is refused.
+  const refused = reviewerRefusal(name, pluginManager.tools().find(tool => tool.name === name)?.annotations?.readOnlyHint === true);
+  if (refused) return refused;
   const parsed = envelope.safeParse(args);
   if (!parsed.success) return fail('INVALID_ARGUMENTS: pass {arguments: {...}, operation_id?: UUID}; receipt metadata is outside upstream arguments.');
   let ambiguous = false;

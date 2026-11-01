@@ -216,3 +216,18 @@ it('keeps upstream exec and wait tools distinct from the cell-control wrappers',
     expect(waited.result.structuredContent).toEqual({ count: 2 });
   } finally { plugin.declaration.name = name; }
 });
+
+// #1832: the Goal step reviewer's chat keeps a plugin tool only when its plugin marks it read-only.
+it('refuses a plugin tool not marked read-only in the Goal step reviewer\'s chat, before the plugin runs', async () => {
+  vi.spyOn(agents, 'isReviewerConversation').mockReturnValue(true);
+  const readOnly = plugin.declaration.annotations;
+  try {
+    expect((await invokePlugin(plugin.declaration.name, { name: 'scene' })).result.isError).not.toBe(true);
+    expect(plugin.call).toHaveBeenCalledTimes(1);
+    plugin.declaration.annotations = { ...readOnly, readOnlyHint: false };
+    const refused = await invokePlugin(plugin.declaration.name, { name: 'scene' });
+    expect(refused.result.isError).toBe(true);
+    expect(JSON.stringify(refused.result.content)).toContain('TOOL_DISABLED: inspect_scene is not available to the Goal step reviewer');
+    expect(plugin.call).toHaveBeenCalledTimes(1);
+  } finally { plugin.declaration.annotations = readOnly; }
+});

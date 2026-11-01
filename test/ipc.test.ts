@@ -747,6 +747,18 @@ describe('ChatGPT browser settings', () => {
 });
 
 describe('settings writes from more than one UI', () => {
+  it('saves the Goal step reviewer choice, keeps it through a stale unrelated save, and refuses a bad one (#1832)', async () => {
+    const base = defaultConfig();
+    await saveConfig(base);
+    expect((await save({ ...base, goal: { ...base.goal, reviewerModel: 'same' } }, base)).ok).toBe(true);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+    // A form painted before that save does not carry the field back to off.
+    expect((await save({ ...base, ui: { ...base.ui, tabsToKeepOpen: 5 } }, base)).ok).toBe(true);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+    const now = getConfig();
+    expect((await save({ ...now, goal: { ...now.goal, reviewerModel: 'y'.repeat(200) } }, now)).ok).toBe(false);
+    expect(getConfig().goal.reviewerModel).toBe('same');
+  });
   it('validates and persists the Plugins tunnel id through Settings, including explicit clearing', async () => {
     const base = defaultConfig(); await saveConfig(base);
     const tunnelId = `tunnel_${'a'.repeat(32)}`;

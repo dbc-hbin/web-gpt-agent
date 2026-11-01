@@ -64,6 +64,7 @@ import {
   persistCriticalSwarmNow,
   requestWorkerRevivals,
   releaseQuiescentRun,
+  isReviewerConversation,
   retiredWorkerForConversation,
   stageQueuedWorkerRevivals
 } from '../agents.js';
@@ -1134,8 +1135,11 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
       return entry ? entry.run(args, parent)
         : Promise.resolve(fail('UNKNOWN_TOOL: this tool is not available on this connector.'));
     },
-    register(name, config, handler) {
+    register(name, config, unchecked) {
       names.push(name);
+      // The Goal step reviewer's chat (#1832): refused before the tool runs, direct or nested.
+      const readOnly = config.annotations?.readOnlyHint === true;
+      const handler: typeof unchecked = async args => reviewerRefusal(name, readOnly, args) ?? unchecked(args);
       handlers.set(name, { description: config.description, declaration: () => ({
         name, description: config.description, inputSchema: { type: 'object', ...toolSchemaJson(config.inputSchema) },
         ...(config.title ? { title: config.title } : {}),
@@ -1190,6 +1194,32 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
       );
     }
   };
+}
+
+/**
+ * What the Goal step reviewer may run besides read-only tools: commands, to read diffs and run tests.
+ * `exec` and `wait` are the connector's only way to reach them; each tool a script calls is checked
+ * again here, as a nested call of the same registrar.
+ */
+const REVIEWER_TOOLS = new Set(['exec_command', 'write_stdin', 'exec', 'wait']);
+/** The agents actions a reviewer keeps: seeing its run and finishing with its report, never starting or waking a worker. */
+const REVIEWER_AGENT_ACTIONS = new Set(['status', 'finish']);
+
+/**
+ * The Goal step reviewer reviews; it does not author (#1832). In its own chat, a tool not marked
+ * read-only is refused before it runs, and so is every agents action but status and finish, so it
+ * can't have another worker write the Goal's files. Commands stay: it reads diffs and runs tests
+ * with them. They are not read-only, and the Settings row and AGENTS.md say so rather than
+ * promising it. A call whose chat is not known is not a reviewer's.
+ */
+export function reviewerRefusal(name: string, readOnly: boolean, args?: unknown): ToolResult | null {
+  if (readOnly || REVIEWER_TOOLS.has(name) || !isReviewerConversation(currentCall()?.caller.conversationId)) return null;
+  const action = name === 'agents' && args && typeof args === 'object' ? (args as { action?: unknown }).action : undefined;
+  if (name === 'agents' && typeof action === 'string' && REVIEWER_AGENT_ACTIONS.has(action)) return null;
+  const what = name === 'agents' ? `agents${typeof action === 'string' ? ` action=${action}` : ''}` : name;
+  logInfo(`goal review: ${what} refused in the reviewer's chat, which reviews and does not change files or start workers`);
+  return fail(`TOOL_DISABLED: ${what} is not available to the Goal step reviewer: it reviews the step and may run commands such as tests, ` +
+    'but it does not change files or start or message workers. Report what should change instead; the Goal chat makes the changes.');
 }
 
 // ------------------------------------------------------------------ formatters

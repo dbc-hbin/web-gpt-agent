@@ -558,6 +558,19 @@ describe('the goal loop settings', () => {
     expect(config.goal.enabled).toBe(false);
   });
 
+  it('keeps the Goal step reviewer off by default, and loads a saved or damaged choice safely (#1832)', async () => {
+    expect(defaultConfig().goal.reviewerModel).toBe('');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'same' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('same');
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: '  gpt-6-thinking ' } });
+    expect((await loadConfig()).goal.reviewerModel).toBe('gpt-6-thinking');
+    // A value no version wrote turns the reviewer off rather than failing the file.
+    await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, reviewerModel: 'x'.repeat(200) } });
+    const loaded = await loadConfig();
+    expect(loaded.goal.reviewerModel).toBe('');
+    expect(loaded.goal.helperModel).toBe(defaultConfig().goal.helperModel);
+  });
+
   it('keeps the model, reasoning level and system prompt that were chosen', async () => {
     const prompt = 'Custom continuation gate. Reply NO_REPLY when finished.';
     const objectivePrompt = 'Custom goal driver. Reply NO_REPLY once the goal is reached.';
@@ -582,6 +595,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-5.6-sol',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: true,
       mode: 'loop',
       provider: { kind: 'openrouter', baseUrl: '' },
@@ -729,6 +743,7 @@ describe('the goal loop settings', () => {
       impulseMinutes: 0,
       helperModel: 'gpt-5.6-sol',
       helperReasoning: 'high',
+      reviewerModel: '',
       enabled: false,
       mode: 'goal',
       provider: { kind: 'openrouter', baseUrl: '' },
