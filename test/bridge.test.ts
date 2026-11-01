@@ -8810,6 +8810,10 @@ describe('unattributed activity recovery', () => {
         retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
       }]);
       expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      // The refusal names the chat, the repair and the refusing condition, once a minute.
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      expect(getLog().filter(entry => entry.message ===
+        `bridge: automatic silence recovery for ${PRIME} withheld — the page's claim was refused: ChatGPT is limiting its history`)).toHaveLength(1);
       await vi.advanceTimersByTimeAsync(31_001);
       expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
     } finally { vi.useRealTimers(); }

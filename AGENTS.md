@@ -2301,6 +2301,14 @@ CSS to that same document. Navigation cannot carry a recorder without its adapte
 replacement document; missing document proof or injection failure grants no new tab opening.
 First sightings and announced states share one bounded map, reset with the bridge. Repeated no-tab/stalled refusals
 are logged once per chat/cause/minute; handout logs and confirmed browser-action logs remain distinct.
+Every other automatic recovery refusal or withdrawal uses the same bounded set through
+`noticeRecoveryWithheld`: one line `bridge: automatic <reason> recovery for <chat> withheld — <condition>`
+per chat/reason/condition/minute. It covers `queueBrowserRecovery` refusals (no session, worker slot not
+working, blocked, user Stop, spent error budget, a repair already held), a page claim refused at
+`/repairs/claim` (naming the first failing check, including the history-limit hold and in-flight
+event writes), queued repairs dropped at handout (closed page, stale source) and silence the
+watchdog spends without a reload (no MCP/native-failure proof, blocked, every recovery switch off,
+superseded source). The line is diagnostic only; it neither grants nor revokes a browser action.
 Assistant-error repairs retain their three-minute cooldown. Attribution, silence, Goal,
 compaction and no-tab follow their own eligibility and schedules.
 Marked continuation outcomes use a bounded per-chat/token/outcome diagnostic set. Replayed

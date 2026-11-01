@@ -2736,6 +2736,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // An observation still publishing can revoke this handout. Refuse this
     // claim transiently; the same unclaimed token remains eligible to be checked.
     const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
+    if (!allowed) {
+      // Name the first refusing condition, so "the page never asked" and "refused" differ.
+      const condition = session?.conversationId !== conversationId ? 'its session moved to another chat'
+        : !departureAllowsRepair(session) ? 'the user closed its page'
+          : providerHistoryBackoff(conversationId) !== null ? 'ChatGPT is limiting its history'
+            : repair.reason !== 'compaction' && !session.activeTurnId && session.lastTurnOutcome === 'stopped' ? 'its turn was stopped'
+              : isChatBlocked(conversationId) ? 'the chat is blocked'
+                : stopRequestedFor(conversationId) ? 'the user stopped it'
+                  : !current ? 'its repair no longer matches the chat'
+                    : observationWritesInFlight > 0 ? 'a chat was still saving its events; the page may claim it again'
+                      : 'it was replaced or already claimed';
+      noticeRecoveryWithheld(conversationId, repair.reason, `the page's claim was refused: ${condition}`);
+    }
     if (allowed) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
@@ -7261,14 +7274,27 @@ function queueBrowserRecovery(
   // for. Every trigger converges on this function — silence, no-tab, unattributed,
   // assistant-error, goal, compaction — so refusing here refuses all of them, and none of them
   // needs its own exemption.
-  if (!sessionId || !workerRecoveryAllowed(conversationId) || isChatBlocked(conversationId) || stopRequestedFor(conversationId)) return false;
+  const refused = !sessionId ? 'no local session owns the chat'
+    : !workerRecoveryAllowed(conversationId) ? 'its worker slot is not working'
+      : isChatBlocked(conversationId) ? 'the chat is blocked'
+        : stopRequestedFor(conversationId) ? 'the user stopped it' : null;
+  if (refused) {
+    noticeRecoveryWithheld(conversationId, reason, refused);
+    return false;
+  }
   // The turn's one error reload, already spent. Checked before the episode and state guards
   // below because it outlives both: those forget a repair the moment its episode changes, and
   // the whole point here is that a *new* error on the same broken turn buys nothing.
   if (reason === 'assistant-error') {
     const spent = turnRepairSpent.get(conversationId);
-    if (!assistantSource) return false;
-    if (spent?.sessionId === sessionId && assistantSource.key === spent.turnKey) return false;
+    if (!assistantSource) {
+      noticeRecoveryWithheld(conversationId, reason, 'the interrupted question could not be identified');
+      return false;
+    }
+    if (spent?.sessionId === sessionId && assistantSource.key === spent.turnKey) {
+      noticeRecoveryWithheld(conversationId, reason, 'this question already spent its one error reload');
+      return false;
+    }
     if (spent) turnRepairSpent.delete(conversationId);
   }
   const held = repairsInFlight.get(conversationId);
@@ -7289,7 +7315,10 @@ function queueBrowserRecovery(
     // The explicit handoff now owns page recovery. Reuse that one pending slot,
     // but never issue another action while the browser already holds a claim.
     (reason === 'compaction' && held?.reason !== 'compaction' && !held?.claimed);
-  if (held && held.state !== 'done' && !supersedes) return false;
+  if (held && held.state !== 'done' && !supersedes) {
+    noticeRecoveryWithheld(conversationId, reason, `a ${held.reason} repair is already ${held.state}`);
+    return false;
+  }
   // Silence already paid its complete two-minute inactivity boundary. Once genuine new activity
   // starts another episode, layering the unrelated browser-action floor on top delays the next
   // stuck-page recovery beyond its own contract. Assistant-error repairs keep that shared
@@ -7709,6 +7738,15 @@ function noticeRefusal(key: string, message: string): void {
 }
 
 /**
+ * One stable line for every automatic browser-recovery refusal or withdrawal: the chat, the
+ * repair reason and the exact condition that refused it, once per chat/reason/condition/minute.
+ */
+function noticeRecoveryWithheld(conversationId: string, reason: Repair['reason'], condition: string): void {
+  noticeRefusal(`withheld:${conversationId}:${reason}:${condition}`,
+    `bridge: automatic ${reason} recovery for ${conversationId} withheld — ${condition}`);
+}
+
+/**
  * Idle app-owned pages are a reusable resource, independent of durable chat/worker life.
  * Two minutes gives follow-ups a warm page; five minutes releases an unused renderer.
  * The extension still proves the exact document has no draft or generation before closing.
@@ -7864,7 +7902,10 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // Exact local MCP work earns ordinary silence repair; a recorded current native
     // failed/interrupted end can substitute only for that terminal source.
     if (!grant.turnId || !await turnHasRecoveryEvidence(grant.sessionId, conversationId, grant.turnId)) {
-      if (activeUntil.get(conversationId) === grant) spent.push(conversationId);
+      if (activeUntil.get(conversationId) === grant) {
+        spent.push(conversationId);
+        noticeRecoveryWithheld(conversationId, 'silence', 'its silent turn has no attributed local tool call or exact native failure');
+      }
       continue;
     }
     const pro = await extendedSilenceWindowFor(conversationId, grant.sessionId);
@@ -7882,6 +7923,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // sleeps it from the block itself, grant or no grant.)
     if (isChatBlocked(conversationId)) {
       spent.push(conversationId);
+      noticeRecoveryWithheld(conversationId, 'silence', 'the chat is blocked');
       continue;
     }
     // Only positively identified Pro work earns the longer recovery clock.
@@ -7901,6 +7943,7 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
         continue;
       }
       spent.push(conversationId);
+      noticeRecoveryWithheld(conversationId, 'silence', 'tab recovery, Goal/Loop and automatic Continue are all off for it');
       continue;
     }
     const held = repairsInFlight.get(conversationId);
@@ -7934,7 +7977,10 @@ async function inspectSilentChats(now: number): Promise<{ queued: boolean; spent
     // Use the same source verdict as countdown/claim. Otherwise a newer question
     // makes the handout disappear while this scheduler keeps recreating it.
     if (!await silenceSourceCurrent(conversationId, grant)) {
-      if (activeUntil.get(conversationId) === grant) spent.push(conversationId);
+      if (activeUntil.get(conversationId) === grant) {
+        spent.push(conversationId);
+        noticeRecoveryWithheld(conversationId, 'silence', 'a newer question or turn replaced its silent turn');
+      }
       continue;
     }
     if (activeUntil.get(conversationId) !== grant) continue;
@@ -8702,12 +8748,20 @@ async function takePendingRepairs(
       if (!departureAllowsRepair(session)) {
         // Keep confirmed receipts as history; a user close revokes all pending actions.
         endActivity(conversationId);
-        if (repairsInFlight.get(conversationId) === repair && repair.state !== 'done') repairsInFlight.delete(conversationId);
+        if (repairsInFlight.get(conversationId) === repair && repair.state !== 'done') {
+          repairsInFlight.delete(conversationId);
+          noticeRecoveryWithheld(conversationId, repair.reason, 'the user closed its page; the queued repair was dropped');
+        }
         continue;
       }
-      if ((!await attributionRepairAllowed(repair, session) || !await assistantRepairCurrent(conversationId, repair) ||
-          !await silenceRepairCurrent(conversationId, repair) || !compactionRepairCurrent(conversationId, repair)) &&
-          repairsInFlight.get(conversationId) === repair) repairsInFlight.delete(conversationId);
+      const stale = !await attributionRepairAllowed(repair, session) ? 'its attribution incident resolved or moved on'
+        : !await assistantRepairCurrent(conversationId, repair) ? 'its interrupted question was superseded'
+          : !await silenceRepairCurrent(conversationId, repair) ? 'its silent turn was superseded'
+            : !compactionRepairCurrent(conversationId, repair) ? 'its compaction ticket moved on' : null;
+      if (stale && repairsInFlight.get(conversationId) === repair) {
+        repairsInFlight.delete(conversationId);
+        if (repair.state !== 'done') noticeRecoveryWithheld(conversationId, repair.reason, `the queued repair was dropped: ${stale}`);
+      }
       continue;
     }
     repairsInFlight.delete(conversationId);
@@ -8756,6 +8810,12 @@ async function takePendingRepairs(
       if (pickupWatchFloor !== pickupFloor || !current || current.replyId !== pickupWatch.get(conversationId)?.replyId || Date.now() < current.listenUntil ||
           continuationForSession(current.sessionId) || (!current.queued && goalDraftBusy(conversationId))) {
         if (repairsInFlight.get(conversationId) === repair) repairsInFlight.delete(conversationId);
+        noticeRecoveryWithheld(conversationId, repair.reason, `the pickup handout was withdrawn: ${
+          pickupWatchFloor !== pickupFloor ? 'the bridge restarted'
+            : !current ? 'nothing is owed any more'
+              : current.replyId !== pickupWatch.get(conversationId)?.replyId ? 'its source changed'
+                : Date.now() < current.listenUntil ? 'its listening window is still open'
+                  : continuationForSession(current.sessionId) ? 'a compaction owns the chat' : 'the Goal decision draft is still busy'}`);
         continue;
       }
     }
