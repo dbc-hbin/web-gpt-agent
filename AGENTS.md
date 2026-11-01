@@ -1293,6 +1293,30 @@ After-turn and finish entries each retain their own boundary policy. Tool intent
 arbitrary claim-age expiry. Only positively settled, never-offered eligible input may change
 transport; receipt loss cannot justify switching to browser Send.
 
+### Edit & resubmit
+
+ChatGPT keeps an edited question as a new version beside the old one, under the same parent, and
+continues from the new one (upstream #1627, #1653, #1654). The app's Edit action under a question
+(`questionActions`; only the newest version of a native-id question in the chat's current
+conversation, never worker/helper chats or Compact & Resume prompts) puts its authored text in the
+composer with an `editDraft` dock notice counting the later messages it replaces and rings that
+question's bubble; Cancel and switching chats give back the earlier draft. Sending carries
+`edit { messageId }`. Main admits it only into that existing chat as one plain browser message sent
+now (`mode:auto`, no stages, files or tool delivery), with no turn running, for a recorded question
+that is still the newest version (`assertEditSource`); an edit of the chat's first question
+(`editFramed`) carries the chat's setup again through the opening prompt. `pendingBrowserInputs`
+offers `edit`; the page asks MAIN to mark that question's Edit control by handler (`clf-edit-ask`:
+`action:"edit"` on surface `user_message`, never a label), opens ChatGPT's own editor in that turn,
+writes the text through the composer's insertion core (`insertIntoEditor`), and after the ordinary
+claim and authorization submits the editor's form. The receipt is a new question with that text
+where the edited one was, the edited one gone. Before Send any failure closes the editor and fails
+the claim visibly; after the click a missing receipt leaves the authorized claim unresolved like any
+ambiguous Send, never a retry. Retrying a failed edit from its dock row restores it as an edit of the
+same question when that question is loaded and still editable, asks the reader to scroll up when it
+is in unloaded older history, and otherwise restores a new message with a notice. An edit in progress
+is an unsent draft that a retry cannot replace. Switching back to an older version in ChatGPT's
+versions view is not handled (the app keeps showing the newest one it saw).
+
 ### Attachments have one staging owner
 
 `input-attachments.ts` stages immutable originals selected by file picker, drop or clipboard.
@@ -1583,6 +1607,21 @@ removes only the leading provider reaction envelope from assistant presentation;
 canonical source bytes and literal examples remain intact. A reserved user-bubble
 footer and in-place badge updates keep streaming reactions from shifting messages
 or reloading attachment previews. Old history gains badges when natively reobserved.
+
+Edit & resubmit history: the page reports each question's place in ChatGPT's tree
+(`user_message.parentId`: the legacy `metadata.parent_id`, or on the shell the previous turn's
+last `turn.messageIds` entry from the thread's ordered `entries`, `root` for the first) and
+`parentExact` (a real parent or predecessor id proves versions by itself; `root` only with
+ChatGPT's versions control, whose handler asks the versions endpoint and which ChatGPT draws only
+after a reload). Only the model report carries the place, so it also reports a question the DOM
+pass already recorded. The recorder marks a question with `parentExact` as `replaces` the newest
+version recorded before it under that parent in the current chat (`session/edits.ts`); a question
+already recorded can only replace one first seen before it, so ChatGPT showing the older version
+again never flips the edge. An edit the app delivered is marked at the page's acknowledgement
+(`noteEditReplacement`). `parentId`/`replaces` are first-seen and never change. The timeline folds
+the replaced question and everything after it up to the edit (and their late re-scans) into one
+"Earlier version(s) · N messages" row right under the newest version, which says "Edited version";
+chains fold into one row.
 
 Continuous recording serves the local transcript, exact identity and continuation infrastructure.
 There is no model-facing session lookup tool. `update_plan` remains recording-backed; historical
@@ -3267,6 +3306,24 @@ retrieved only by session/call/change identity from the tool row's Review this e
 (main timeline, local project chats only). Failed, inexact or oversized edits do not gain
 fabricated review evidence. Current Git changes and recorded edit review share a diff renderer
 but have separate truth owners.
+
+Per answer (upstream #1836, `main/session/turn-changes.ts`): `sessions:turnChanges` { sessionId,
+turnId, from } groups a turn's successful recorded edits by path (first-change order, the prime's
+own calls only, never a `worker-N` agent's) and gives each file one net diff, the first edit's
+before against the last edit's after, read from the review assets by id (`readEditReviewAsset`,
+which logs an unreadable asset once by id prefix, never content), counted with `lineDelta`:
+`edited`, `created`, `deleted` or `unchanged` (put back, or made and removed). An end with no
+review asset falls back to the summed recorded counts, marked approximate, `diff: not-kept`; an
+edit between the two ends that lost its asset does not. At most 50 files; `total` says how many
+there are. `sessions:turnFileDiff` adds `path` and returns that net before/after. `from` is the
+turn's first non-reopening `turn_start` seq when loaded, else 0. The main process reads a turn's
+tool calls once per (session, turn, from) and drops that cache on any recording change; malformed
+requests log one fixed `ipc: <channel> refused: invalid_payload` line. The renderer
+(`renderer/turn-changes.ts`) draws one collapsed "Changed N files · +a −r" card under the final
+answer of a finished turn (its end, or a later turn's start) that edited files, or whose start is
+not loaded; each file row loads its net diff on open through the shared diff viewer. Open in
+Review (local project chats) opens the turn's latest editing call in the Review panel's recorded
+edit view (`openReview`), or Review's Changes when no loaded call kept an asset.
 
 ### Plugins: installation, execution and connector refresh
 

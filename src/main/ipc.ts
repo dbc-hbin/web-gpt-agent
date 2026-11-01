@@ -59,7 +59,7 @@ import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CH
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
 import { runDiagnostics } from './diagnostics.js';
-import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
+import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
 import { markStartup } from './startup-timing.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
 import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject, setProjectSecretsShieldOff } from './projects.js';
@@ -98,8 +98,10 @@ import {
   readEvents,
   readRecentEvents,
   readHandoff,
-  readToolEditReview
+  readToolEditReview,
+  readEditReviewAsset
 } from './session/store.js';
+import { netTurnChanges, netTurnFileDiff, turnFileEdits, type EditAt } from './session/turn-changes.js';
 import { activeSessionId, forgetSession, onSessionChange } from './session/recorder.js';
 import { blockedChatIds, setChatBlocked } from './session/blocked-chats.js';
 import {
@@ -796,6 +798,41 @@ export function registerIpc(
     }).strict().parse(payload);
     return readToolEditReview(sessionId, callId, changeIndex);
   });
+  // What one answer changed, per file, read from the turn's start on.
+  const turnChangesRequest = z.object({ sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i), turnId: z.string().min(1).max(256),
+    from: z.number().int().nonnegative() });
+  // Read once for a turn's card and each of its files' diffs, not once per request; any change to
+  // the recordings reads it again, since a turn can still gain an edit.
+  const turnEditsRead = new Map<string, Promise<ReturnType<typeof turnFileEdits>>>();
+  onSessionChange(() => turnEditsRead.clear());
+  const turnEdits = (request: z.infer<typeof turnChangesRequest>) => {
+    const key = `${request.sessionId}\0${request.turnId}\0${request.from}`;
+    let read = turnEditsRead.get(key);
+    if (!read) {
+      read = readEvents(request.sessionId, { from: request.from, kinds: ['tool_call'] }).then(events => turnFileEdits(events, request.turnId));
+      turnEditsRead.set(key, read);
+      read.catch(() => turnEditsRead.delete(key));
+      if (turnEditsRead.size > 64) turnEditsRead.delete(turnEditsRead.keys().next().value!);
+    }
+    return read;
+  };
+  /** A malformed request is refused with one fixed log line, never its paths or ids. */
+  const turnRequest = <T extends z.ZodTypeAny>(channel: string, schema: T, payload: unknown): z.infer<T> => {
+    const parsed = schema.safeParse(payload);
+    if (parsed.success) return parsed.data;
+    logWarn(`ipc: ${channel} refused: invalid_payload`);
+    throw new Error('The request was not valid.');
+  };
+  const reviewOf = (sessionId: string) => (at: EditAt) => at.assetId ? readEditReviewAsset(sessionId, at.assetId) : Promise.resolve(null);
+  handle('sessions:turnChanges', async payload => {
+    const request = turnRequest('sessions:turnChanges', turnChangesRequest.strict(), payload);
+    const files = await turnEdits(request);
+    return { changes: await netTurnChanges(files, reviewOf(request.sessionId)), total: files.length };
+  });
+  handle('sessions:turnFileDiff', async payload => {
+    const request = turnRequest('sessions:turnFileDiff', turnChangesRequest.extend({ path: z.string().min(1).max(4096) }).strict(), payload);
+    return netTurnFileDiff(await turnEdits(request), request.path, reviewOf(request.sessionId));
+  });
   handle('projectFiles:preview', async payload => {
     const { projectId, path } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1) }).strict().parse(payload);
     return previewProjectFile(projectId, path);
@@ -1310,7 +1347,8 @@ export function registerIpc(
         ? entry.text + GOAL_MARKER_INSTRUCTION : entry.text;
       // Only the opening user input owns executor setup. Existing chats, queued
       // checkpoints and automatic continuations already have their instructions.
-      return (entry.opening || !entry.sessionId) && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish'
+      // An edit of a chat's first question replaces the message that carried its setup.
+      return ((entry.opening || !entry.sessionId) && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish') || entry.editFramed
         ? prepareSessionPrompt(text, entry, limits, authored)
         : !entry.finishOwner && entry.purpose !== 'decision' ? prepareSkillFollowup(text, authored, limits, entry) : text;
     },

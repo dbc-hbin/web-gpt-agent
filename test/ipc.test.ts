@@ -81,6 +81,42 @@ const removeRoot = (payload: unknown): Promise<any> => handlers.get('roots:remov
 const sessionEvents = (payload: unknown): Promise<any> => handlers.get('sessions:events')!(null, payload) as Promise<any>;
 const sessionList = (): Promise<any> => handlers.get('sessions:list')!(null, undefined) as Promise<any>;
 
+it('answers a turn\'s changed files and refuses a malformed request', async () => {
+  const session = await createSession({ conversationId: 'ipc-turn-changes', title: 'Changes' });
+  const call = (name: string, payload: unknown) => handlers.get(name)!(null, payload) as Promise<any>;
+  expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'no-edits', from: 0 })).toEqual({ ok: true, data: { changes: [], total: 0 } });
+  expect(await call('sessions:turnFileDiff', { sessionId: session.id, turnId: 'no-edits', from: 0, path: 'a.ts' })).toEqual({ ok: true, data: null });
+  expect(await call('sessions:turnChanges', { sessionId: '../escape', turnId: 'x', from: 0 })).toMatchObject({ ok: false });
+  expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'x', from: -1 })).toMatchObject({ ok: false });
+});
+
+it('reads a turn\'s edits once for its card and its files, again after the chat changes, and logs a refused request', async () => {
+  const session = await createSession({ conversationId: 'ipc-turn-changes-reuse', title: 'Changes' });
+  const call = (name: string, payload: unknown) => handlers.get(name)!(null, payload) as Promise<any>;
+  const store = await import('../src/main/session/store.js');
+  const logger = await import('../src/main/logger.js');
+  const reads = vi.spyOn(store, 'readEvents');
+  const warn = vi.spyOn(logger, 'logWarn');
+  try {
+    const request = { sessionId: session.id, turnId: 'reused', from: 0 };
+    await call('sessions:turnChanges', request);
+    await call('sessions:turnFileDiff', { ...request, path: 'a.ts' });
+    await call('sessions:turnFileDiff', { ...request, path: 'b.ts' });
+    expect(reads.mock.calls.filter(([id]) => id === session.id)).toHaveLength(1);
+    const recorder = await import('../src/main/session/recorder.js');
+    // Any recording change clears the cache; wait for that exact notice, which the IPC listener saw first.
+    const changed = new Promise<void>(resolve => { const off = recorder.onSessionChange(() => { off(); resolve(); }); });
+    await recorder.sessionForConversation('ipc-turn-changes-other');
+    await changed;
+    await call('sessions:turnChanges', request);
+    expect(reads.mock.calls.filter(([id]) => id === session.id)).toHaveLength(2);
+    expect(await call('sessions:turnChanges', { sessionId: session.id, turnId: 'x', from: -1 })).toMatchObject({ ok: false });
+    expect(warn).toHaveBeenCalledWith('ipc: sessions:turnChanges refused: invalid_payload');
+    expect(await call('sessions:turnFileDiff', { sessionId: session.id, turnId: 'x', from: 0 })).toMatchObject({ ok: false });
+    expect(warn).toHaveBeenCalledWith('ipc: sessions:turnFileDiff refused: invalid_payload');
+  } finally { reads.mockRestore(); warn.mockRestore(); }
+});
+
 it('saves the Code checkpoints switch through Settings, preserves it across a stale unrelated save and keeps it when omitted', async () => {
   const base = getConfig();
   expect(base.projects.codeCheckpoints).toBe(false);

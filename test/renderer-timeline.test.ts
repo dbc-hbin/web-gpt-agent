@@ -1,7 +1,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { JSDOM } from 'jsdom';
-import { afterEach, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DEFAULT_GOAL_SYSTEM_PROMPT } from '../src/shared/goal.js';
 import { prependUserPrompt } from '../src/shared/user-prompt.js';
 import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/session.js';
@@ -161,7 +161,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; summary?: Partial<SessionSummary> } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -238,7 +238,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         return () => undefined;
       },
       listSessions: () => {
-        const sessions = options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
+        const sessions = options.sessions ?? [{ ...summary(live.events), ...options.summary, ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
         const known = new Set(sessions.map(row => row.id));
         const openings = live.inputs.filter(row => row.opening && row.sessionId && !known.has(row.sessionId)).map(row => ({
           ...summary(live.events), id: row.sessionId!, title: row.text, conversationId: null, chatIds: []
@@ -3651,4 +3651,356 @@ it('switches the secrets shield off for one project from its sidebar heading', a
   expect(api.setProjectSecretsShieldOff).toHaveBeenCalledExactlyOnceWith(project.id, true);
   expect(shield().getAttribute('aria-checked')).toBe('false');
   expect(shield().classList.contains('is-off')).toBe(true);
+});
+
+describe('edit and resubmit', () => {
+  const q = (seq: number, messageId: string, value: string, turnId: string, extra: object = {}): SessionEvent =>
+    ({ kind: 'user_message', seq, origin: seq, time: T0 + seq * 1000, source: 'extension', turnId, messageId, message: text(value), ...extra }) as SessionEvent;
+  const a = (seq: number, messageId: string, value: string, turnId: string): SessionEvent =>
+    ({ kind: 'assistant_message', seq, time: T0 + seq * 1000, source: 'extension', turnId, messageId, message: text(value), final: true, state: 'final' }) as SessionEvent;
+  const end = (seq: number, turnId: string): SessionEvent => ({ seq, time: T0 + seq * 1000, source: 'extension', kind: 'turn_end', turnId, outcome: 'completed' }) as SessionEvent;
+  const said = (w: { document: Document }) => [...w.document.querySelectorAll('#timeline > .ev-user_message, #timeline > .ev-assistant_message, #timeline > .earlier-version')]
+    .map(node => node.classList.contains('earlier-version') ? `earlier:${node.querySelector('summary')!.textContent!.trim()}` : node.querySelector('.said')!.textContent!.replace(/\s+/g, ' ').trim().slice(0, 40));
+
+  it('folds the version an edit replaced, and what followed it, under the edited question', async () => {
+    const events = [q(1, 'q-1', 'First question', 't1'), a(2, 'a-1', 'First answer', 't1'), end(3, 't1'),
+      q(4, 'q-2', 'Fix the logn bug', 't2'), a(5, 'a-2', 'Which bug?', 't2'), end(6, 't2'),
+      q(7, 'q-2b', 'Fix the login bug', 't3', { replaces: 'q-2' }), a(8, 'a-3', 'Done, here is the fix.', 't3'), end(9, 't3')];
+    const { w } = await boot(events, true);
+    const rows = said(w);
+    expect(rows[0]).toContain('First question');
+    expect(rows[1]).toContain('First answer');
+    expect(rows[2]).toContain('Fix the login bug');
+    expect(rows[3]).toBe('earlier:Earlier version · 2 messages');
+    expect(rows[4]).toContain('Done, here is the fix.');
+    expect(rows).toHaveLength(5);
+    expect(w.document.querySelector('#timeline > .ev-user_message:nth-of-type(n) .message-edited, #timeline .message-edited')?.textContent).toBe('Edited version');
+    // Directly under the edited question, before the line of the turn that answers it.
+    const editedRow = [...w.document.querySelectorAll('#timeline > .ev-user_message')].find(row => row.textContent!.includes('Fix the login bug'))!;
+    expect(editedRow.nextElementSibling?.classList.contains('earlier-version')).toBe(true);
+    const fold = w.document.querySelector<HTMLDetailsElement>('#timeline > .earlier-version')!;
+    expect(fold.open).toBe(false);
+    fold.open = true; fold.dispatchEvent(new w.Event('toggle')); await settle();
+    const shown = [...fold.querySelectorAll('.said')].map(node => node.textContent!.replace(/\s+/g, ' ').trim());
+    expect(shown).toHaveLength(2);
+    expect(shown[0]).toContain('Fix the logn bug');
+    expect(shown[1]).toContain('Which bug?');
+  });
+
+  it('folds every earlier version of a question edited twice into one row', async () => {
+    const events = [q(1, 'q-1', 'Ask', 't1'), a(2, 'a-1', 'Answer one', 't1'), end(3, 't1'),
+      q(4, 'q-1b', 'Ask again', 't2', { replaces: 'q-1' }), a(5, 'a-2', 'Answer two', 't2'), end(6, 't2'),
+      q(7, 'q-1c', 'Ask a third time', 't3', { replaces: 'q-1b' }), a(8, 'a-3', 'Answer three', 't3'), end(9, 't3')];
+    const { w } = await boot(events, true);
+    expect(said(w)).toEqual([expect.stringContaining('Ask a third time'), 'earlier:Earlier versions · 4 messages', expect.stringContaining('Answer three')]);
+  });
+
+  const chat = '6ad337fe-47a4-83ed-a21f-c2e24d5829a4';
+  const Q1 = '6ad3a59b-0001-83eb-8bc4-8c84e68dd911', Q2 = '6ad3a59b-0002-83eb-8bc4-8c84e68dd911';
+  const A1 = '6ad3a59b-00a1-83eb-8bc4-8c84e68dd911', A2 = '6ad3a59b-00a2-83eb-8bc4-8c84e68dd911';
+  const exchange = () => [q(1, Q1, 'First question', 't1'), a(2, A1, 'First answer', 't1'), end(3, 't1'),
+    q(4, Q2, 'Fix the logn bug', 't2'), a(5, A2, 'Which bug?', 't2'), end(6, 't2')];
+  const submit = async (w: Window & typeof globalThis, value?: string) => {
+    if (value !== undefined) (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = value;
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+  };
+  const editButton = (w: { document: Document }, text: string) => [...w.document.querySelectorAll('#timeline > .ev-user_message')]
+    .find(row => row.textContent!.includes(text))?.querySelector<HTMLButtonElement>('.question-edit') ?? null;
+
+  it('edits one of your questions from the composer and sends it as ChatGPT\'s edit of that question', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = 'A draft I was writing';
+    editButton(w, 'First question')!.click(); await settle();
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    expect(input.value).toBe('First question');
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 3 later messages');
+    // The question being edited is marked in the chat, so an earlier one is easy to find.
+    const marked = () => [...w.document.querySelectorAll('#timeline .ev-user_message.is-being-edited')].map(row => row.textContent!.includes('First question'));
+    expect(marked()).toEqual([true]);
+    await submit(w as any, 'First question, edited');
+    expect(live.sent.at(-1)).toMatchObject({ sessionId: summary([]).id, text: 'First question, edited', mode: 'auto', edit: { messageId: Q1 } });
+    expect(notice.hidden).toBe(true);
+    expect(marked()).toEqual([]);
+    // The draft that was there before the edit comes back.
+    expect(input.value).toBe('A draft I was writing');
+  });
+
+  it('says so when the latest question is edited, and gives the draft back when the edit is cancelled', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Unfinished';
+    editButton(w, 'Fix the logn bug')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 1 later message');
+    w.document.querySelector<HTMLButtonElement>('#editDraft .edit-draft-cancel')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(input.value).toBe('Unfinished');
+    await submit(w as any, 'Just a follow-up');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('offers no Edit in a worker chat', async () => {
+    const { w } = await boot(exchange(), true, [], [], { summary: { conversationId: chat, origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'x' } } });
+    expect(editButton(w, 'First question')).toBeNull();
+  });
+
+  it('offers no Edit for a question without a native id', async () => {
+    const { w } = await boot([q(1, 'user:local:1', 'Local question', 't1'), a(2, A1, 'Answer', 't1'), end(3, 't1')], true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Local question')).toBeNull();
+  });
+
+  it('offers Edit on the newest version only, never inside the earlier versions it folded', async () => {
+    const { w } = await boot([...exchange(), q(7, '6ad3a59b-0003-83eb-8bc4-8c84e68dd911', 'Fix the login bug', 't3', { replaces: Q2 }), a(8, '6ad3a59b-00a3-83eb-8bc4-8c84e68dd911', 'Fixed.', 't3'), end(9, 't3')],
+      true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Fix the login bug')).not.toBeNull();
+    const fold = w.document.querySelector<HTMLDetailsElement>('#timeline > .earlier-version')!;
+    fold.open = true; fold.dispatchEvent(new w.Event('toggle')); await settle();
+    expect(fold.querySelector('.question-edit')).toBeNull();
+  });
+
+  it('leaves edit mode when another chat is opened', async () => {
+    const other = { ...summary([]), id: '2026-10-17-other001', title: 'Other chat', conversationId: '6ad388c2-faf8-83ed-bb4f-9efff4ad92de' };
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat }, sessions: [{ ...summary([]), conversationId: chat }, other] });
+    editButton(w, 'First question')!.click(); await settle();
+    (w.document.querySelector(`#sessionList [data-id="${other.id}"]`) as HTMLElement).click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    await submit(w as any, 'Hello there');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('shows an edit whose replaced version is not in the loaded history as edited, without a fold', async () => {
+    const { w } = await boot([q(7, 'q-2b', 'Fix the login bug', 't3', { replaces: 'q-gone' }), a(8, 'a-3', 'Done.', 't3'), end(9, 't3')], true);
+    expect(said(w)).toEqual([expect.stringContaining('Fix the login bug'), expect.stringContaining('Done.')]);
+    expect(w.document.querySelector('#timeline .message-edited')?.textContent).toBe('Edited version');
+  });
+
+  // The page failed an edit's delivery; the failed row keeps `edit`, and retrying must keep it an edit.
+  const failedInput = (text: string, extra: Partial<InputEntry> = {}): InputEntry => ({ id: 'failed-edit', sessionId: summary([]).id, requestedSessionId: null,
+    projectId: null, text, automation: 'off', model: 'gpt-5.6-sol', reasoningEffort: 'high', mode: 'auto', dueAt: 1, createdAt: T0 + 7000, state: 'failed',
+    owner: 'old-page', conversationId: chat, error: 'ChatGPT did not offer Edit for that message.', ...extra }) as InputEntry;
+  const retryDelivery = async (w: Window & typeof globalThis) => {
+    w.document.querySelector<HTMLButtonElement>('[aria-label="Retry delivery"]')!.click(); await settle();
+  };
+
+  it('retries a failed edit as an edit of the same question', async () => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    expect(input.value).toBe('First question, edited');
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 3 later messages');
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).toBeNull();
+    await submit(w as any);
+    expect(live.sent.at(-1)).toMatchObject({ text: 'First question, edited', mode: 'auto', edit: { messageId: Q1 } });
+    expect(notice.hidden).toBe(true);
+  });
+
+  it('retries a failed ordinary message as an ordinary message', async () => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('A follow-up', { error: 'Delivery failed' })]; await append([]);
+    await retryDelivery(w as any);
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('A follow-up');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    await submit(w as any);
+    expect(live.sent.at(-1)).toMatchObject({ text: 'A follow-up' });
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  // An edit in progress is an unsent draft: retrying must neither replace it nor inherit it.
+  it.each([
+    ['a failed edit', { edit: { messageId: Q1 } }],
+    ['a failed ordinary message', {}]
+  ])('keeps an edit in progress, with the draft it will give back, when %s is retried', async (_name, extra) => {
+    const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'My draft';
+    editButton(w, 'Fix the logn bug')!.click(); await settle();
+    input.value = ''; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    live.inputs = [failedInput('Retried words', extra)]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('Send or clear your current draft before retrying this message.');
+    expect(input.value).toBe('');
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).not.toBeNull();
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 1 later message');
+    expect([...w.document.querySelectorAll('#timeline .ev-user_message.is-being-edited')].map(row => row.textContent!.includes('Fix the logn bug'))).toEqual([true]);
+    // Cancelling still gives back the draft the edit began with.
+    w.document.querySelector<HTMLButtonElement>('#editDraft .edit-draft-cancel')!.click(); await settle();
+    expect(input.value).toBe('My draft');
+  });
+
+  it('does not restore a failed edit while the question it edited is in older history that is not loaded', async () => {
+    const filler = Array.from({ length: 40 }, (_, i) => a(2 + i, `6ad3a59b-01${String(i).padStart(2, '0')}-83eb-8bc4-8c84e68dd911`, `Answer ${i}`, 't1'));
+    const { w, live, append } = await boot([q(1, Q1, 'First question', 't1'), ...filler, end(42, 't1')], true, [], [], { summary: { conversationId: chat } });
+    expect(w.document.getElementById('timeline')!.textContent).not.toContain('First question');
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('Scroll up to the message you edited, then retry.');
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).not.toBeNull();
+    await submit(w as any, 'Unrelated');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('counts every later message of a retried edit, whatever the agent filter shows', async () => {
+    const worker = { ...a(5, A2, 'Which bug?', 't2'), agent: 'worker-1' } as SessionEvent;
+    const { w, live, append } = await boot([q(1, Q1, 'First question', 't1'), a(2, A1, 'First answer', 't1'), end(3, 't1'),
+      q(4, Q2, 'Fix the logn bug', 't2'), worker, end(6, 't2')], true, [], [], { developerMode: true, summary: { conversationId: chat } });
+    w.document.querySelector<HTMLButtonElement>('#chatAgentFilter [data-agent="worker-1"]')!.click(); await settle();
+    expect(w.document.getElementById('timeline')!.textContent).not.toContain('First question');
+    live.inputs = [failedInput('First question, edited', { edit: { messageId: Q1 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 3 later messages');
+  });
+
+  it('restores a failed edit whose question can no longer be edited as a new message, and says so', async () => {
+    const replaced = [...exchange(), q(7, '6ad3a59b-0003-83eb-8bc4-8c84e68dd911', 'Fix the login bug', 't3', { replaces: Q2 }), end(8, 't3')];
+    const { w, live, append } = await boot(replaced, true, [], [], { summary: { conversationId: chat } });
+    live.inputs = [failedInput('Fix the login bug please', { edit: { messageId: Q2 } })]; await append([]);
+    await retryDelivery(w as any);
+    expect((w.document.getElementById('chatInput') as HTMLTextAreaElement).value).toBe('Fix the login bug please');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(w.document.querySelector('.toast')?.textContent).toContain('can no longer be edited');
+    await submit(w as any);
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+});
+
+
+// one collapsed "Changed files" summary under a finished answer that edited files.
+it("sums up what a finished answer changed, collapsed, counting only real changes, with each file's net diff and Open in Review", async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Repo', path: '/repo', createdAt: 1 };
+  const { w, append } = await boot([], true, [], [project]);
+  const api = (w as any).api;
+  const changes = [
+    { path: 'src/app.ts', state: 'edited', added: 30, removed: 5, approximate: false, diff: 'kept', edits: 3 },
+    { path: 'src/new-page.ts', state: 'created', added: 12, removed: 0, approximate: false, diff: 'kept', edits: 1 },
+    { path: 'old/helper.ts', state: 'unchanged', added: 0, removed: 0, approximate: false, diff: 'kept', edits: 2 },
+    { path: 'big.json', state: 'edited', added: 400, removed: 2, approximate: true, diff: 'not-kept', edits: 1 }
+  ];
+  api.turnChanges = vi.fn(async () => ({ ok: true, data: { changes, total: 4 } }));
+  api.turnFileDiff = vi.fn(async () => ({ ok: true, data: { before: 'a\n', after: 'a\nb\n' } }));
+  const edit = (seq: number, path: string, kind: 'edit' | 'create', agent?: string): SessionEvent => {
+    const call = toolCall(seq, `edit-${seq}`) as Extract<SessionEvent, { kind: 'tool_call' }>;
+    return { ...call, turnId: 't-edit', ...(agent ? { agent } : {}), call: { ...call.call, tool: 'apply_patch', summary: { kind, tone: 'good', title: `Edited ${path}` },
+      changes: [{ path, added: 1, removed: 0, approximate: false, reviewAssetId: `asset-${seq}` }] } } as SessionEvent;
+  };
+  const answer = (seq: number): SessionEvent => ({ seq, time: T0 + seq * 1000, source: 'extension', kind: 'assistant_message', turnId: 't-edit',
+    messageId: 'answer-edit', message: text('Done: three files.'), final: true, state: 'final' } as SessionEvent);
+  await append([
+    { seq: 10, time: T0 + 10_000, source: 'extension', kind: 'turn_start', turnId: 't-edit' } as SessionEvent,
+    edit(11, 'src/app.ts', 'edit'), edit(12, 'src/new-page.ts', 'create'), answer(13)
+  ]);
+  // Still running: no card yet, so it never changes under the reader.
+  expect(w.document.querySelector('.turn-changes')).toBeNull();
+  await append([{ seq: 14, time: T0 + 14_000, source: 'extension', kind: 'turn_end', turnId: 't-edit', outcome: 'completed' } as SessionEvent]);
+  await append([]);
+  const card = w.document.querySelector<HTMLDetailsElement>('.turn-changes')!;
+  expect(card).not.toBeNull();
+  expect(api.turnChanges).toHaveBeenCalledWith(expect.any(String), 't-edit', 10);
+  // Collapsed, even for a few files; the headline counts net changes only, and says the rest.
+  expect(card.open).toBe(false);
+  expect(card.querySelector('summary')!.textContent).toBe('Changed 3 files · +442 −7 (approx.) · 1 put back');
+  card.open = true; card.dispatchEvent(new w.Event('toggle'));
+  const rows = [...card.querySelectorAll<HTMLDetailsElement>('.turn-change')];
+  expect(rows.map(row => row.querySelector('summary')!.textContent)).toEqual([
+    'src/app.ts+30 −5edited', 'src/new-page.ts+12created', 'old/helper.tsno net change', 'big.json+400 −2 (approx.)edited'
+  ]);
+  // A file's net diff loads when its row opens; one the recording did not keep says so.
+  rows[0]!.open = true; rows[0]!.dispatchEvent(new w.Event('toggle'));
+  await settle();
+  expect(api.turnFileDiff).toHaveBeenCalledWith(expect.any(String), 't-edit', 10, 'src/app.ts');
+  rows[3]!.open = true; rows[3]!.dispatchEvent(new w.Event('toggle'));
+  await settle();
+  expect(rows[3]!.textContent).toContain('Diff unavailable: this edit was not kept');
+  expect(api.turnFileDiff).toHaveBeenCalledTimes(1);
+  expect(card.querySelector('.turn-changes-review')!.textContent).toBe('Open in Review');
+  // Open in Review shows the turn's latest editing call in the Review panel's recorded-edit view.
+  api.getToolEditReview = vi.fn(async () => ({ ok: true, data: { callId: 'edit-12', changeIndex: 0, path: 'src/new-page.ts', added: 1, removed: 0, baseText: '', currentText: 'x\n' } }));
+  card.querySelector<HTMLButtonElement>('.turn-changes-review')!.click();
+  await settle();
+  expect(api.getToolEditReview).toHaveBeenCalledWith(expect.any(String), 'edit-12', 0);
+});
+
+// a long turn's early edits can be outside the loaded page; a turn can gain an edit
+// after its card loaded; a turn can start again after it ended.
+it('asks for the card of an answer whose turn start is not loaded, and shows none when it edited nothing', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  api.turnChanges = vi.fn(async () => ({ ok: true, data: { changes: [{ path: 'early.ts', state: 'edited', added: 2, removed: 1, approximate: false, diff: 'kept', edits: 1 }], total: 1 } }));
+  await append([
+    { seq: 501, time: T0 + 501_000, source: 'extension', kind: 'assistant_message', turnId: 't-long', messageId: 'a-long', message: text('All done.'), final: true, state: 'final' } as SessionEvent,
+    { seq: 502, time: T0 + 502_000, source: 'extension', kind: 'turn_end', turnId: 't-long', outcome: 'completed' } as SessionEvent
+  ]);
+  await append([]);
+  expect(api.turnChanges).toHaveBeenCalledWith(expect.any(String), 't-long', 0);
+  expect(w.document.querySelector('.turn-changes')?.textContent).toContain('Changed 1 file');
+});
+
+it('reads a reopened turn from its first start when only the reopening is loaded', async () => {
+  // The first turn_start and its edits left the loaded page; the app-authored reopening (with \`detail\`) is still there.
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  api.turnChanges = vi.fn(async () => ({ ok: true, data: { changes: [{ path: 'early.ts', state: 'edited', added: 2, removed: 1, approximate: false, diff: 'kept', edits: 1 }], total: 1 } }));
+  await append([
+    { seq: 700, time: T0 + 700_000, source: 'app', kind: 'turn_start', turnId: 't-reopened', detail: 'a tool call proved the turn was still running' } as SessionEvent,
+    { seq: 701, time: T0 + 701_000, source: 'extension', kind: 'assistant_message', turnId: 't-reopened', messageId: 'a-reopened', message: text('All done.'), final: true, state: 'final' } as SessionEvent,
+    { seq: 702, time: T0 + 702_000, source: 'extension', kind: 'turn_end', turnId: 't-reopened', outcome: 'completed' } as SessionEvent
+  ]);
+  await append([]);
+  // Not from 700: that would leave out every edit made before the reopening.
+  expect(api.turnChanges).toHaveBeenCalledWith(expect.any(String), 't-reopened', 0);
+  expect(w.document.querySelector('.turn-changes')?.textContent).toContain('Changed 1 file');
+});
+
+it('refreshes the card when its finished turn gains another edit, and hides it while the turn runs again', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  let files = 1;
+  api.turnChanges = vi.fn(async () => ({ ok: true, data: { changes: Array.from({ length: files }, (_, i) => ({ path: `f${i}.ts`, state: 'edited', added: 1, removed: 0, approximate: false, diff: 'kept', edits: 1 })), total: files } }));
+  const edit = (seq: number, path: string): SessionEvent => {
+    const call = toolCall(seq, `edit-late-${seq}`) as Extract<SessionEvent, { kind: 'tool_call' }>;
+    return { ...call, turnId: 't-late', call: { ...call.call, tool: 'apply_patch', summary: { kind: 'edit', tone: 'good', title: `Edited ${path}` },
+      changes: [{ path, added: 1, removed: 0, approximate: false, reviewAssetId: `asset-${seq}` }] } } as SessionEvent;
+  };
+  await append([
+    { seq: 600, time: T0 + 600_000, source: 'extension', kind: 'turn_start', turnId: 't-late' } as SessionEvent,
+    edit(601, 'f0.ts'),
+    { seq: 602, time: T0 + 602_000, source: 'extension', kind: 'assistant_message', turnId: 't-late', messageId: 'a-late', message: text('Done.'), final: true, state: 'final' } as SessionEvent,
+    { seq: 603, time: T0 + 603_000, source: 'extension', kind: 'turn_end', turnId: 't-late', outcome: 'completed' } as SessionEvent
+  ]);
+  await append([]);
+  expect(w.document.querySelector('.turn-changes')?.textContent).toContain('Changed 1 file');
+  files = 2;
+  await append([edit(604, 'f1.ts')]);
+  await append([]);
+  expect(w.document.querySelector('.turn-changes')?.textContent).toContain('Changed 2 files');
+  // The same turn starts again: its card waits until it is over again.
+  await append([{ seq: 605, time: T0 + 605_000, source: 'extension', kind: 'turn_start', turnId: 't-late' } as SessionEvent]);
+  await append([]);
+  expect(w.document.querySelector('.turn-changes')).toBeNull();
+});
+
+it('shows no Changed files card for a turn whose only edits were a worker\'s, or that edited nothing', async () => {
+  const { w, append } = await boot([]);
+  const api = (w as any).api;
+  api.turnChanges = vi.fn(async () => ({ ok: true, data: { changes: [], total: 0 } }));
+  const worker = toolCall(21, 'worker-edit') as Extract<SessionEvent, { kind: 'tool_call' }>;
+  await append([
+    { seq: 20, time: T0 + 20_000, source: 'extension', kind: 'turn_start', turnId: 't-w' } as SessionEvent,
+    { ...worker, turnId: 't-w', agent: 'worker-1', call: { ...worker.call, tool: 'apply_patch', summary: { kind: 'edit', tone: 'good', title: 'Edited a.ts' },
+      changes: [{ path: 'a.ts', added: 1, removed: 0, approximate: false }] } } as SessionEvent,
+    { ...toolCall(22, 'read-only'), turnId: 't-w' } as SessionEvent,
+    { seq: 23, time: T0 + 23_000, source: 'extension', kind: 'assistant_message', turnId: 't-w', messageId: 'a-w', message: text('Read it.'), final: true, state: 'final' } as SessionEvent,
+    { seq: 24, time: T0 + 24_000, source: 'extension', kind: 'turn_end', turnId: 't-w', outcome: 'completed' } as SessionEvent
+  ]);
+  await append([]);
+  expect(w.document.querySelector('.turn-changes')).toBeNull();
+  expect(api.turnChanges).not.toHaveBeenCalled();
 });

@@ -1,4 +1,5 @@
 import type { WorkspaceTerminalEvent, WorkspaceTerminalInfo } from '../shared/workspace-terminal.js';
+import type { TurnFileChange } from '../main/session/turn-changes.js';
 import type { DesktopDaemonApi, DesktopDaemonReply, DesktopDaemonStatus } from '../shared/desktop-daemon.js';
 import type { ChatModelCatalog } from '../shared/chat-models.js';
 import type { GoalModel } from '../shared/goal-reasoning.js';
@@ -240,6 +241,9 @@ const api = {
     call<CheckpointRestoreResult>('checkpoints:restore', { projectId, checkpointId, paths, expectedRevision }),
   getToolEditReview: (sessionId: string, callId: string, changeIndex: number) =>
     call<ToolEditReview | null>('sessions:toolEditReview', { sessionId, callId, changeIndex }),
+  /** What one answer changed, per file, read from the turn's first event (`from`, a sequence number) on. */
+  turnChanges: (sessionId: string, turnId: string, from: number) => call<{ changes: TurnFileChange[]; total: number }>('sessions:turnChanges', { sessionId, turnId, from }),
+  turnFileDiff: (sessionId: string, turnId: string, from: number, path: string) => call<{ before: string; after: string } | null>('sessions:turnFileDiff', { sessionId, turnId, from, path }),
   onProjectGitChanged: (listener: (event: ProjectGitChanged) => void): (() => void) => {
     const wrapped = (_event: unknown, change: ProjectGitChanged): void => listener(change);
     ipcRenderer.on('projectGit:changed', wrapped);

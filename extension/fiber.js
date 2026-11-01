@@ -606,6 +606,12 @@
    * it after a reload. The model id is already ChatGPT's durable identity, so there is no
    * reason to make user capture depend on the DOM having caught up.
    */
+  /** A question's parent in ChatGPT's message tree: a message id, or "root" for a chat's first turn. */
+  function parentIdOf(message) {
+    const parent = message.metadata?.parent_id;
+    return typeof parent === 'string' && (parent === 'root' || /^[A-Za-z0-9:_-]{8,190}$/.test(parent)) ? parent : null;
+  }
+
   function authoredUserMessages(messages, budget) {
     const out = [];
     const seen = new Set();
@@ -636,6 +642,10 @@
         stable: true,
         rawText,
         ...(attachments.length ? { attachments } : {}),
+        // Its place in ChatGPT's message tree; `parentExact` says two questions sharing it are versions
+        // of one message (always, for a real parent id; for the shell's predecessor, only with ChatGPT's
+        // own versions control on that turn).
+        ...(parentIdOf(message) ? { parentId: parentIdOf(message), parentExact: message.metadata?.clf_parent_exact !== false } : {}),
         order: index,
         createTime: authoredTime(message)
       });
@@ -920,6 +930,7 @@
         createTime: userCandidates[c].createTime,
         rawText: userCandidates[c].rawText,
         ...(userCandidates[c].attachments ? { attachments: userCandidates[c].attachments } : {}),
+        ...(userCandidates[c].parentId ? { parentId: userCandidates[c].parentId, parentExact: userCandidates[c].parentExact === true } : {}),
         renderedHtml: ''
       });
     }
@@ -1623,12 +1634,44 @@
   }
   /** Translate only publicly identified items in the mounted exchange. Missing item ids
    * stay missing; a stopped turn does not manufacture replies to its tool calls. */
+  /**
+   * Where a shell turn's question sits in ChatGPT's message tree (Edit & resubmit). The shell
+   * model carries no parent ids, but the thread's ordered `entries` (a few levels up) does: the
+   * question follows the previous turn's last message, and the first turn follows the root. Two
+   * questions after the same message are versions of one: a thread holds one question after each
+   * message. "root" is weaker, since a thread list that starts later would call its first turn the
+   * root too; there only ChatGPT's versions control (its handler asks the versions endpoint) proves
+   * it. ChatGPT draws that control only once the page is loaded again after an edit.
+   */
+  function shellQuestionPlace(fiber, entry, section) {
+    let entries = null, index = -1;
+    for (let at = fiber, up = 0; at && up < 40; up++, at = at.return) {
+      const list = at.memoizedProps?.entries;
+      if (!Array.isArray(list)) continue;
+      // The same entry, or the same turn re-rendered as a new object; one match only.
+      const matches = list.reduce((found, item, at) => item === entry || (item?.id && item.id === entry.id) ? [...found, at] : found, []);
+      if (matches.length === 1) { entries = list; index = matches[0]; break; }
+    }
+    if (!entries || index < 0) return null;
+    const previous = index > 0 ? entries[index - 1]?.turn?.messageIds : null;
+    const parentId = index === 0 ? 'root' : Array.isArray(previous) && previous.length ? str(previous[previous.length - 1]) : null;
+    if (!parentId) return null;
+    let versioned = false;
+    for (const button of section.querySelectorAll('button')) {
+      if (button.closest('[data-turn-key]') !== section) continue;
+      const onClick = fiberOf(button)?.memoizedProps?.onClick;
+      if (typeof onClick === 'function' && /usesVersionsEndpoint/.test(Function.prototype.toString.call(onClick))) { versioned = true; break; }
+    }
+    return { parentId, versioned: versioned || parentId !== 'root' };
+  }
+
   function shellTurnSource(fiber, section, turnId) {
-    let entry = null;
+    let entry = null, entryFiber = null;
     for (let at = fiber, up = 0; at && up < 16; up++, at = at.return) {
-      if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; break; }
+      if (Array.isArray(at.memoizedProps?.entry?.turn?.items)) { entry = at.memoizedProps.entry; entryFiber = at; break; }
     }
     if (!entry || !turnId || entry.id !== turnId || entry.turn.items.length > MAX_ROWS) return null;
+    const place = shellQuestionPlace(entryFiber, entry, section);
     const messages = [], calls = [], slots = [], seen = new Set();
     const units = new Map();
     for (const node of section.querySelectorAll('[data-content-search-unit-key]')) {
@@ -1664,7 +1707,8 @@
         const completed = final && item.completed === true && entry.turn.status === 'complete';
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
-          status: completed ? 'finished_successfully' : 'in_progress', metadata: {} });
+          status: completed ? 'finished_successfully' : 'in_progress',
+          metadata: user && place ? { parent_id: place.parentId, clf_parent_exact: place.versioned } : {} });
         const key = `${turnId}:${index}:${role}`;
         const node = units.get(key);
         if (node) slots.push({ node, id });
@@ -2235,13 +2279,51 @@
     return { ...result, refreshAvailable: !!control };
   }
 
+  /**
+   * Edit & resubmit: marks the Edit control of one question with `nonce`, chosen by handler
+   * (ChatGPT's own edit action on a user message), never by its translated label. The question's
+   * turn is `[data-turn-key=<id>]` on the newer shell (its key is the question's id), or the turn
+   * holding `[data-message-id=<id>]` on the older page. Returns how many controls matched; only
+   * exactly one is marked.
+   */
+  function markQuestionEdit(nonce, messageId) {
+    if (typeof messageId !== 'string' || !/^[0-9a-f-]{36}$/i.test(messageId)) return 0;
+    for (const node of document.querySelectorAll('[data-clf-edit]')) node.removeAttribute('data-clf-edit');
+    const keyed = [...document.querySelectorAll('[data-turn-key]')].filter(node => node.getAttribute('data-turn-key') === messageId);
+    const legacy = [...document.querySelectorAll('[data-message-id]')].filter(node => node.getAttribute('data-message-id') === messageId)
+      .map(node => node.closest('[data-testid^="conversation-turn"], article'));
+    const turns = [...new Set([...keyed, ...legacy].filter(Boolean))];
+    if (turns.length !== 1) return 0;
+    const handler = button => {
+      let fiber = null;
+      for (const key in button) if (key.indexOf('__reactFiber$') === 0) { fiber = button[key]; break; }
+      for (let depth = 0; fiber && depth < 8; depth++, fiber = fiber.return) {
+        const onClick = fiber.memoizedProps && fiber.memoizedProps.onClick;
+        if (typeof onClick === 'function') return Function.prototype.toString.call(onClick);
+      }
+      return '';
+    };
+    const edits = [...turns[0].querySelectorAll('button')].filter(button => {
+      const source = handler(button);
+      return /action:\s*"edit"/.test(source) && /surface:\s*"user_message"/.test(source);
+    });
+    if (edits.length === 1) edits[0].setAttribute('data-clf-edit', nonce);
+    return edits.length;
+  }
+
   const listener = (event) => {
     // Only this window, only our own request shape. Anything else is not ours to answer.
     if (event.source !== window) return;
     const data = event.data;
-    if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask', 'clf-plugin-ask'].includes(data.source)) return;
+    if (!data || typeof data !== 'object' || ![ASK, 'clf-picker-ask', 'clf-plugin-ask', 'clf-edit-ask'].includes(data.source)) return;
     const nonce = typeof data.nonce === 'string' ? data.nonce.slice(0, 64) : '';
     if (!nonce) return;
+    if (data.source === 'clf-edit-ask') {
+      let marked = 0;
+      try { marked = markQuestionEdit(nonce, data.messageId); } catch { /* An unknown turn shape marks nothing. */ }
+      post({ source: 'clf-edit-reply', nonce, v: 1, marked }, location.origin);
+      return;
+    }
     if (data.source === 'clf-plugin-ask') {
       let plugin = null;
       try { plugin = pluginSnapshot(); } catch { /* Unrecognized installed settings. */ }

@@ -10,7 +10,9 @@ import { getConfig } from '../config.js';
 import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
-import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, turnHasRecoveryEvidence, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage } from './store.js';
+import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, turnHasRecoveryEvidence, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage, readEvents } from './store.js';
+import { noteEditReplacement } from './edits.js';
+import type { SessionEvent } from '../../shared/session.js';
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
@@ -21,7 +23,7 @@ import { inFlightToolCalls } from '../mcp/call-context.js';
 import { automaticFinishEnabled, consumeGoalReplyForInputNow } from '../goal.js';
 import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
-import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
+import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
 import { recoveryMessage, recoveryBusyMs, rotationMessage } from '../../shared/recovery.js';
 /**
@@ -30,6 +32,9 @@ import { recoveryMessage, recoveryBusyMs, rotationMessage } from '../../shared/r
  */
 const SEND_WITHDRAWN = 'Native Send was withdrawn before its click.';
 const WITHDRAWN_FAILED = 'Not sent: ChatGPT did not accept the message.';
+
+/** ChatGPT's native message id shape. */
+const NATIVE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -51,10 +56,17 @@ export const inputArgs = z.object({
   afterTurn: z.boolean().optional(),
   dueAt: z.number().int().nonnegative(),
   model: z.string().max(80).nullable(),
-  reasoningEffort: z.enum(REASONING_EFFORTS).nullable()
+  reasoningEffort: z.enum(REASONING_EFFORTS).nullable(),
+  /**
+   * Edit & resubmit: this message replaces the chat's question `messageId` through ChatGPT's
+   * own edit, which keeps the old version beside it and continues the chat from the new one.
+   */
+  edit: z.object({ messageId: z.string().regex(NATIVE_ID) }).strict().optional()
 });
 export type InputArgs = z.infer<typeof inputArgs>;
 const entrySchema = inputArgs.extend({
+  /** An edit of the chat's first question: its new version carries the chat's setup again. */
+  editFramed: z.literal(true).optional(),
   /** This exact outbox row owns the first native send of its reserved local session. */
   opening: z.literal(true).optional(),
   /** An explicit retry can keep its unbound local chat instead of reserving another. */
@@ -771,6 +783,31 @@ export function withdrawUnsentRotation(id: string): Promise<'queued' | 'browser'
   });
 }
 
+/**
+ * An edit replaces one recorded question of the chat's current ChatGPT conversation, its newest
+ * version, as one plain browser message sent now, never beside a running turn. Whether the question
+ * is still on the page is the page's to prove, just before Send.
+ */
+async function assertEditSource(input: InputArgs, entry: InputEntry): Promise<void> {
+  const edit = input.edit!;
+  if (!input.sessionId || entry.opening) throw new Error('Edit a message in the chat it was sent in');
+  if (input.mode !== 'auto' || input.stages?.length || input.delivery || input.attachmentDelivery || input.images?.length || input.attachments?.length)
+    throw new Error('Send an edit as one plain message');
+  const session = await getSession(input.sessionId);
+  if (!session || session.origin?.kind === 'worker' || session.origin?.kind === 'helper') throw new Error('This chat\'s messages cannot be edited');
+  if (!session.conversationId) throw new Error('This recording has no ChatGPT conversation');
+  if (isChatBlocked(session.conversationId)) throw new Error('Unblock this conversation before sending');
+  if (session.activeTurnId) throw new Error('Wait until this chat finishes its turn, then edit again');
+  // Only the chat ChatGPT shows now: a chat left through Compact & Resume has its own messages.
+  const since = Math.max(0, ...Object.values(session.retiredChatAt ?? {}));
+  const questions = (await readEvents(input.sessionId, { kinds: ['user_message'] }))
+    .filter((event): event is Extract<SessionEvent, { kind: 'user_message' }> => event.kind === 'user_message');
+  const versions = questions.filter(event => event.messageId === edit.messageId);
+  const latest = versions.at(-1);
+  if (!latest || versions[0]!.time < since) throw new Error('That message is no longer in this ChatGPT chat, so it cannot be edited');
+  if (questions.some(event => event.replaces === edit.messageId)) throw new Error('That message was edited already; edit its newest version');
+  if (userPromptText(latest.message.text) !== null) entry.editFramed = true;
+}
 export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner'], generatedBy?: InputEntry['generatedBy'], workInput?: InputEntry['workInput']): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
@@ -822,7 +859,8 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     }
     // Unattributed work can fence browser Send without making this chat a tool recipient.
     // Leave that input neutral until the existing serialized claim selects a safe transport.
-    const transportIntent = toolDelivery ? 'tool' as const : input.attachments?.length ? 'browser' as const : input.mode === 'auto' && !finishOwner
+    // An edit exists only as ChatGPT's own editor action; it is never a tool-result injection.
+    const transportIntent = toolDelivery ? 'tool' as const : input.attachments?.length || input.edit ? 'browser' as const : input.mode === 'auto' && !finishOwner
       ? policy?.canInject ? 'tool' as const : !policy || policy.browserAllowed || policy.directTurn ? 'browser' as const : undefined : undefined;
     const directTurn = !toolDelivery && input.mode === 'auto' && !finishOwner && input.dueAt <= Date.now() ? policy?.directTurn : null;
     const entry: InputEntry = { ...input, ...(generatedBy ? { generatedBy } : {}), ...(workInput ? { workInput } : {}), ...(toolImages ? { toolImages } : {}), ...(directTurn ? { directTurn } : {}),
@@ -849,6 +887,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
       entry.opening = true;
       entry.sessionId = input.id;
     }
+    if (input.edit) await assertEditSource(input, entry);
     if (finishOwner && !(await finishInputCurrent(entry))) throw new Error('The automatic follow-up no longer belongs to an active turn');
     if (injectionOwner) {
       policy = await sessionInputPolicy(input.sessionId!);
@@ -1445,9 +1484,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner'; edit?: { messageId: string } }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner'; edit?: { messageId: string } }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1467,7 +1506,8 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(entry.purpose === 'rotation' && entry.directTurn ? { rotation: true as const } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
-          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}) });
+          ...(entry.lifetime ? { lifetime: entry.lifetime } : {}),
+          ...(entry.edit && conversationId ? { edit: { messageId: entry.edit.messageId } } : {}) });
       } catch { /* blocked/deleted stays user-visible */ }
     }
     return result;
@@ -1714,6 +1754,9 @@ export function acknowledgeBrowserInput(id: string, owner: string, conversationI
       entry.state !== 'cancelled' && (entry.opening || !entry.sessionId) && entry.automation && deliveredConversation && entry.purpose !== 'decision' ? [acknowledged] : [], 'after-send');
     if (entry.completedTurnId && entry.sessionId && deliveredConversation)
       await consumeGoalReplyForInputNow(deliveredConversation, entry.sessionId, entry.completedTurnId);
+    // The page saw its edit replace the question: that is known now, before ChatGPT draws its versions.
+    if (entry.edit && messageId && entry.sessionId) await noteEditReplacement(entry.sessionId, messageId, entry.edit.messageId)
+      .catch((err: Error) => logWarn(`input ${id}: could not mark the edited question (${err.message})`));
     logInfo(`input ${id}: browser acknowledged after ${Math.max(0, Date.now() - entry.createdAt)} ms`);
     await publishHistory();
     return true;
