@@ -1494,5 +1494,18 @@
   "An edit is sent as one message, not as a plan.": "Una edición se envía como un solo mensaje, no como un plan.",
   "Editing your message · replaces {0} later messages": "Editando tu mensaje · reemplaza {0} mensajes posteriores",
   "That message can no longer be edited, so this is restored as a new message.": "Este mensaje ya no se puede editar, así que se restaura como un mensaje nuevo.",
-  "Scroll up to the message you edited, then retry.": "Desplázate hacia arriba hasta el mensaje que editaste y vuelve a intentarlo."
+  "Scroll up to the message you edited, then retry.": "Desplázate hacia arriba hasta el mensaje que editaste y vuelve a intentarlo.",
+  "Changed and put back in this answer: no net change.": "Se cambió y se restauró en esta respuesta: sin cambio neto.",
+  "created": "creado",
+  "deleted": "eliminado",
+  "edited": "editado",
+  "no net change": "sin cambio neto",
+  "Open in Review": "Abrir en Revisión",
+  "Changed {0} files": "{0} archivos cambiados",
+  "{0} put back": "{0} restaurados",
+  "and {0} more": "y {0} más",
+  "{0} more not listed": "{0} más sin listar",
+  "Touched {0} files, no net change": "{0} archivos tocados, sin cambio neto",
+  "Diff unavailable: this edit was not kept": "Diff no disponible: esta edición no se guardó",
+  "The request was not valid.": "La solicitud no era válida."
 }

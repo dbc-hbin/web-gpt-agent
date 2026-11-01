@@ -7,6 +7,7 @@ import { marked, Marked } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
 import { createAgentPanel } from './agent-panel.js';
 import { createFilePanel } from './file-panel.js';
+import { firstTurnStart, renderTurnChanges, turnAnswerMessage, turnEditCount, turnFinished, turnFrom } from './turn-changes.js';
 import { createWorkPanel } from './work-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
 import { userPromptText } from '../shared/user-prompt.js';
@@ -1082,6 +1083,21 @@ function laterMessageCounts(items: readonly TimelineItem[]): Map<number, number>
 function olderHistoryPending(): boolean {
   const oldest = events.reduce((least, event) => Math.min(least, positionOf(event)), Infinity);
   return Number.isFinite(oldest) && oldest > 1 && oldest !== historyStart;
+}
+
+/**
+ * Open in Review for a turn's Changed files card: the turn's latest loaded editing call with
+ * recorded edits, in the Review panel's recorded-edit view (as that call's own Review this edit
+ * does); without one, the panel's working-tree Changes.
+ */
+async function openTurnInReview(projectId: string, sessionId: string, turnId: string): Promise<void> {
+  const call = [...events].reverse().find((event): event is Extract<SessionEvent, { kind: 'tool_call' }> => event.kind === 'tool_call' &&
+    event.turnId === turnId && !(event.agent && /^worker-\d+$/.test(event.agent)) && event.call.outcome === 'ok' &&
+    (event.call.changes ?? []).some(change => change.reviewAssetId))?.call;
+  const indices = call ? (call.changes ?? []).flatMap((change, index) => change.reviewAssetId ? [index] : []).slice(0, 8) : [];
+  if (!call || !indices.length) { await reviewPanel?.show(); return; }
+  const opened = await reviewPanel?.openReview(projectId, sessionId, call.callId, indices);
+  if (!opened) toast(t("Recorded edit is unavailable."));
 }
 
 /** The Edit action under one of your questions. */
@@ -2861,8 +2877,16 @@ function paintDetail(followBottom = historyBefore === null): void {
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && item.event.source === 'app' && item.event.kind === 'progress' && item.event.progressId?.startsWith('browser-repair:')) continue;
     if (!deps.state()?.config.ui.developerMode && item.kind === 'event' && ['session_start', 'session_end', 'turn_start', 'turn_end', 'note'].includes(item.event.kind)) continue;
     const key = itemKey(item);
+    // What a finished answer changed, once its turn is over, so the card never changes under the reader.
+    // A long turn's early edits can be outside the loaded page: an answer whose turn start is not
+    // loaded asks too, and its card stays hidden when the turn edited nothing. A new edit refreshes it.
+    const answerTurn = item.kind === 'event' && item.event.kind === 'assistant_message' && item.event.turnId && item.event.messageId &&
+      (item.event.final || item.event.state === 'final') && turnAnswerMessage(events, item.event.turnId) === item.event.messageId ? item.event.turnId : null;
+    const loadedEdits = answerTurn ? turnEditCount(events, answerTurn) : 0;
+    const changedFiles = !!answerTurn && item.kind === 'event' && turnFinished(events, answerTurn, item.event.seq) &&
+      (loadedEdits > 0 || !firstTurnStart(events, answerTurn));
     const sig = itemSignature(item) + (item.kind === 'event' && item.event.kind === 'chat_error'
-      ? JSON.stringify(chatErrorPresentation(item.event, events)) : '') +
+      ? JSON.stringify(chatErrorPresentation(item.event, events)) : '') + (changedFiles ? `\u0000changes:${loadedEdits}` : '') +
       (item.kind === 'event' && editableQuestion(item.event, events) ? `\u0000edit:${laterMessages.get(item.event.seq) ?? 0}` : '');
     keep.add(key);
     const cached = rowCache.get(key);
@@ -2877,6 +2901,14 @@ function paintDetail(followBottom = historyBefore === null): void {
     }
     const row = item.kind === 'compaction' ? compactionRow(item.block, cached?.row)
       : item.kind === 'earlier' ? earlierVersionsRow(item.fold, key) : eventRow(item.event);
+    if (changedFiles && answerTurn && selectedId) {
+      const sessionId = selectedId;
+      const project = selectedLocalProject();
+      const turnId = answerTurn;
+      row.querySelector('.said')?.append(renderTurnChanges({ sessionId, turnId, from: turnFrom(events, turnId),
+        current: () => selectedId === sessionId && selectedLocalProject()?.id === project?.id,
+        openReview: project ? () => void openTurnInReview(project.id, sessionId, turnId) : null }));
+    }
     if (item.kind === 'event' && editableQuestion(item.event, events)) {
       row.querySelector('.ev-body')?.append(questionActions(item.event, laterMessages.get(item.event.seq) ?? 0));
       row.dataset.questionId = item.event.messageId;

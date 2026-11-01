@@ -1530,5 +1530,18 @@
   "An edit is sent as one message, not as a plan.": "編集はプランではなく 1 件のメッセージとして送信されます。",
   "Editing your message · replaces {0} later messages": "メッセージを編集中 · 後続の {0} 件のメッセージを置き換えます",
   "That message can no longer be edited, so this is restored as a new message.": "このメッセージはもう編集できないため、新しいメッセージとして復元しました。",
-  "Scroll up to the message you edited, then retry.": "編集したメッセージまで上にスクロールしてから、もう一度試してください。"
+  "Scroll up to the message you edited, then retry.": "編集したメッセージまで上にスクロールしてから、もう一度試してください。",
+  "Changed and put back in this answer: no net change.": "この回答で変更して元に戻しました：差分なし。",
+  "created": "作成",
+  "deleted": "削除",
+  "edited": "編集",
+  "no net change": "差分なし",
+  "Open in Review": "レビューで開く",
+  "Changed {0} files": "{0}件のファイルを変更",
+  "{0} put back": "{0}件を元に戻した",
+  "and {0} more": "ほか{0}件",
+  "{0} more not listed": "{0}件は一覧にありません",
+  "Touched {0} files, no net change": "{0}件のファイルに触れましたが差分なし",
+  "Diff unavailable: this edit was not kept": "差分を表示できません：この編集は保存されていません",
+  "The request was not valid.": "リクエストが無効です。"
 }

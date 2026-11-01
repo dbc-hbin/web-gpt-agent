@@ -1639,5 +1639,18 @@
   "An edit is sent as one message, not as a plan.": "편집은 계획이 아닌 하나의 메시지로 전송됩니다.",
   "Editing your message · replaces {0} later messages": "메시지 편집 중 · 이후 메시지 {0}개를 대체합니다",
   "That message can no longer be edited, so this is restored as a new message.": "이 메시지는 더 이상 수정할 수 없어 새 메시지로 복원했습니다.",
-  "Scroll up to the message you edited, then retry.": "수정한 메시지까지 위로 스크롤한 다음 다시 시도하세요."
+  "Scroll up to the message you edited, then retry.": "수정한 메시지까지 위로 스크롤한 다음 다시 시도하세요.",
+  "Changed and put back in this answer: no net change.": "이 답변에서 변경했다가 되돌렸습니다: 순 변경 없음.",
+  "created": "생성됨",
+  "deleted": "삭제됨",
+  "edited": "편집됨",
+  "no net change": "순 변경 없음",
+  "Open in Review": "리뷰에서 열기",
+  "Changed {0} files": "파일 {0}개 변경",
+  "{0} put back": "{0}개 되돌림",
+  "and {0} more": "외 {0}개",
+  "{0} more not listed": "{0}개는 목록에 없음",
+  "Touched {0} files, no net change": "파일 {0}개를 건드렸지만 순 변경 없음",
+  "Diff unavailable: this edit was not kept": "Diff를 볼 수 없음: 이 편집은 보관되지 않았습니다",
+  "The request was not valid.": "요청이 올바르지 않습니다."
 }

@@ -3277,6 +3277,24 @@ retrieved only by session/call/change identity from the tool row's Review this e
 fabricated review evidence. Current Git changes and recorded edit review share a diff renderer
 but have separate truth owners.
 
+Per answer (upstream #1836, `main/session/turn-changes.ts`): `sessions:turnChanges` { sessionId,
+turnId, from } groups a turn's successful recorded edits by path (first-change order, the prime's
+own calls only, never a `worker-N` agent's) and gives each file one net diff, the first edit's
+before against the last edit's after, read from the review assets by id (`readEditReviewAsset`,
+which logs an unreadable asset once by id prefix, never content), counted with `lineDelta`:
+`edited`, `created`, `deleted` or `unchanged` (put back, or made and removed). An end with no
+review asset falls back to the summed recorded counts, marked approximate, `diff: not-kept`; an
+edit between the two ends that lost its asset does not. At most 50 files; `total` says how many
+there are. `sessions:turnFileDiff` adds `path` and returns that net before/after. `from` is the
+turn's first non-reopening `turn_start` seq when loaded, else 0. The main process reads a turn's
+tool calls once per (session, turn, from) and drops that cache on any recording change; malformed
+requests log one fixed `ipc: <channel> refused: invalid_payload` line. The renderer
+(`renderer/turn-changes.ts`) draws one collapsed "Changed N files · +a −r" card under the final
+answer of a finished turn (its end, or a later turn's start) that edited files, or whose start is
+not loaded; each file row loads its net diff on open through the shared diff viewer. Open in
+Review (local project chats) opens the turn's latest editing call in the Review panel's recorded
+edit view (`openReview`), or Review's Changes when no loaded call kept an asset.
+
 ### Plugins: installation, execution and connector refresh
 
 The optional Plugins connector proxies installed enabled MCP servers. `catalog.ts` describes

@@ -1528,5 +1528,18 @@
   "An edit is sent as one message, not as a plan.": "編輯會以單一訊息傳送，而不是計畫。",
   "Editing your message · replaces {0} later messages": "正在編輯你的訊息 · 將取代之後的 {0} 則訊息",
   "That message can no longer be edited, so this is restored as a new message.": "此訊息已無法再編輯，因此已作為新訊息還原。",
-  "Scroll up to the message you edited, then retry.": "請向上捲動到你編輯的訊息，然後重試。"
+  "Scroll up to the message you edited, then retry.": "請向上捲動到你編輯的訊息，然後重試。",
+  "Changed and put back in this answer: no net change.": "在此回答中變更後又還原：無淨變化。",
+  "created": "已建立",
+  "deleted": "已刪除",
+  "edited": "已編輯",
+  "no net change": "無淨變化",
+  "Open in Review": "在審查中開啟",
+  "Changed {0} files": "變更了 {0} 個檔案",
+  "{0} put back": "{0} 個已還原",
+  "and {0} more": "以及另外 {0} 個",
+  "{0} more not listed": "另有 {0} 個未列出",
+  "Touched {0} files, no net change": "變動了 {0} 個檔案，無淨變化",
+  "Diff unavailable: this edit was not kept": "無法顯示差異：未保留此編輯",
+  "The request was not valid.": "要求無效。"
 }
