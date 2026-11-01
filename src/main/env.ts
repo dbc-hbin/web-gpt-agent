@@ -20,6 +20,8 @@
  * all of which match names the way the operating system does.
  */
 
+import { accessSync, constants, existsSync, statSync } from 'node:fs';
+
 /** The separator between path entries: `;` on Windows, `:` everywhere else. */
 export const PATH_SEPARATOR = process.platform === 'win32' ? ';' : ':';
 const CASE_INSENSITIVE_ENVIRONMENT = process.platform === 'win32';
@@ -105,6 +107,17 @@ export function normalizeEnvironment(source: NodeJS.ProcessEnv = process.env): M
     if (!env[held]) env[held] = value;
   }
   return env;
+}
+
+/** True when `candidate` is a regular file this process may execute (any file on Windows). */
+export function isExecutableFile(candidate: string): boolean {
+  try {
+    if (!existsSync(candidate) || !statSync(candidate).isFile()) return false;
+    if (process.platform !== 'win32') accessSync(candidate, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 /** The path entries of an environment, in order, unquoted and without blanks. */

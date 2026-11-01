@@ -1706,10 +1706,6 @@ export function resetWorkContinuityForTests(): void {
   storeRef = null;
 }
 
-export function isWorkContinuityReady(): boolean {
-  return manager !== null;
-}
-
 /** The live manager, for a host that owns its lifecycle (and for tests that drive the pump). */
 export function getWorkContinuityHandle(): WorkContinuityHandle | null {
   return manager;
@@ -1899,18 +1895,6 @@ export function unbindWorkController(input: { sessionId: string; conversationId:
     logWarn(`continuity could not unbind controller: ${(error as Error).message}`);
     return false;
   }
-}
-
-/**
- * The controller that owns one work, from the binding registry rather than from the work's own
- * agent list.
- *
- * The original conversation is deliberately *not* one of the work's agents: the phone that started
- * the work never joins the run, so an agent scan cannot find it. Ownership is the binding, and the
- * binding is what this answers with.
- */
-export function workControllerOwner(workId: string): WorkControllerBinding | null {
-  return controllerOwnerOf(workId);
 }
 
 /**

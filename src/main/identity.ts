@@ -25,7 +25,6 @@
 import { randomUUID } from 'node:crypto';
 import {
   chmodSync,
-  existsSync,
   mkdirSync,
   readFileSync,
   renameSync,
@@ -108,15 +107,6 @@ export function defaultUserDataDir(
   // a Windows host must not come back with backslashes.
   return (platform === 'win32' ? path.win32 : path.posix).join(appDataRoot(env, platform), NPM_NAME);
 }
-
-/**
- * The default data directory of this host, resolved once at module load.
- *
- * Exported as a value as well as the `defaultUserDataDir()` function because the
- * CLI needs one string and has no business re-deriving it; the function stays
- * for the tests and for callers modelling another platform.
- */
-export const DEFAULT_USER_DATA_DIR = defaultUserDataDir();
 
 /** The installation id, read once per process from disk. */
 let installationId: string | null = null;
@@ -225,15 +215,6 @@ export function readPrivateFile(file: string): string | null {
     return readFileSync(file, 'utf8');
   } catch {
     return null;
-  }
-}
-
-/** True when `file` exists and is an ordinary file. */
-export function isRegularFile(file: string): boolean {
-  try {
-    return statSync(file).isFile();
-  } catch {
-    return false;
   }
 }
 
@@ -351,9 +332,4 @@ export function directoryExists(dir: string): boolean {
   } catch {
     return false;
   }
-}
-
-/** True when `file` exists at all. */
-export function pathExists(candidate: string): boolean {
-  return existsSync(candidate);
 }

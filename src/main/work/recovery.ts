@@ -65,17 +65,6 @@ export interface RecoveryRecord {
   updated_at: number;
 }
 
-/** The projection every interface displays; never the internal record verbatim. */
-export interface RecoveryEvent {
-  work_id: string;
-  agent_id: string;
-  generation: number;
-  phase: RecoveryPhase;
-  episodes: number;
-  attempts: number;
-  next_attempt_at: number;
-}
-
 /** What a managed agent's conversation told us. Only proven current-turn facts arrive here. */
 export interface RecoveryObservation {
   workId: string;

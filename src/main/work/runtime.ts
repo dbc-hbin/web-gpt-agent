@@ -2564,17 +2564,6 @@ export async function prepareManagedWorkerBootstraps(
   return out;
 }
 
-/** Binds a worker's conversation to its durable agent row and its own worktree folder. */
-export async function bindManagedWorkerConversation(conversationId: string, sessionId: string, agentId: string): Promise<boolean> {
-  if (!runtime) return false;
-  const active = runtime;
-  const existing = active.store.getAgent(agentId);
-  if (!existing) return false;
-  active.store.bindAgentConversation({ agentId, sessionId, conversationId });
-  active.store.updateAgent(agentId, { state: 'active' });
-  return true;
-}
-
 /**
  * Installs the managed hooks the broker exposes: worker-worktree staging before a chat opens,
  * the proven worker binding, and the finish precondition.
@@ -3123,6 +3112,3 @@ export async function reconcileWorkRuntime(): Promise<void> {
   await syncWorkPowerHolders();
 }
 
-export function isWorkRuntimeReady(): boolean {
-  return runtime !== null && !shuttingDown;
-}
