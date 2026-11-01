@@ -2603,6 +2603,18 @@ var CLF_DOM = (() => {
       !node.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select, ' +
         '[contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="searchbox"]')), []);
   }
+  /**
+   * Why ChatGPT's page cannot take a message right now, from what is drawn: its access-limit notice
+   * (`errors()` blocking) or an announcement over a hidden composer. Null when the composer is usable
+   * or the cause is something else. Classification only; the callers own any action.
+   */
+  function pageUnusable() {
+    return safe(() => {
+      if (errors().some(error => error.blocking === true)) return 'access_limited';
+      if (!composerVisible() && announcementDialogs().length) return 'announcement';
+      return null;
+    }, null);
+  }
   async function dismissAnnouncements(stillCurrent = () => true, waitMs = 1500) {
     const closed = [];
     for (const dialog of announcementDialogs()) {
@@ -2722,6 +2734,7 @@ var CLF_DOM = (() => {
     toolLabel,
     errors,
     dismissAnnouncements,
+    pageUnusable,
     composer,
     composerSubmitReady,
     composerBox,

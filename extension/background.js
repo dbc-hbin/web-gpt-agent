@@ -3062,6 +3062,12 @@ const HANDLERS = {
   },
   /** A ChatGPT announcement the page closed (CLF_DOM.dismissAnnouncements), for one app log line. */
   async page_note(message) {
+    if (message?.note === 'page-unusable') {
+      if (!PAGE_UNUSABLE.has(message.reason)) return { ok: false };
+      void call('/page-note', { method: 'POST',
+        body: JSON.stringify({ note: 'page-unusable', reason: message.reason, conversationId: cleanConversationId(message.conversationId) }) }).catch(() => undefined);
+      return { ok: true };
+    }
     if (message?.note !== 'announcement-closed') return { ok: false };
     const heading = typeof message.heading === 'string' ? message.heading.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
     // Best effort, and never in the tab's queue: a claim or receipt behind it must not wait on a log line.
@@ -3320,6 +3326,10 @@ const HANDLERS = {
       pendingAll: journal.length,
       pendingCloses: closeOutbox.length,
       pendingCommandAcks: commandAckOutbox.length,
+      // One typed reason the shown chat cannot take a message: Chrome's error page (no recorder can
+      // answer there) or what the page itself reports (announcement, access_limited).
+      pageUnusable: tab !== null && errorPageReloads.has(tab) && page === null ? 'error_page'
+        : PAGE_UNUSABLE.has(page?.pageUnusable) ? page.pageUnusable : null,
       delivery
     };
   },
@@ -4612,6 +4622,8 @@ function recoverDeferredRevivals() {
 // 1, 2, 4 … 15 minutes per tab. The backoff and the counter live in session storage: Chrome stops the
 // worker between passes, and a fresh worker must neither reload at once again nor report old reloads as new.
 const ERROR_PAGE_RELOADS_KEY = 'errorPageReloads';
+/** The typed reasons a chat page cannot take a message (`page_unusable`). */
+const PAGE_UNUSABLE = new Set(['announcement', 'error_page', 'access_limited']);
 const errorPageReloads = new Map();
 // For the app's log (via the diagnostics snapshot): how many, and when the last one was.
 let errorPageReloadCount = 0, lastErrorPageReloadAt = 0, errorPageReloadsLoaded = null;
@@ -4648,6 +4660,9 @@ async function forgetErrorPage(id) {
   if (errorPageReloads.delete(id)) await saveErrorPageReloads();
 }
 async function reloadErrorPage(id) {
+  // The tab is unusable whether or not it is reloaded now; the repair log line names why.
+  void call('/page-note', { method: 'POST', body: JSON.stringify({ note: 'page-unusable', reason: 'error_page',
+    conversationId: cleanConversationId(tabConversations[String(id)]) }) }).catch(() => undefined);
   if (typeof navigator !== 'undefined' && navigator.onLine === false) return noteErrorPageSkip(id, 'offline');
   // Unread is not "never reloaded": reloading now could skip the backoff, and saving would overwrite it.
   if (!await loadErrorPageReloads()) return noteErrorPageSkip(id, 'unreadable');

@@ -44,7 +44,7 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
-import type { BridgeStatus, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
+import type { BridgeStatus, PageUnusable, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
 import { recoveryBusyMs } from '../shared/recovery.js';
 import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffort, normalizedToolOutcome, toolCallSummary, unescapeMarkdown,
   type ReasoningEffort, type SessionEvent, type SessionOrigin, type StoredText, type ToolCallRecord } from '../shared/session.js';
@@ -587,6 +587,12 @@ let versionWarned = false;
 let latestCompanionDiagnostics: CompanionDiagnostics | null = null;
 /** When each page note was last logged, by chat and heading (see `/page-note`). */
 const pageNotesLogged = new Map<string, number>();
+/** The last `page_unusable` reason logged per chat, and when (see `/page-note`). */
+const pageUnusableLogged = new Map<string, { reason: PageUnusable; at: number }>();
+const PAGE_UNUSABLE_REASONS: readonly PageUnusable[] = ['announcement', 'error_page', 'access_limited'];
+function isPageUnusable(value: unknown): value is PageUnusable {
+  return PAGE_UNUSABLE_REASONS.includes(value as PageUnusable);
+}
 let companionDiagnosticsRevision = 0;
 const companionDiagnosticsWaiters = new Set<() => void>();
 
@@ -672,6 +678,7 @@ function diagnosticTab(value: unknown): CompanionTabDiagnostics | null {
     pendingAll: diagnosticNumber(tab.pendingAll, 1_000_000),
     pendingCloses: diagnosticNumber(tab.pendingCloses, 1_000_000),
     pendingCommandAcks: diagnosticNumber(tab.pendingCommandAcks, 1_000_000),
+    pageUnusable: isPageUnusable(tab.pageUnusable) ? tab.pageUnusable : null,
     delivery: {
       at: diagnosticNumber(delivery?.at),
       ok: delivery?.ok === true ? true : delivery?.ok === false ? false : null,
@@ -2660,6 +2667,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch (err) {
       if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
       return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (body?.['note'] === 'page-unusable') {
+      const reason = body['reason'];
+      if (!isPageUnusable(reason)) return json(res, 400, { error: 'bad_request' }, origin);
+      const chat = conversationId(body['conversationId']);
+      const key = chat ?? '';
+      const now = Date.now(), last = pageUnusableLogged.get(key);
+      // One line when a chat's reason changes, and again at most every ten minutes while it holds.
+      if (!last || last.reason !== reason || now - last.at >= 10 * 60_000) {
+        pageUnusableLogged.set(key, { reason, at: now });
+        if (pageUnusableLogged.size > 200) pageUnusableLogged.delete(pageUnusableLogged.keys().next().value!);
+        logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} cannot take a message: page_unusable: ${reason}`);
+      }
+      return json(res, 200, { ok: true }, origin);
     }
     if (body?.['note'] !== 'announcement-closed') return json(res, 400, { error: 'bad_request' }, origin);
     const heading = typeof body['heading'] === 'string'
@@ -9787,6 +9808,7 @@ export async function restoreCommands(): Promise<void> {
 export function resetBridgeForTests(): void {
   clearCompanionDiagnostics();
   pageNotesLogged.clear();
+  pageUnusableLogged.clear();
   errorPageReloadsLogged = { at: 0, count: 0 };
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);

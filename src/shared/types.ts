@@ -571,6 +571,9 @@ export interface CompanionPageDiagnostics {
   blocked: string | null;
 }
 
+/** Why a ChatGPT page cannot take a message: an announcement over it, Chrome's error page, or ChatGPT's access limit. */
+export type PageUnusable = 'announcement' | 'error_page' | 'access_limited';
+
 export interface CompanionTabDiagnostics {
   tab: number | null;
   isChat: boolean;
@@ -585,6 +588,8 @@ export interface CompanionTabDiagnostics {
   pendingAll: number;
   pendingCloses: number;
   pendingCommandAcks: number;
+  /** The shown chat's typed reason it cannot take a message, or null. */
+  pageUnusable: PageUnusable | null;
   delivery: {
     at: number;
     ok: boolean | null;

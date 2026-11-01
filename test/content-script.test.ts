@@ -1350,7 +1350,7 @@ describe('desktop input delivery and helper ownership', () => {
     expire();
     expect(await sending).toEqual({ ok: false });
     expect(notice.isConnected).toBe(true);
-    expect(live.sent.some(message => message.type === 'page_note')).toBe(false);
+    expect(live.sent.some(message => message.type === 'page_note' && message.note === 'announcement-closed')).toBe(false);
   });
 
   it('keeps the history-limit hold on the limited chat only', async () => {
@@ -1371,6 +1371,32 @@ describe('desktop input delivery and helper ownership', () => {
     });
     expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatB })).toEqual({ ok: true });
     expect(dialog.isConnected).toBe(false);
+  });
+
+  it('names why a held input waits: page_unusable announcement or access_limited, once per chat and reason', async () => {
+    live = await harness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => ({ ok: true, data: message.authorize || message.ack || message.fail ? { ok: true } : { input: claimed() } }),
+      page_note: () => ({ ok: true })
+    });
+    const timer = live.window.setTimeout;
+    let expire!: () => void;
+    live.window.setTimeout = ((fn: () => void, ms?: number) => {
+      if (ms === 15000) { expire = fn; return 0; }
+      return timer(fn, ms);
+    }) as typeof live.window.setTimeout;
+    const now = Date.now();
+    live.window.dispatchEvent(new live.window.MessageEvent('message', { source: live.window as unknown as Window, origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId: chatA, observedAt: now, retryAt: now + 60_000 } }));
+    announcement(live.document, { heading: 'Zu viele Anfragen' });
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const sending = live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA });
+      await settle(200);
+      expire();
+      expect(await sending).toEqual({ ok: false });
+    }
+    expect(live.sent.filter(message => message.type === 'page_note')).toEqual([
+      expect.objectContaining({ note: 'page-unusable', reason: 'access_limited', conversationId: chatA })]);
+    expect(await live.runtimeMessage({ type: 'clf-page-status' })).toMatchObject({ pageUnusable: 'access_limited' });
   });
 
   it('reports a closed announcement only for the chat it was closed on', async () => {

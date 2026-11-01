@@ -1048,6 +1048,16 @@ the chat it was closed on, as the owned message `page_note` `{ note: 'announceme
 conversationId }`; the worker answers at once and posts `POST /page-note` outside the tab's queue,
 which logs ChatGPT's heading (≤ 80 characters, no quotes or control characters) at most once a
 minute per chat and heading. A dialog with a field (Settings, Rename, a form) keeps holding input.
+One typed `page_unusable` reason names why a page cannot take a message: `announcement` (a dialog
+`dismissAnnouncements` would close is over the hidden composer), `access_limited` (the blocking
+access-limit notice `errors()` reads, or a dialog over the composer on a chat whose history was
+limited in the last 10 minutes) or `error_page` (recorder restoration hit Chrome's error page).
+`CLF_DOM.pageUnusable()` classifies what is drawn; it adds no poller or timer. A queued input that
+stays held, a bootstrap that found no composer (in its failure text), `clf-page-status`, and the
+diagnostics snapshot's `tab.pageUnusable` carry it; the held input and the error-page restoration
+post `page_note` `{ note: 'page-unusable', reason }` → `POST /page-note`, which logs
+`page_unusable: <reason>` once per chat when the reason changes and at most every 10 minutes while
+it holds. Backoff and repair decisions stay with their existing owners.
 Bootstrap (before insertion) and queued input (before its draft check) read ChatGPT's own
 `/api/auth/session`; an answer with neither `user` nor `accessToken` (signed out) fails the delivery
 with "ChatGPT is not signed in in this browser", because a signed-out ChatGPT answers in an anonymous

@@ -382,6 +382,11 @@ describe('a chat tab left on Chrome\'s error page', () => {
     expect(h.reload).toHaveBeenCalledOnce();
     expect((h.saved as any).errorPageReloads.tabs[0][1].nextAt - Date.now()).toBeLessThanOrEqual(15 * 60_000);
   });
+  it('tells the app the tab is unusable because of Chrome\'s error page, offline or not', async () => {
+    const h = await errorPage(false);
+    await vi.waitFor(() => expect(h.fetch.mock.calls.some(([url, init]: any) => new URL(url).pathname === '/page-note' &&
+      JSON.parse(init.body).note === 'page-unusable' && JSON.parse(init.body).reason === 'error_page')).toBe(true), { timeout: 5_000 });
+  });
   it('is not reloaded for any other injection failure', async () => {
     const h = await errorPage(true, {}, 'Cannot access contents of the page.');
     expect(h.reload).not.toHaveBeenCalled();

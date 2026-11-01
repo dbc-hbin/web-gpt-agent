@@ -1420,6 +1420,26 @@ describe('work continuity over the bridge', () => {
 // ------------------------------------------------------------------ events
 
 describe('observations', () => {
+  it('logs one typed page_unusable reason per chat when it changes, and refuses an unknown one', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      await pair();
+      const chat = 'f0f00003-1111-4111-8111-11111111111b';
+      const before = getLog().length;
+      const lines = () => getLog().slice(before).map(entry => entry.message).filter(line => line.includes('page_unusable'));
+      const note = (reason: unknown) => request('POST', '/page-note', { body: { note: 'page-unusable', reason, conversationId: chat } });
+      expect((await note('announcement')).body).toEqual({ ok: true });
+      await note('announcement');
+      await note('access_limited');
+      expect((await note('offline')).status).toBe(400);
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      await note('access_limited');
+      expect(lines()).toEqual([
+        `bridge: the page of ${chat} cannot take a message: page_unusable: announcement`,
+        `bridge: the page of ${chat} cannot take a message: page_unusable: access_limited`,
+        `bridge: the page of ${chat} cannot take a message: page_unusable: access_limited`]);
+    } finally { vi.useRealTimers(); }
+  });
   it('logs where the page saw a request id it could not place, and stores no transcript for it', async () => {
     // Upstream #1908.
     await pair();

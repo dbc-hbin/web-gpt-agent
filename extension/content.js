@@ -10322,6 +10322,27 @@
    * Not on a chat whose history ChatGPT limited in the last 10 minutes: its access-limit notice is a
    * dialog like any other, recognized by wording in only some languages, and must stay for the person.
    */
+  /**
+   * One typed reason this page cannot take a message: `access_limited` (ChatGPT's notice, or a
+   * dialog over the composer on a chat whose history was limited in the last 10 minutes) or
+   * `announcement` (any other dialog over the composer). Read from state other owners already keep; nothing here waits or polls.
+   */
+  function currentPageUnusable() {
+    const drawn = CLF_DOM.pageUnusable();
+    const chat = CLF_DOM.conversationId();
+    // During a history limit a dialog over the composer is taken for its notice, as closeAnnouncements does.
+    const limited = historyLimitSeen && historyLimitSeen.conversationId === chat && Date.now() - historyLimitSeen.at < 10 * 60_000;
+    return limited && drawn !== null ? 'access_limited' : drawn;
+  }
+  /** A held input says once per chat and reason why the page held it (the app logs it). */
+  let pageUnusableNoted = '';
+  function notePageUnusable() {
+    const reason = currentPageUnusable(), chat = CLF_DOM.conversationId();
+    const key = reason ? `${chat}|${reason}` : '';
+    if (key === pageUnusableNoted) return;
+    pageUnusableNoted = key;
+    if (reason) void ask({ type: 'page_note', note: 'page-unusable', reason, conversationId: chat }).catch(() => undefined);
+  }
   async function closeAnnouncements(stillCurrent = () => true) {
     const chat = CLF_DOM.conversationId();
     if (historyLimitSeen && historyLimitSeen.conversationId === chat && Date.now() - historyLimitSeen.at < 10 * 60_000) return [];
@@ -10568,7 +10589,10 @@
     let readyComposer = await waitForComposer();
     // One that opened after the page loaded gets the same treatment, once.
     if (!readyComposer && (await closeAnnouncements(stillOnTarget)).length) readyComposer = await waitForComposer(5_000);
-    if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
+    if (!readyComposer) {
+      const unusable = currentPageUnusable();
+      return void (await fail(`ChatGPT never exposed a usable composer for bootstrap${unusable ? ` (page_unusable: ${unusable})` : ''}`));
+    }
     if (await failIfRetargeted()) return;
 
     // An announcement that opened over the picker refuses the choice; closing it earns one more try.
@@ -11227,7 +11251,10 @@
         await flush();
         return false; // No claim, insertion or Send: queued input survives recovery.
       }
-      if (!composer || !onTarget() || (!message.directTurn && ((!silencePickup && generating) || CLF_DOM.generating())) || !CLF_DOM.composerVisible()) return false;
+      if (!composer || !onTarget() || (!message.directTurn && ((!silencePickup && generating) || CLF_DOM.generating())) || !CLF_DOM.composerVisible()) {
+        if (onTarget()) notePageUnusable();
+        return false;
+      }
       const reply = await ask({ type: 'desktop_input', id: message.id, conversationId: target, requiresAuthorization: true });
       const input = reply?.data?.input;
       if (input?.silenceBoundary || input?.completedTurnId) { claimedSilence = input; sourceQuiet = true; }
@@ -11706,6 +11733,7 @@
           // app-owned activity now appears only in the canonical chronological stream.
           painted: false,
           bridge: { connected: status.connected === true, paired: status.paired === true },
+          pageUnusable: currentPageUnusable(),
           ...observed
         });
         return false;
