@@ -170,6 +170,7 @@ import {
   noteAgentAlive,
   noteAgentContextTokens,
   persistCriticalSwarmNow,
+  persistAgentAuthorityNow,
   stageWorkerConversationFinish,
   workerConversationGone,
   workerRevivalDeliveredSince,
@@ -10010,6 +10011,19 @@ function settleLateStart(id: string, late: LateStartCandidate, conversation: str
       error: adopted ? null : `the worker's chat started after the app had given up on it, and ${result.outcome === 'stray' ? result.why : ''}`,
       completedAt: Date.now()
     };
+    // The adopted binding, or the retired-worker fence of a stray, is on disk before the receipt
+    // that says the command is finished: otherwise a restart finds neither the worker's chat nor
+    // its fence and the chat keeps local authority it no longer has (as at the ack path above).
+    try {
+      if (!(await persistAgentAuthorityNow())) {
+        late.settling = null;
+        return [503, { error: 'worker_state_not_durable', retryable: true }];
+      }
+    } catch (err) {
+      late.settling = null;
+      logWarn(`bridge: worker state for the late start of worker:${late.spec.runId}:${late.spec.agent} is not durable yet — ${err instanceof Error ? err.message : String(err)}`);
+      return [503, { error: 'worker_state_not_durable', retryable: true }];
+    }
     try {
       await writeDurableNow(COMMANDS_STATE, commandSnapshot({ addReceipt: receipt }));
     } catch (err) {

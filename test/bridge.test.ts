@@ -171,6 +171,7 @@ const {
   pendingWorkerSpawns,
   releaseQuiescentRun,
   onSwarmPersistNow,
+  onRetiredWorkersPersistNow,
   persistCriticalSwarmNow,
   retiredWorkerForConversation,
   resetSwarm,
@@ -387,6 +388,7 @@ beforeAll(async () => {
   initSessionStore(dir);
   initDurableStore(dir);
   onSwarmPersistNow((snapshot) => writeDurableNow('swarm', snapshot));
+  onRetiredWorkersPersistNow((snapshot) => writeDurableNow('retired-workers', snapshot));
   const baseConfig = defaultConfig();
   suiteConfig = {
     ...baseConfig,
@@ -6960,6 +6962,45 @@ describe('a worker whose chat starts after the app gave up on it', () => {
       expect(swarmState().agents.filter(agent => agent.conversationId === LATE_CHAT)).toEqual([]);
       expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late, outside the run\] .*tool calls are refused/);
     } finally { vi.useRealTimers(); }
+  });
+
+  it('saves the stray fence before the receipt that finishes its command', async () => {
+    vi.useFakeTimers();
+    const gate = Promise.withResolvers<void>();
+    const fenceWrite = Promise.withResolvers<void>();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first half' }, { task: 'second half' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      const first = await redeem(new URL(opened[0]!).searchParams.get('clf')!);
+      const second = await redeem(new URL(opened[1]!).searchParams.get('clf')!, 'tab-2');
+      await request('POST', '/commands/ack', { body: { id: second.id, status: 'sent',
+        conversationId: 'cdcdcdcd-5555-4444-3333-222222222222', agent: second.agent, client: 'tab-2' } });
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      spawn({ workers: [{ task: 'first half, again' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(3));
+      const replacement = await redeem(new URL(opened[2]!).searchParams.get('clf')!, 'tab-3');
+      await request('POST', '/commands/ack', { body: { id: replacement.id, status: 'sent',
+        conversationId: 'efefefef-5555-4444-3333-222222222222', agent: replacement.agent, client: 'tab-3' } });
+      onRetiredWorkersPersistNow(async snapshot => {
+        fenceWrite.resolve();
+        await gate.promise;
+        await writeDurableNow('retired-workers', snapshot);
+      });
+      const late = ack(first.id, LATE_CHAT);
+      await fenceWrite.promise;
+      // The fence is being written: the receipt that ends the command must not be on disk yet.
+      const before = await readDurable<{ receipts?: Array<{ id?: string }> }>('bridge-commands');
+      expect(before?.receipts?.some(entry => entry.id === first.id)).toBe(false);
+      gate.resolve();
+      expect((await late).body).toMatchObject({ final: true, committed: false });
+      const after = await readDurable<{ receipts?: Array<{ id?: string }> }>('bridge-commands');
+      expect(after?.receipts?.some(entry => entry.id === first.id)).toBe(true);
+    } finally {
+      gate.resolve();
+      onRetiredWorkersPersistNow((snapshot) => writeDurableNow('retired-workers', snapshot));
+      vi.useRealTimers();
+    }
   });
 
   it('takes no late ACK from a page other than the one that claimed it', async () => {
