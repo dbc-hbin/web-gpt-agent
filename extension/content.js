@@ -1118,6 +1118,19 @@
 
   const sleep = (ms) => new Promise((resolve) => later(resolve, ms));
 
+  const SIGNED_OUT = 'ChatGPT is not signed in in this browser. Sign in to ChatGPT there, then send again.';
+  /** ChatGPT's own answer that no account is signed in on this page; false when unknown. */
+  async function chatGptSignedOut() {
+    try {
+      if (typeof fetch !== 'function') return false;
+      const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store',
+        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(4000) : undefined });
+      if (!response?.ok) return false;
+      const session = await response.json();
+      return !!session && typeof session === 'object' && !Array.isArray(session) && !session.accessToken && !session.user;
+    } catch { return false; }
+  }
+
   const utf8Bytes = (value) => {
     const text = typeof value === 'string' ? value : String(value ?? '');
     if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).byteLength;
@@ -10575,6 +10588,8 @@
         ...(boot.reasoningEffort ? { reasoningEffort: boot.reasoningEffort } : {}), time: selectionConfirmedAt });
     };
     if (await failIfRetargeted()) return;
+    // A worker brief, Resume handoff or helper prompt never goes into an anonymous signed-out chat.
+    if (await chatGptSignedOut()) return void (await fail(SIGNED_OUT));
     let insertionFailure = '';
     if (!CLF_DOM.insertPrompt(boot.text, true, reason => { insertionFailure = reason; })) {
       return void (await fail(`ChatGPT refused the inserted text${insertionFailure ? ` (${insertionFailure})` : ''}`));
@@ -11235,6 +11250,10 @@
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
       // since React can hydrate that autosaved text while the picker is open.
+      // A signed-out ChatGPT still offers a composer and answers in an anonymous chat that is never
+      // saved, so the app's message would leave the account and never get a receipt. Only ChatGPT's
+      // own "no account" answer stops it; an unreadable session is not evidence.
+      if (await chatGptSignedOut()) return fail(SIGNED_OUT);
       if ((!ownsFreshPage() && (composer.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
       if (message.directTurn) {
         // The offer only wakes this document. The just-committed outbox claim
