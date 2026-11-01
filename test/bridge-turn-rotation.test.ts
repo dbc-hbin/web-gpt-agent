@@ -32,14 +32,14 @@ vi.mock('../src/main/browser.js', async (importOriginal) => ({
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { APP_VERSION, BRIDGE_PROTOCOL } = await import('../src/main/version.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
-const { resetBridgeForTests, setRotationHoldForTests, shutdownBridge, startBridge, sessionInputActivity, stopSessionTurn } = await import('../src/main/bridge.js');
+const { resetBridgeForTests, setRotationHoldForTests, settleRotationStopsForTests, shutdownBridge, startBridge, sessionInputActivity, stopSessionTurn } = await import('../src/main/bridge.js');
 const { resetBrowserStartupForTests } = await import('../src/main/browser-startup.js');
 const { getSession } = await import('../src/main/session/store.js');
 const { flushDurable, initDurableStore, writeDurableSoon } = await import('../src/main/durable.js');
 const { getLog } = await import('../src/main/logger.js');
 const { findSessionByConversation, initSessionStore, resetSessionStoreForTests } = await import('../src/main/session/store.js');
 const { recordToolCall, resetRecorderForTests } = await import('../src/main/session/recorder.js');
-const { listInputs, resetInputForTests } = await import('../src/main/session/input.js');
+const { listInputs, onInputChange, resetInputForTests, rotationDelivery } = await import('../src/main/session/input.js');
 const { resetTurnRotationForTests } = await import('../src/main/turn-rotation.js');
 const { openCallHold, resetCallHoldsForTests } = await import('../src/main/rotation-hold.js');
 const { trackInFlight } = await import('../src/main/mcp/call-context.js');
@@ -117,6 +117,21 @@ async function heldCall(chat: string, hold = true, tool = 'read'): Promise<() =>
   return close;
 }
 
+/** The rotation row a held call filed, re-read on each outbox change notification (bounded). */
+async function rotationRow(sessionId: string, state?: string): Promise<Awaited<ReturnType<typeof listInputs>>[number]> {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const changed = Promise.withResolvers<void>();
+    const stop = onInputChange(() => changed.resolve());
+    try {
+      const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && (!state || entry.state === state));
+      if (row) return row;
+      const timer = setTimeout(() => changed.reject(new Error('no rotation row was filed')), Math.max(0, deadline - Date.now()));
+      try { await changed.promise; } finally { clearTimeout(timer); }
+    } finally { stop(); }
+  }
+}
+
 async function attributedCall(chat: string, tool = 'read'): Promise<void> {
   const answer = (await heldCall(chat, true, tool))();
   // The page takes no continue in these tests: the held answer goes out once the wait gives up.
@@ -133,9 +148,10 @@ async function turnFor(chat: string, turnId: string, ageMinutes: number, model =
   return session!.id;
 }
 
-/** The fire-and-forget rotation settles within the serial outbox; give it a few ticks. */
+/**
+ * The rotation decision is attached to the call's hold, so an answered call has settled it.
+ */
 async function rotationsFor(sessionId: string): Promise<Array<{ turnId?: string; text: string }>> {
-  await new Promise(resolve => setTimeout(resolve, 150));
   return (await listInputs()).filter(row => row.sessionId === sessionId && row.purpose === 'rotation')
     .map(row => ({ turnId: row.queuedTurn?.turnId, text: row.text }));
 }
@@ -236,7 +252,6 @@ describe('turn rotation (#1402)', () => {
     await events(chat, [{ kind: 'page_tool', time: at + 3, turnId: 'g-rot-follow-0-2', label: 'Read file', messageId: 'rot-follow-tool' }]);
     await events(chat, [{ kind: 'assistant_message', time: at + 4, turnId: 'g-rot-follow-0-2', messageId: 'rot-follow-final', text: 'All steps are done.', state: 'final', final: true }]);
     await events(chat, [{ kind: 'turn_end', time: at + 5, turnId: 'g-rot-follow-0-2', outcome: 'completed' }]);
-    await new Promise(resolve => setTimeout(resolve, 50));
     // Before the fix this still read as exact work on the rotated turn g-rot-follow-0-1.
     expect(sessionInputActivity((await getSession(sessionId))!)).toMatchObject({ exact: false, possible: false });
   });
@@ -250,14 +265,13 @@ describe('turn rotation (#1402)', () => {
     const sessionId = await turnFor(chat, 'g-rot-hold-1', 31);
     let answered = false;
     const answer = (await heldCall(chat))().then(() => { answered = true; });
-    await new Promise(resolve => setTimeout(resolve, 150));
-    const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation')!;
-    expect(row).toBeDefined();
+    const row = await rotationRow(sessionId);
     expect(answered).toBe(false);
     const page = { id: row.id, owner: 'rotation-page', conversationId: chat };
     expect((await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body.input).toMatchObject({ id: row.id });
     expect((await request('POST', '/input/claim', { body: { ...page, authorize: true } })).body).toEqual({ ok: true });
-    await new Promise(resolve => setTimeout(resolve, 150));
+    // Authorized but not yet sent: the next delivery check still finds it sending, so the answer waits.
+    await vi.waitFor(async () => expect(await rotationDelivery(row.id)).toBe('sending'));
     expect(answered).toBe(false);
     expect((await request('POST', '/input/ack', { body: { ...page, messageId: 'rotation-continue-1' } })).body).toEqual({ ok: true });
     await answer;
@@ -298,8 +312,7 @@ describe('turn rotation (#1402)', () => {
       const chat = 'f0f00003-1111-4111-8111-000000000206';
       const sessionId = await turnFor(chat, 'g-rot-hold-6', 31);
       const answer = (await heldCall(chat))();
-      await new Promise(resolve => setTimeout(resolve, 100));
-      const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation')!;
+      const row = await rotationRow(sessionId);
       expect((await request('POST', '/input/claim', { body: { id: row.id, owner: 'slow-page', conversationId: chat, requiresAuthorization: true } })).body.input).toMatchObject({ id: row.id });
       await answer;
       const lines = logged.mock.calls.map(([line]) => String(line)).filter(line => line.includes(chat) && line.includes('within'));
@@ -315,8 +328,7 @@ describe('turn rotation (#1402)', () => {
     const sessionId = await turnFor(chat, 'g-rot-hold-4', 31);
     let answered = false;
     const answer = (await heldCall(chat))().then(() => { answered = true; });
-    await new Promise(resolve => setTimeout(resolve, 150));
-    const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation')!;
+    const row = await rotationRow(sessionId);
     const page = { id: row.id, owner: 'rotation-page', conversationId: chat };
     expect((await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body.input).toMatchObject({ id: row.id });
     const started = Date.now();
@@ -366,8 +378,7 @@ describe('stop fallback for fresh turns', () => {
   async function declineTwice(chat: string, sessionId: string, clock: { now: number }): Promise<void> {
     for (let round = 0; round < 2; round += 1) {
       const answer = (await heldCall(chat))();
-      await new Promise(resolve => setTimeout(resolve, 150));
-      const row = (await listInputs()).find(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.state === 'queued')!;
+      const row = await rotationRow(sessionId, 'queued');
       const page = { id: row.id, owner: 'rotation-page', conversationId: chat };
       expect((await request('POST', '/input/claim', { body: { ...page, requiresAuthorization: true } })).body.input).toMatchObject({ id: row.id });
       await request('POST', '/input/fail', { body: { ...page, error: 'Fresh-turn continue declined: no Send while ChatGPT works.', detail: 'no-send' } });
@@ -509,8 +520,8 @@ describe('stop fallback for fresh turns', () => {
       } else {
         await stopSessionTurn(sessionId, turn);
         expect(rotationFenced(chat)).toBe(false);
+        // The fence is gone, so this end reaches no fence branch and files nothing; the reply is the settle point.
         await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped', stoppedBy: 'app' }]);
-        await new Promise(resolve => setTimeout(resolve, 200));
         expect((await listInputs()).some(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true)).toBe(false);
       }
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
@@ -630,7 +641,8 @@ describe('stop fallback for fresh turns', () => {
       const current = defaultConfig();
       await saveConfig({ ...current, sessions: { ...current.sessions, record: true }, ui: { ...current.ui, rotateStopFallback: true, rotateTurnMinutes: 0 } });
       await (await heldCall(chat))();
-      await new Promise(resolve => setTimeout(resolve, 900));
+      // Any fallback Stop this call started has been queued or given up by now.
+      await settleRotationStopsForTests();
       expect((await request('GET', '/status')).body.stopTurns ?? []).toEqual([]);
       expect(rotationFenced(chat)).toBe(false);
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
@@ -657,7 +669,8 @@ describe('stop fallback for fresh turns', () => {
         expect((await request('GET', '/status')).body.stopTurns).toEqual([expect.objectContaining({ conversationId: chat, turnId: turn })]);
         expect(browserProbe.launches).toBeGreaterThan(0);
       }, { timeout: 10_000, interval: 50 });
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // The fallback has finished its Stop, including the failed browser launch.
+      await settleRotationStopsForTests();
       expect(rotationFenced(chat)).toBe(true);
     } finally {
       spy.mockRestore(); setRotationHoldForTests(15_000);
@@ -695,7 +708,8 @@ describe('stop fallback for fresh turns', () => {
       const sessionId = await turnFor(chat, turn, 31);
       await declineTwice(chat, sessionId, clock);
       await (await heldCall(chat))();
-      await new Promise(resolve => setTimeout(resolve, 900));
+      // Any fallback Stop this call started has been queued or given up by now.
+      await settleRotationStopsForTests();
       expect((await request('GET', '/status')).body.stopTurns ?? []).toEqual([]);
       expect(rotationFenced(chat)).toBe(false);
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); }

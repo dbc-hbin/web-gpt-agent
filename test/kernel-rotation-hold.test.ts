@@ -35,19 +35,23 @@ function handler() {
 beforeEach(() => { resetCallHoldsForTests(); recorded.during = null; });
 
 it('keeps a call\'s answer back while the continue it is due for is being sent, then answers', async () => {
-  let release!: () => void;
-  const sending = new Promise<void>(resolve => { release = resolve; });
+  const sending = Promise.withResolvers<void>();
+  const reached = Promise.withResolvers<void>();
   const seen: Array<{ conversationId: string | null; open: boolean }> = [];
   recorded.during = conversationId => {
     seen.push({ conversationId, open: conversationId ? callHoldOpen(conversationId) : false });
-    if (conversationId) holdCalls(conversationId, sending);
+    if (conversationId) holdCalls(conversationId, sending.promise);
+    reached.resolve();
   };
   let answered = false;
   const result = handler()('req-chat-a').then(value => { answered = true; return value; });
-  await new Promise(resolve => setTimeout(resolve, 50));
+  // The call is being recorded and its hold has the continue's send attached.
+  await reached.promise;
   expect(seen).toEqual([{ conversationId: 'chat-a', open: true }]);
+  // Let everything the answer could run before the hold settles: it still has not answered.
+  await new Promise(resolve => setImmediate(resolve));
   expect(answered).toBe(false);
-  release();
+  sending.resolve();
   expect(JSON.stringify(await result)).toContain('result');
   expect(callHoldOpen('chat-a')).toBe(false);
 });

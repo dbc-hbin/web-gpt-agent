@@ -15,13 +15,25 @@ vi.mock('electron', () => ({
     decryptStringAsync: async (buffer: Buffer) => ({ result: buffer.toString('utf8'), shouldReEncrypt: false })
   }
 }));
-const review = vi.hoisted(() => ({ started: [] as Array<{ conversationId: string; sessionId: string; turnId: string }>, current: null as unknown, cancelled: [] as string[] }));
+const review = vi.hoisted(() => ({ started: [] as Array<{ conversationId: string; sessionId: string; turnId: string }>, current: null as unknown, cancelled: [] as string[],
+  /** Woken when `current` changes; `waiting` is told when a draft starts waiting on a pending review. */
+  changed: [] as Array<() => void>, waiting: null as null | (() => void) }));
+/** Sets the review the draft sees and wakes a draft waiting on the previous one. */
+function setReview(value: unknown): void {
+  review.current = value;
+  for (const wake of review.changed.splice(0)) wake();
+}
 vi.mock('../src/main/goal-reviewer.js', async (original) => ({
   ...await original<typeof import('../src/main/goal-reviewer.js')>(),
   startStepReview: async (input: { conversationId: string; sessionId: string; turnId: string }) => { review.started.push(input); return 'asked'; },
   reviewForDraft: () => review.current,
   awaitStepReview: async (_conversationId: string, _turnId: string, wanted: () => boolean) => {
-    while (review.current && typeof review.current === 'object' && 'pending' in review.current && wanted()) await new Promise(resolve => setTimeout(resolve, 5));
+    while (review.current && typeof review.current === 'object' && 'pending' in review.current && wanted()) {
+      const next = Promise.withResolvers<void>();
+      review.changed.push(next.resolve);
+      review.waiting?.();
+      await next.promise;
+    }
     return review.current;
   },
   cancelStepReview: async (conversationId: string) => { review.cancelled.push(conversationId); return true; }
@@ -43,13 +55,19 @@ const bodies: string[] = [];
 function decision(action: 'stop' | 'continue', reply = ''): Response {
   return Response.json({ choices: [{ message: { content: JSON.stringify({ action, reply }) } }] });
 }
+/** The draft's settled view, awaited on Goal's own change notification (bounded). */
 async function settled(conversationId: string) {
-  for (let attempt = 0; attempt < 200; attempt++) {
+  const done = () => {
     const view = goal.goalViewFor(conversationId);
-    if (view && view.stage !== 'sending' && view.stage !== 'answering') return view;
-    await new Promise(resolve => setTimeout(resolve, 5));
-  }
-  throw new Error('the draft never settled');
+    return view && view.stage !== 'sending' && view.stage !== 'answering' ? view : null;
+  };
+  const ready = Promise.withResolvers<NonNullable<ReturnType<typeof done>>>();
+  const stop = goal.onGoalChange(() => { const view = done(); if (view) ready.resolve(view); });
+  const timer = setTimeout(() => ready.reject(new Error('the draft never settled')), 5_000);
+  try {
+    const now = done();
+    return now ?? await ready.promise;
+  } finally { stop(); clearTimeout(timer); }
 }
 const seed = async (conversationId: string): Promise<string> => {
   const session = await createSession({ title: 'goal', conversationId });
@@ -60,7 +78,7 @@ async function draftWith(conversationId: string, current: unknown, answer: Respo
   const sessionId = await seed(conversationId);
   await goal.setGoalSwitchNow(conversationId, 'goal', true);
   await goal.acceptGoalReplyNow({ conversationId, sessionId, replyId: `assistant-${conversationId}`, turnId: 'g-1', eventSeq: 3, blocked: false });
-  review.current = current;
+  setReview(current);
   globalThis.fetch = (async (_url: string, init: { body: string }) => { bodies.push(init.body); return answer; }) as never;
   goal.startGoalDraft({ sessionId, conversationId, turnId: 'g-1' });
   return { sessionId, view: await settled(conversationId) };
@@ -73,7 +91,7 @@ beforeAll(async () => {
 afterAll(async () => { resetSessionStoreForTests(); await removeTempDir(dir); globalThis.fetch = realFetch; });
 beforeEach(async () => {
   goal.resetGoalStateForTests();
-  review.started.length = 0; review.current = null; review.cancelled.length = 0; bodies.length = 0;
+  review.started.length = 0; review.current = null; review.cancelled.length = 0; review.changed.length = 0; review.waiting = null; bodies.length = 0;
   await saveConfig({ ...defaultConfig(), goal: { ...defaultConfig().goal, backend: 'api', loopBackend: 'api', enabled: true, model: 'deepseek/deepseek-v4-flash', reasoning: 'default' } });
   await setSecret('openRouterApiKey', 'sk-or-test');
 });
@@ -84,8 +102,8 @@ it('asks for a review when a step ends owing a Goal reply, and not for a blocked
   await goal.acceptGoalReplyNow({ conversationId: 'c-start', sessionId, replyId: 'assistant-start', turnId: 'g-start', eventSeq: 3, blocked: false });
   await vi.waitFor(() => expect(review.started).toEqual([{ conversationId: 'c-start', sessionId, turnId: 'g-start' }]), { timeout: 5_000 });
   const blocked = await seed('c-blocked');
+  // A blocked reply is filed as handled, so no review is ever scheduled for it.
   await goal.acceptGoalReplyNow({ conversationId: 'c-blocked', sessionId: blocked, replyId: 'assistant-blocked', turnId: 'g-b', eventSeq: 3, blocked: true });
-  await new Promise(resolve => setTimeout(resolve, 20));
   expect(review.started.map(row => row.conversationId)).toEqual(['c-start']);
 });
 
@@ -98,8 +116,12 @@ it('reviews the exact turn behind a reply alias, and says so when the turn is no
   await goal.acceptGoalReplyNow({ conversationId: 'c-alias', sessionId, replyId: 'assistant-alias', turnId: 'reply:assistant-alias', eventSeq: 3, blocked: false });
   await vi.waitFor(() => expect(review.started).toEqual([{ conversationId: 'c-alias', sessionId, turnId: 'g-real' }]), { timeout: 5_000 });
   const unknown = await seed('c-unknown');
-  await goal.acceptGoalReplyNow({ conversationId: 'c-unknown', sessionId: unknown, replyId: 'assistant-unknown', turnId: 'reply:assistant-unknown', eventSeq: 3, blocked: false });
-  await new Promise(resolve => setTimeout(resolve, 50));
+  const logged = vi.spyOn(logger, 'logInfo');
+  try {
+    await goal.acceptGoalReplyNow({ conversationId: 'c-unknown', sessionId: unknown, replyId: 'assistant-unknown', turnId: 'reply:assistant-unknown', eventSeq: 3, blocked: false });
+    await vi.waitFor(() => expect(logged.mock.calls.map(([line]) => String(line)))
+      .toContainEqual(expect.stringContaining('step reply:assistant-unknown in c-unknown is not tied to a turn yet')), { timeout: 5_000 });
+  } finally { logged.mockRestore(); }
   expect(review.started.map(row => row.conversationId)).toEqual(['c-alias']);
 });
 
@@ -177,12 +199,15 @@ it('waits for a review still in progress before the helper decides the next step
   const sessionId = await seed('c-wait');
   await goal.setGoalSwitchNow('c-wait', 'goal', true);
   await goal.acceptGoalReplyNow({ conversationId: 'c-wait', sessionId, replyId: 'assistant-c-wait', turnId: 'g-1', eventSeq: 3, blocked: false });
-  review.current = { pending: true };
+  setReview({ pending: true });
+  const waiting = Promise.withResolvers<void>();
+  review.waiting = waiting.resolve;
   globalThis.fetch = (async (_url: string, init: { body: string }) => { bodies.push(init.body); return decision('continue', 'Go on.'); }) as never;
   goal.startGoalDraft({ sessionId, conversationId: 'c-wait', turnId: 'g-1' });
-  await new Promise(resolve => setTimeout(resolve, 60));
+  // The draft is waiting on the review: nothing has been asked of the helper yet.
+  await waiting.promise;
   expect(bodies).toHaveLength(0);
-  review.current = { text: 'src/sum.js:1 sum subtracts.' };
+  setReview({ text: 'src/sum.js:1 sum subtracts.' });
   const view = await settled('c-wait');
   expect(view.reply.endsWith('\n\nReviewer: src/sum.js:1 sum subtracts.')).toBe(true);
   expect(bodies.at(-1)).toContain('src/sum.js:1 sum subtracts.');

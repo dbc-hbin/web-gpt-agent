@@ -845,11 +845,6 @@ export function setManagedRecoveryHooks(hooks: ManagedRecoveryHooks | null): voi
   managedRecovery = hooks;
 }
 
-/** The installed owner, for callers that need to ask `isManaged` themselves. */
-export function managedRecoveryHooks(): ManagedRecoveryHooks | null {
-  return managedRecovery;
-}
-
 /**
  * Performs the one managed reload, through the existing repair queue.
  *
@@ -8406,7 +8401,10 @@ async function owedPickups(now: number): Promise<Map<string, { conversationId: s
 /** One timeline row and one log line when a retried pickup reaches its twelve-hour lifetime. */
 async function noticePickupExpired(conversationId: string, watch: { replyId: string; attempts: number }): Promise<void> {
   logWarn(`bridge: automatic pickup for ${conversationId} ended after ${watch.attempts} reload(s) at its twelve-hour lifetime; the next step stays saved for the user`);
-  const session = await findSessionByConversation(conversationId, { requireUnique: true }).catch(() => null);
+  const session = await findSessionByConversation(conversationId, { requireUnique: true }).catch((error: unknown) => {
+    logWarn(`bridge: could not find the session of ${conversationId} to note its expired pickup: ${error instanceof Error ? error.message : String(error)}`);
+    return null;
+  });
   if (!session) return;
   await recordProgress(session.id, `pickup-expired:${conversationId}:${watch.replyId}`,
     `Automatic recovery ended: no page collected the next step within 12 hours (${watch.attempts} reloads). ` +
@@ -8424,7 +8422,8 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     if (now >= watch.expiresAt) {
       pickupWatch.delete(conversationId);
       // The lifetime is the last bound on an unfinished step; it must not end silently.
-      if (watch.attempts > 0) void noticePickupExpired(conversationId, watch).catch(() => undefined);
+      if (watch.attempts > 0) void noticePickupExpired(conversationId, watch)
+        .catch(error => logWarn(`bridge: could not note the expired pickup of ${conversationId}: ${error instanceof Error ? error.message : String(error)}`));
     }
     if (now < watch.expiresAt && owed.get(conversationId)?.replyId === watch.replyId) continue;
     const repair = repairsInFlight.get(conversationId);
@@ -8782,6 +8781,12 @@ function retireSpentRepairs(): void {
 let rotationHoldMs = 15_000;
 /** Test seam. */
 export function setRotationHoldForTests(ms: number): void { rotationHoldMs = ms; }
+/** Fresh-turn fallback Stops still on their way (drain, delay, queue). */
+const rotationStops = new Set<Promise<void>>();
+/** Test seam: resolves once every fallback Stop started so far has been queued or given up. */
+export async function settleRotationStopsForTests(): Promise<void> {
+  while (rotationStops.size) await Promise.all([...rotationStops]);
+}
 /** Calls that wait for the app (Session Finish, keep-on): their result is Loop's next instruction, not work. */
 const ROTATION_HOLD_TOOLS: ReadonlySet<string> = new Set(['session_finish', 'keep_astra_on_forever']);
 
@@ -8866,7 +8871,7 @@ function considerCallRotation(conversationId: string, sessionId: string, sourceT
     // still find it and file the continue.
     const fenceSaved = armRotationFence(conversationId, sourceTurnId);
     logInfo(`turn rotation: ${conversationId} — ChatGPT offered no Send for the continue; stopping turn ${sourceTurnId} after this result to continue in a fresh one`);
-    void (async () => {
+    const stopping = (async () => {
       // The Stop goes out only once no call of this chat is still running or still on its way
       // back: a Stop that lands meanwhile can make the model run that call again. The fence
       // stays armed throughout, so no new call starts. Bounded: one that never drains leaves the
@@ -8896,6 +8901,8 @@ function considerCallRotation(conversationId: string, sessionId: string, sourceT
       void clearRotationFence(conversationId);
       logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
     });
+    rotationStops.add(stopping);
+    void stopping.finally(() => rotationStops.delete(stopping));
     return;
   }
   let filedId: string | null = null;
