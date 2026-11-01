@@ -2080,7 +2080,8 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
       ...(input.recovery ? { recovery: input.recovery } : {}),
       ...(input.silenceTurnId ? { silenceTurnId: input.silenceTurnId } : {}),
-      ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
+      ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.rotation === true ? { rotation: true } : {}),
+      ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
   }
 }
 

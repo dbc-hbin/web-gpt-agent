@@ -1519,5 +1519,14 @@
   "Save a checkpoint before each turn's first edit": "各ターンの最初の編集の前にチェックポイントを保存",
   "This checkpoint is no longer available. Git has cleaned it up.": "このチェックポイントは利用できなくなりました。Git によって整理されました。",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "チェックポイントは一時的なものです。古いものは Git に整理されることがあります。オフ: 新しいチェックポイントは作成されません。",
-  "Cleaned up": "整理済み"
+  "Cleaned up": "整理済み",
+  "Start a fresh turn after": "新しいターンを始めるまで",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "長い作業は、ツール結果の直後に自動の「続行」で新しいターンに引き継がれます。短いターンほど途切れにくくなります。Goal と Loop のチャットでも使われます。Pro モデルやサブエージェント自身のチャットでは使われません。",
+  "20 minutes": "20分",
+  "30 minutes": "30分",
+  "45 minutes": "45分",
+  "60 minutes": "60分",
+  "{0} min": "{0}分",
+  "Stop and continue when ChatGPT offers no Send": "ChatGPT に送信ボタンがないときは停止して続行",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "ツール結果の時点で停止ボタンしか表示されないチャットでは、新しいターンの「続行」を送れません。1つのターンでそれが2回起きると、アプリは結果の直後にターンを停止し、停止が表示されたら「続行」を送ります。Goal と Loop はオンのままで、その間に届いたステップは実行されません。"
 }

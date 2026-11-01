@@ -1483,5 +1483,14 @@
   "Save a checkpoint before each turn's first edit": "Guardar un punto de control antes de la primera edición de cada turno",
   "This checkpoint is no longer available. Git has cleaned it up.": "Este punto de control ya no está disponible. Git lo ha limpiado.",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "Los puntos de control son temporales: Git puede limpiar los antiguos. Desactivado: no se crean nuevos.",
-  "Cleaned up": "Limpiado"
+  "Cleaned up": "Limpiado",
+  "Start a fresh turn after": "Iniciar un turno nuevo después de",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "El trabajo largo sigue en un turno nuevo con un Continuar automático, justo después de un resultado de herramienta. Los turnos más cortos fallan menos. También en chats con Goal y Loop; no con modelos Pro ni en los chats propios de los subagentes.",
+  "20 minutes": "20 minutos",
+  "30 minutes": "30 minutos",
+  "45 minutes": "45 minutos",
+  "60 minutes": "60 minutos",
+  "{0} min": "{0} min",
+  "Stop and continue when ChatGPT offers no Send": "Detener y continuar cuando ChatGPT no ofrece Enviar",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "Algunos chats solo muestran Detener tras un resultado de herramienta, así que el Continuar del turno nuevo no se puede enviar ahí. Si pasa dos veces en un turno, la app detiene el turno justo después de un resultado y envía Continuar cuando se ve la detención. Goal y Loop siguen activos, y un paso que llegue mientras tanto no se ejecuta."
 }

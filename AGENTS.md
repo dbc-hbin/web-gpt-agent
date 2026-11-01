@@ -199,6 +199,8 @@ define the tool/config/wire contract. README and worklogs are secondary and can 
 | Shell/UI | Dark theme, minimize to tray, no automatic connector connection/login startup by default. | Optional browser/finish/plan choices are resolved by current config and their consumer, not invented from absent fields. |
 | Plugin auto-refresh | Off. | Local status/discovery never claims ChatGPT refreshed its connector snapshot. |
 | Background chats | On. | Omitted legacy settings use On; explicit saved On/Off remains exact. Cold Windows startup requests a minimized browser window. |
+| Fresh turns for long work | Every 30 minutes (`ui.rotateTurnMinutes`: 0 off, 20/30/45/60; missing or malformed means 30). | Upstream #1402: turns past ~35 minutes almost always broke; Stop + "continue" by hand never did. `turn-rotation.ts` `considerTurnRotation` runs per attributed tool call (`noteCallAttribution` → `considerCallRotation`, after `grantActivity`) while that call's answer is still held (`rotation-hold.ts`, opened by the kernel around recording). Once the turn's own `turn_start` is `rotateTurnMinutes` old, `fileRotationInput` files one `purpose: 'rotation'` continue (`rotationMessage()`) into exactly that running turn and the held answer waits (bounded, `awaitRotationDelivery`) until the page has sent it; not taken in 15 s it is withdrawn without a notice. One rotation per turn; a refused filing retries after 1 min, an untaken one after 5, at most two filings per turn. A page decline for want of Send (`ROTATION_DECLINED`) retries after 1 min without spending a filing, up to six. Never for Pro/Astra turns, worker or helper chats, blocked chats, or at a `session_finish`/`keep_astra_on_forever` result; Goal and Loop chats rotate too. See §11 for the send path. |
+| Stop fallback for fresh turns | On (`ui.rotateStopFallback`; disabled while fresh turns are off). Configs without `ui.rotateStopFallbackAdopted` are turned on once (`adoptStopFallback`); a later off stays off, and a damaged marker reads as adopted. | After two `ROTATION_DECLINED` declines in one turn and the usual minute, the next held result stops the turn instead of a third continue (`stopFallbackDue`/`noteStopFallback`, once per turn). `rotation-fence.ts` arms a durable fence first (`rotation-fences` state, `FENCE_MS` = Stop budget + 15 s); the kernel refuses that chat's calls with `ROTATION_FENCE_REFUSAL`, so a Stop landing mid-call cannot repeat one. 500 ms later, only once the fence is on disk, `stopSessionTurn(…, { rotation: true })` queues the native Stop without turning Goal/Loop off or cancelling Compact & Resume. The stopped end lifts the fence and `fileRotationContinueAfterStop` files the continue as an ordinary message. A terminal-failure Stop receipt lifts the fence with no continue; the person's own Stop of that turn strips the command's `rotation` mark and clears the fence on disk first. Restart restores saved fences and re-arms one per pending `rotation` Stop for what is left of its budget. With fresh turns at 0 no fallback is taken. §14. |
 
 Keep evidence levels separate in all reports: **source → tests → build → package → installed
 payload → live browser/device/provider behavior**. Passing one level does not prove the next.
@@ -1128,6 +1130,19 @@ tool-seen flag owns it. Recheck the exact claim before native interruption and b
 Navigation, a newer question, an occupied draft or a first MCP call during preparation can
 revoke delivery. A claimed browser correction never also enters a tool result. After-turn
 entries retain their source-boundary policy and never acquire interruption authority.
+
+The app's fresh-turn continue (`purpose: 'rotation'`, settings table) is the one exception to the
+tool-free rule and never changes the person's Send directly / Inject now. It uses
+`sessionInputPolicy().runningTurn` (the same exact non-Pro running turn without the last-tool and
+in-flight fence) and is offered, claimed and sent while a call of that turn runs: `/status` and
+`/input/claim` pass rows marked `rotation`, and the page sends with ChatGPT's own Send while the turn
+generates (`CLF_DOM.send({ whileGenerating })`, exact new user row as the only receipt) without
+pressing Stop, because a Stop while a call ran made the model run it again. Offered only Stop, the
+page sends nothing and reports `ROTATION_DECLINED`. A continue never enters a tool result. It is
+nobody's typed message (`manualInput` false): a message the person sends replaces it before Send,
+a dropped or failed one raises no notice and is drawn at its creation time, and a draft its own
+uncertain click left behind is cleared from the composer. The after-Stop continue (`afterStop`) is
+an ordinary queued message for the stopped turn.
 
 Native **Thinking failed** and provider **Stopped thinking / Thinking stopped** are recognized
 only by exact visible disclosure buttons inside the current assistant turn, including
@@ -2489,6 +2504,11 @@ without renewing on retries. Browser election is saved before opening; lost rece
 and user closure do not grant another opening for that command. A reopened page adopts the
 pending Stop only after matching its original native question, and rechecks that identity before
 clicking Stop. Newer questions never inherit the old Stop's authority.
+The fresh-turn stop fallback (`stopSessionTurn(…, { rotation: true })`, settings table) is the one
+Stop that keeps Goal/Loop and Compact & Resume as they are; its fence refuses that chat's calls
+until the stopped end, a failed Stop receipt or `FENCE_MS`, and survives restart. A person's own
+Stop of the same turn takes it over: no continue follows. A Stop whose browser cannot be opened
+stays queued (logged) instead of throwing, so the fence is not lifted under a Stop still on its way.
 Block persists the exact conversation's local-tool refusal across all MCP surfaces; only a
 user release/deletion removes it. It does not remotely terminate ChatGPT or erase history.
 Neither action may spill into another local session merely because labels or timing match.

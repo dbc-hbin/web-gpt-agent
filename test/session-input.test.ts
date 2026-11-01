@@ -8,7 +8,8 @@ import { flushDurable, initDurableStore, readDurable, resetDurableForTests, writ
 import {
   fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
-  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy
+  authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy,
+  fileRotationInput, ROTATION_DECLINED, rotationDelivery
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
@@ -141,6 +142,49 @@ describe('durable user input ownership', () => {
     expect(await authorizeBrowserInput(direct.id, 'native-page', binding.conversationId)).toBe(false);
     expect(await acknowledgeBrowserInput(direct.id, 'native-page', binding.conversationId, 'native-message')).toBe(true);
     expect((await listInputs())[0]).toMatchObject({ state: 'sent', messageId: 'native-message' });
+  });
+
+  // #1402: turns past ~35 minutes break; a native send into the running turn ends it as interrupted
+  // and continues in a fresh one, a command in flight keeping its result. It is decided at a tool
+  // result, so it is filed and offered while the turn has calls; a person's Send directly is not.
+  it('files one fresh-turn continue into a running turn that has calls, as nobody\'s typed message', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    binding.lastToolCallAt = 950;
+    expect((await sessionInputPolicy(sessionId)).directTurn).toBeNull();
+    expect(await fileRotationInput(sessionId, 'other-turn')).toBeNull();
+    const row = await fileRotationInput(sessionId, 'plain-turn');
+    expect(row).toMatchObject({ purpose: 'rotation', authoredSource: 'none', mode: 'auto', transportIntent: 'browser',
+      directTurn: { id: 'plain-turn' }, queuedTurn: { turnId: 'plain-turn' }, conversationId: binding.conversationId, state: 'queued' });
+    expect(row!.text).toMatch(/continue/i);
+    expect(await pendingBrowserInputs()).toEqual([expect.objectContaining({ id: row!.id, rotation: true })]);
+    // Never in a tool result: there it would end no turn.
+    expect(await offerToolInput(sessionId, binding.conversationId, 'next-call', now)).toEqual([]);
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+    // A message of the user's own replaces a continue that was never handed out.
+    const own = await enqueueInput(input({ text: 'Also check the tests' }));
+    expect((await listInputs()).find(entry => entry.id === row!.id)).toMatchObject({ state: 'cancelled' });
+    expect(own.state).toBe('queued');
+  });
+  it('files no fresh-turn continue for a Pro turn or a blocked chat', async () => {
+    binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    binding.model = 'gpt-5.6-pro';
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+    binding.model = 'gpt-5.6-sol'; binding.blocked = true;
+    expect(await fileRotationInput(sessionId, 'plain-turn')).toBeNull();
+  });
+  it('cancels a declined fresh-turn continue without a notice and reports it declined', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const row = await fileRotationInput(sessionId, 'plain-turn');
+    expect(await claimBrowserInput(row!.id, 'native-page', binding.conversationId, true)).not.toBeNull();
+    expect(await rotationDelivery(row!.id)).toBe('pending');
+    expect(await failBrowserInput(row!.id, 'native-page', ROTATION_DECLINED)).toBe(true);
+    expect(await rotationDelivery(row!.id)).toBe('declined');
+    const after = (await listInputs()).find(entry => entry.id === row!.id)!;
+    expect(after.state).toBe('cancelled');
+    expect(after.error).toBeUndefined();
   });
 
   it('queues an explicit injection before the first tool for that exact turn without browser fallback', async () => {

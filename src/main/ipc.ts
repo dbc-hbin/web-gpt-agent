@@ -161,6 +161,8 @@ const settingsPatch = z.object({
     backgroundChats: z.boolean().optional(),
     browserOnly: z.boolean().optional(),
     autoRefreshPlugins: z.boolean().optional(),
+    rotateTurnMinutes: z.number().int().min(0).max(120).optional(),
+    rotateStopFallback: z.boolean().optional(),
     tabsToKeepOpen: z.number().int().min(1).max(50).optional(),
     minimizeToTray: z.boolean(),
     autoConnect: z.boolean(),
@@ -295,6 +297,11 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       backgroundChats: pick(current.ui.backgroundChats, base.ui.backgroundChats, wanted.ui.backgroundChats),
       browserOnly: pick(current.ui.browserOnly, base.ui.browserOnly, wanted.ui.browserOnly),
       autoRefreshPlugins: pick(current.ui.autoRefreshPlugins, base.ui.autoRefreshPlugins, wanted.ui.autoRefreshPlugins),
+      rotateTurnMinutes: pick(current.ui.rotateTurnMinutes, base.ui.rotateTurnMinutes, wanted.ui.rotateTurnMinutes),
+      // On unless false: a missing value is the default, on.
+      rotateStopFallback: pick(current.ui.rotateStopFallback !== false, base.ui.rotateStopFallback !== false, wanted.ui.rotateStopFallback ?? current.ui.rotateStopFallback !== false),
+      // Not a form field: kept as saved, or the next load would turn a saved off back on.
+      ...(current.ui.rotateStopFallbackAdopted !== undefined ? { rotateStopFallbackAdopted: current.ui.rotateStopFallbackAdopted } : {}),
       tabsToKeepOpen: pick(current.ui.tabsToKeepOpen, base.ui.tabsToKeepOpen, wanted.ui.tabsToKeepOpen),
       minimizeToTray: pick(current.ui.minimizeToTray, base.ui.minimizeToTray, wanted.ui.minimizeToTray),
       autoConnect: pick(current.ui.autoConnect, base.ui.autoConnect, wanted.ui.autoConnect),

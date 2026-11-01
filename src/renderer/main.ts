@@ -477,6 +477,8 @@ function save(over: { readOnly?: boolean; fileAccessMode?: AppState['config']['f
       finishTool: $<HTMLInputElement>('finishTool').checked,
       planBackend: $<HTMLSelectElement>('planBackend').value as 'chatgpt' | 'api',
       finishLeadMinutes: Number($<HTMLSelectElement>('finishLeadMinutes').value),
+      rotateTurnMinutes: Number($<HTMLSelectElement>('rotateTurnMinutes').value),
+      rotateStopFallback: $<HTMLInputElement>('rotateStopFallback').checked,
       backgroundChats: $<HTMLInputElement>('backgroundChats').checked,
       autoContinue: $<HTMLInputElement>('autoContinue').checked,
       browserOnly: $<HTMLInputElement>('browserOnly').checked,
@@ -1013,6 +1015,19 @@ function apply(next: AppState): void {
   $<HTMLSelectElement>('planBackend').value = config.ui.planBackend ?? 'chatgpt';
   applyChecked($<HTMLInputElement>('finishTool'), config.ui.finishTool === true, previousState?.config.ui.finishTool);
   applyValue($<HTMLSelectElement>('finishLeadMinutes'), String(config.ui.finishLeadMinutes ?? 5), String(previousState?.config.ui.finishLeadMinutes ?? 5));
+  // A value the list does not offer (set in the config) gets its own option; without one the select
+  // reads empty and the next save of any setting turned fresh turns Off.
+  const rotate = $<HTMLSelectElement>('rotateTurnMinutes');
+  const rotateMinutes = String(config.ui.rotateTurnMinutes ?? 30);
+  if (![...rotate.options].some(option => option.value === rotateMinutes)) {
+    rotate.querySelector('option[data-configured]')?.remove();
+    const option = document.createElement('option');
+    option.value = rotateMinutes; option.textContent = t('{0} min', [rotateMinutes]); option.dataset.configured = '';
+    rotate.add(option);
+  }
+  applyValue(rotate, rotateMinutes, previousState ? String(previousState.config.ui.rotateTurnMinutes ?? 30) : undefined);
+  applyChecked($<HTMLInputElement>('rotateStopFallback'), config.ui.rotateStopFallback !== false, previousState?.config.ui.rotateStopFallback);
+  $<HTMLInputElement>('rotateStopFallback').disabled = (config.ui.rotateTurnMinutes ?? 30) === 0;
   applyChecked($<HTMLInputElement>('backgroundChats'), config.ui.backgroundChats === true, previousState?.config.ui.backgroundChats);
   applyChecked($<HTMLInputElement>('autoContinue'), config.ui.autoContinue !== false, previousState?.config.ui.autoContinue);
   applyChecked($<HTMLInputElement>('browserOnly'), config.ui.browserOnly === true, previousState?.config.ui.browserOnly);

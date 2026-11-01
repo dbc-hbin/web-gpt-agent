@@ -1517,5 +1517,14 @@
   "Save a checkpoint before each turn's first edit": "在每個回合的首次編輯前儲存檢查點",
   "This checkpoint is no longer available. Git has cleaned it up.": "此檢查點已無法使用。Git 已將其清理。",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "檢查點是暫時的：Git 可能會清理舊的檢查點。關閉：不再建立新的檢查點。",
-  "Cleaned up": "已清理"
+  "Cleaned up": "已清理",
+  "Start a fresh turn after": "開始新一輪的時間",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "長時間的工作會在工具結果之後透過自動「繼續」在新一輪中接著進行。較短的輪次較不容易中斷。Goal 和 Loop 聊天中也會使用；Pro 模型和子代理自己的聊天中不會使用。",
+  "20 minutes": "20 分鐘",
+  "30 minutes": "30 分鐘",
+  "45 minutes": "45 分鐘",
+  "60 minutes": "60 分鐘",
+  "{0} min": "{0} 分鐘",
+  "Stop and continue when ChatGPT offers no Send": "ChatGPT 不提供傳送時停止並繼續",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "有些聊天在工具結果處只顯示停止，因此新一輪的「繼續」無法在那裡傳送。一輪中出現兩次後，應用程式會在結果之後立即停止該輪，並在顯示已停止後傳送「繼續」。Goal 和 Loop 保持開啟，期間到達的步驟不會執行。"
 }

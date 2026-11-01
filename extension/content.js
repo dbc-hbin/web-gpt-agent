@@ -789,8 +789,8 @@
     };
   }
   function sendSubmittedText(stillCurrent, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null,
-                             matchesUser = matchesSubmittedUser) {
-    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser,
+                             matchesUser = matchesSubmittedUser, whileGenerating = false) {
+    return CLF_DOM.send({ stillCurrent, clearAcceptedDraft, beforeSend, acceptUserReceipt, matchesUser, whileGenerating,
       observeEvidence: check => { pageViewChecks.add(check); return () => pageViewChecks.delete(check); } });
   }
   // Kept byte-identical to shared/goal-templates.ts: the main process appends the same instruction.
@@ -11216,8 +11216,12 @@
 
   async function acceptDesktopInput(message) {
     const silencePickup = typeof message.silenceTurnId === 'string';
+    // The app's fresh-turn continue (#1402) goes into the running turn while the call it is due at
+    // still runs: the app holds that call's answer until it is sent (rotation-hold.ts). Only it
+    // may be sent while ChatGPT works; a person's direct message keeps the tool-free Stop-then-Send.
+    const rotation = message.rotation === true && !!message.directTurn;
     let sourceQuiet = silencePickup;
-    if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || pendingTools > 0 || goalBusy || job?.busy) return false;
+    if (desktopInputBusy || modelCatalogBusy || !alive || (generating && !message.directTurn && !silencePickup) || (pendingTools > 0 && !rotation) || goalBusy || job?.busy) return false;
     const target = message.conversationId || null;
     const forEpoch = epoch;
     const sourceTurn = turnId;
@@ -11228,7 +11232,8 @@
       (!message.recovery || sendAttempted || !userStopped) &&
       (!sourceQuiet || sendAttempted || (turnProgressRevision === sourceActivity && turnId === sourceTurn &&
         CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser)) &&
-      (!message.directTurn || sendAttempted || (CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser &&
+      // A first turn's question can be missing from the page; the turn id alone names it.
+      (!message.directTurn || sendAttempted || (((rotation && sourceUser === undefined) || CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id === sourceUser) &&
         (!turnId || turnId === sourceTurn)));
     if (!onTarget()) return false;
     if (message.recovery && (!sourceUser || sourceUser !== message.recovery.questionId || userStopped)) return false;
@@ -11269,8 +11274,9 @@
         return false;
       }
     }
+    // The running turn is named by the page's own turn id; a fresh-turn continue needs no visible question.
     if (message.directTurn && (!target || ((generating || CLF_DOM.generating()) &&
-        (!sourceUser || sourceTurn !== message.directTurn.id)))) return false;
+        ((rotation ? !sourceTurn : !sourceUser) || sourceTurn !== message.directTurn.id)))) return false;
     const ownsFreshPage = () => !target && onTarget() && location.pathname === '/' &&
       new URL(location.href).searchParams.get('cos-input') === message.id && !CLF_DOM.turns().length;
     if (!target && !ownsFreshPage()) return false;
@@ -11290,7 +11296,7 @@
       // An announcement is not a dialog the person is using: close it so the message is not held behind it.
       if (!CLF_DOM.composerVisible()) await closeAnnouncements(onTarget);
       const composer = await waitPageView(() => (message.directTurn || !CLF_DOM.generating()) && CLF_DOM.composerVisible() && CLF_DOM.composer(),
-        () => onTarget() && (message.directTurn || silencePickup || !generating) && pendingTools === 0, 15000);
+        () => onTarget() && (message.directTurn || silencePickup || !generating) && (rotation || pendingTools === 0), 15000);
       if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {
         // Only after readiness expires, re-prove the exact terminal: a Retry or
         // new user turn must never become authority to reload the page.
@@ -11353,7 +11359,13 @@
       // own "no account" answer stops it; an unreadable session is not evidence.
       if (await chatGptSignedOut()) return fail(SIGNED_OUT);
       if ((!ownsFreshPage() && (composer.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
-      if (message.directTurn) {
+      if (rotation) {
+        // Nothing is stopped for a fresh-turn continue: a Stop while one of the turn's calls runs
+        // made the model run that call again (measured upstream 2026-10-18, #1662).
+        if (input.directTurn?.id !== message.directTurn.id) return fail('The turn changed before direct delivery.');
+        await flush();
+        if (!onTarget()) return fail('The chat changed before direct delivery.');
+      } else if (message.directTurn) {
         // The offer only wakes this document. The just-committed outbox claim
         // authorizes interrupting this exact tool-free turn, like handoff's Stop
         // then normal Send. A changed question, tool call or lost claim forbids it.
@@ -11379,7 +11391,7 @@
       const limitation = providerLimitation();
       if (limitation) return fail(limitation);
       if (!(await CLF_DOM.selectModelSettings(input.model, input.reasoningEffort, onTarget))) return fail(providerLimitation() || 'Requested model or reasoning could not be confirmed');
-      if (!onTarget() || CLF_DOM.generating() || (!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('The ChatGPT composer changed before sending');
+      if (!onTarget() || (CLF_DOM.generating() && !rotation) || (!ownsFreshPage() && (CLF_DOM.composer()?.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('The ChatGPT composer changed before sending');
       if (!CLF_DOM.insertPrompt(input.text, ownsFreshPage())) return fail('ChatGPT did not accept the text');
       const sendingTarget = submittedSendLifetime(target, forEpoch);
       draft = CLF_DOM.captureComposerDraft(input.text, () => sendAttempted ? sendingTarget() : onTarget());
@@ -11417,6 +11429,14 @@
       // The receipt is recorded under the identity too: this is the same native send the click
       // listeners will see, and it must not be rewritten with a Goal marker either.
       rememberUserSend(managedSendInFlight);
+      // While ChatGPT thinks it may offer only Stop and no Send. The page then sends nothing and says
+      // so at once: the app holds the due call's answer for this continue, and a later tool result,
+      // usually one without Stop, tries again (measured upstream on Loop chats, 2026-10-20).
+      if (rotation && CLF_DOM.generating() && !await waitPageView(() => !!CLF_DOM.sendButton(), onTarget, 3000)) {
+        await ask({ type: 'desktop_input', id: input.id, owner: input.owner, fail: true,
+          error: 'Fresh-turn continue declined: no Send while ChatGPT works.' }).catch(() => undefined);
+        return false;
+      }
       if (!(await sendSubmittedText(sendingTarget, false, async sendCurrent => {
         // Preserve the outbox's revocable claim until the actual native Send is ready.
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current())) return false;
@@ -11441,7 +11461,13 @@
         // may replace it before this async operation resumes; do not rediscover it.
         receipt = { conversation, user: { id: user.id } };
         return true;
-      }))) {
+      }, matchesSubmittedUser, rotation))) {
+        // The app's own continue is never the person's text. One that collided with the turn's end
+        // sent nothing and would sit in the composer until the person's next message failed on "an
+        // unsent draft". Still uncertain, so never resent, but an exact copy of it is taken out.
+        if (rotation && sendAttempted && onTarget() && sendText(CLF_DOM.composer()?.textContent) === submittedText) {
+          try { await draft.clear(); } catch { /* An unclearable draft stays where it is. */ }
+        }
         // Authorized, yet never clicked: ChatGPT drew the editor again while the app answered, as a
         // fresh tab does when it moves to its project route. Nothing went out, but the claim reads as
         // a send that may have, so the message would never be sent at all. With this exact text taken

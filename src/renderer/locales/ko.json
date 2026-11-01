@@ -1628,5 +1628,14 @@
   "Save a checkpoint before each turn's first edit": "각 턴의 첫 편집 전에 체크포인트 저장",
   "This checkpoint is no longer available. Git has cleaned it up.": "이 체크포인트는 더 이상 사용할 수 없습니다. Git이 정리했습니다.",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "체크포인트는 임시입니다. 오래된 것은 Git이 정리할 수 있습니다. 끔: 새 체크포인트를 만들지 않습니다.",
-  "Cleaned up": "정리됨"
+  "Cleaned up": "정리됨",
+  "Start a fresh turn after": "새 턴 시작 시점",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "긴 작업은 도구 결과 직후 자동 계속으로 새 턴에서 이어집니다. 턴이 짧을수록 덜 끊깁니다. Goal과 Loop 채팅에서도 쓰이며, Pro 모델이나 하위 에이전트 자체 채팅에서는 쓰이지 않습니다.",
+  "20 minutes": "20분",
+  "30 minutes": "30분",
+  "45 minutes": "45분",
+  "60 minutes": "60분",
+  "{0} min": "{0}분",
+  "Stop and continue when ChatGPT offers no Send": "ChatGPT에 보내기 버튼이 없으면 중지 후 계속",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "일부 채팅은 도구 결과 시점에 중지 버튼만 보여서 새 턴의 계속을 보낼 수 없습니다. 한 턴에서 이런 일이 두 번 생기면 앱이 결과 직후 턴을 중지하고, 중지가 표시되면 계속을 보냅니다. Goal과 Loop는 켜진 채로 유지되며, 그사이 도착한 단계는 실행되지 않습니다."
 }

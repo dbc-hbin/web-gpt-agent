@@ -9,7 +9,10 @@ import { pendingChatModelRequest, observeChatModels, requestChatModels } from '.
 import { isProModel } from '../shared/chat-models.js';
 import { injectedUserMessage, recordedRequestTurn, responseTurnId } from '../shared/chronology.js';
 import type { SessionSummary } from '../shared/session.js';
-import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, type InputActivity } from './session/input.js';
+import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, fileRotationInput, fileRotationContinueAfterStop, rotationDelivery, withdrawUnsentRotation, type InputActivity } from './session/input.js';
+import { considerTurnRotation, noteRotationDeclined, noteStopFallback, stopFallbackDue, type RotationDeps } from './turn-rotation.js';
+import { armRotationFence, clearRotationFence, FENCE_MS, restoreRotationFences, rotationFenced, rotationFenceTurn } from './rotation-fence.js';
+import { callHoldOpen, holdCalls } from './rotation-hold.js';
 import { pluginRefreshPublications, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { wakeBrowserUrl } from './browser-startup.js';
@@ -454,7 +457,9 @@ type CommandSpec =
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
   | { type: 'resume'; sessionId: string; token: string }
-  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
+  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string;
+    /** A fresh-turn Stop (the stop fallback): its chat's rotation fence lives as long as it does. */
+    rotation?: true };
 
 interface Command {
   id: string;
@@ -2152,8 +2157,15 @@ async function stopUserAnchor(sessionId: string, turnId: string): Promise<string
   }
   return undefined;
 }
-/** Stop is a request against one exact live turn, never a predicted final boundary. */
-export async function stopSessionTurn(sessionId: string, expectedTurnId: string): Promise<SessionControlsView> {
+/** After a call is recorded, how long until its answer has gone out and the fallback's Stop may follow. */
+const ROTATION_STOP_DELAY_MS = 500;
+
+/**
+ * Stop is a request against one exact live turn, never a predicted final boundary. `rotation`: the
+ * app stops the turn to continue it in a fresh one (`ui.rotateStopFallback`), so Goal or Loop and a
+ * pending Compact & Resume stay as they are.
+ */
+export async function stopSessionTurn(sessionId: string, expectedTurnId: string, options: { rotation?: boolean } = {}): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
   const assertCurrent = async () => {
     const latest = await getSession(sessionId);
@@ -2161,13 +2173,30 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
         await conversationWasSuperseded(id) || (await sessionControlsFor(sessionId)).activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
   };
   await assertCurrent();
-  await setSessionAutomation(sessionId, 'off');
-  await assertCurrent();
-  if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
+  if (!options.rotation) {
+    // The person's Stop takes over a pending fresh-turn Stop of the same turn: no automatic continue
+    // may follow the stop they asked for. The saved Stop loses its fresh-turn mark first, so a
+    // restart restores neither it nor its fence.
+    const pendingRotation = commands.find(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId &&
+      entry.spec.turnId === expectedTurnId && entry.spec.rotation === true);
+    if (pendingRotation && !await withdrawStopRotation(pendingRotation))
+      logWarn(`turn rotation: ${id} — the person's Stop over the fresh-turn Stop of turn ${expectedTurnId} could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after it`);
+    if (rotationFenceTurn(id) === expectedTurnId) {
+      // On disk before their Stop goes out, so a restart cannot bring the fence back and continue
+      // after it. Their Stop goes out even when the disk refuses: it is theirs.
+      const cleared = await clearRotationFence(id);
+      logInfo(`turn rotation: ${id} — the person stopped turn ${expectedTurnId}; the fresh turn the app was starting is cancelled`);
+      if (!cleared) logWarn(`turn rotation: ${id} — the cancelled fresh turn could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after the person's Stop`);
+    }
+    await setSessionAutomation(sessionId, 'off');
+    await assertCurrent();
+    if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
+  }
   const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
-  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}) });
+  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}),
+    ...(options.rotation ? { rotation: true as const } : {}) });
   try {
     // Reuse the command lease barrier: status must not hand out an unsaved request.
     const pendingLease = commandWrites.get(command.id);
@@ -2183,17 +2212,26 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
   await revokeSilenceInputs(sessionId);
   endActivity(id);
   repairsInFlight.delete(id);
+  if (!alreadyQueued) logInfo(`bridge: ${options.rotation ? 'fresh-turn' : 'desktop'} Stop requested for session ${sessionId}, conversation ${id}, turn ${expectedTurnId}, command ${command.id}; native cancellation is unconfirmed`);
   wakeBrowserWork();
   changed();
   if (!alreadyQueued) {
     const lifecycle = bridgeLifecycleEpoch;
     // The shared startup owner launches only on positive process absence. An
     // existing browser remains the extension election's responsibility.
-    await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
-      current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
-        Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
-        liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
-    });
+    // The Stop is queued and saved by now, so a browser that cannot be opened does not undo it: the
+    // extension takes it when it next connects (or it times out). Throwing here made the stop
+    // fallback lift its fence under a Stop still on its way, and showed the person an error for a
+    // Stop that was in fact requested.
+    try {
+      await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
+        current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
+          Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
+          liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
+      });
+    } catch (error) {
+      logWarn(`bridge: could not open the browser for the Stop of conversation ${id}, turn ${expectedTurnId}: ${error instanceof Error ? error.message : String(error)}; the Stop stays queued for the extension's next pass`);
+    }
   }
   return sessionControlsFor(sessionId);
 }
@@ -2630,7 +2668,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         pluginRefreshRequests: getConfig().ui.autoRefreshPlugins === true ? pluginRefreshPublications().map(({ surface, schemaId, connectorName }) => ({ surface, schemaId, connectorName })) : [],
         browserPreferenceRequest: pendingBrowserPreferenceRequest(),
         inputOpeningIds: inputRows.filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).map(row => row.id),
-        inputs: [...(await pendingBrowserInputs()).filter(input => !input.conversationId || runningToolCalls(input.conversationId) === 0),
+        // A fresh-turn continue goes in while the call it is due at still runs (rotation-hold.ts).
+        inputs: [...(await pendingBrowserInputs()).filter(input => !input.conversationId || input.rotation || runningToolCalls(input.conversationId) === 0),
           ...inputRows.filter(row => row.lifetime === 'temporary-planner' && ['sent', 'cancelled', 'failed'].includes(row.state))
             .map(row => ({ id: row.id, owner: row.owner, lifetime: row.lifetime, close: true,
               retire: true }))],
@@ -2804,7 +2843,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return json(res, 200, { ok: deferred }, origin);
     }
     if (body.authorize === true) return json(res, 200, { ok: await authorizeBrowserInput(body.id, body.owner, target) }, origin);
-    if (target && runningToolCalls(target) > 0) return json(res, 200, { input: null }, origin);
+    // A fresh-turn continue may be claimed while a call runs, exactly as /status offers it;
+    // claimBrowserInput still requires that same running turn. Everything else waits for the call.
+    if (target && runningToolCalls(target) > 0 &&
+        !(await pendingBrowserInputs()).some(row => row.id === body.id && row.conversationId === target && row.rotation))
+      return json(res, 200, { input: null }, origin);
     const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
     return json(res, 200, { input }, origin);
   }
@@ -5806,6 +5849,23 @@ function receiptReply(receipt: CommandReceipt): Record<string, unknown> {
   };
 }
 
+/** A fresh-turn Stop the person's own Stop takes over: saved without its mark. */
+async function withdrawStopRotation(command: Command): Promise<boolean> {
+  return writeCommandTransition(command, async () => {
+    if (!commands.includes(command) || command.spec.type !== 'stop' || !command.spec.rotation) return true;
+    const { rotation: _rotation, ...spec } = command.spec;
+    command.spec = spec;
+    try {
+      await writeDurableNow(COMMANDS_STATE, commandSnapshot());
+      return true;
+    } catch (err) {
+      persistCommands();
+      logWarn(`bridge: could not save the person's Stop over ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  });
+}
+
 async function finalizeCommand(command: Command, receipt: CommandReceipt): Promise<boolean> {
   return writeCommandTransition(command, async () => {
     if (!commands.includes(command)) return receiptFor(receipt.id) !== null;
@@ -5822,6 +5882,14 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
     command.timer = null;
     commands = commands.filter((entry) => entry !== command);
     commandReceipts = [...commandReceipts.filter((entry) => entry.id !== receipt.id), receipt].slice(-MAX_COMMAND_RECEIPTS);
+    // A fresh-turn Stop the page could not send protects nothing any more: no stop and no continue
+    // follow, so its chat's calls run again at once. A Stop that went out keeps the fence until its
+    // stopped end is processed, which files the continue.
+    if (receipt.outcome === 'terminal-failure' && command.spec.type === 'stop' && command.spec.rotation &&
+        rotationFenceTurn(command.spec.conversationId) === command.spec.turnId) {
+      void clearRotationFence(command.spec.conversationId);
+      logInfo(`turn rotation: ${command.spec.conversationId} — the page could not stop turn ${command.spec.turnId}; its calls run again and no fresh turn follows`);
+    }
     changed();
     return true;
   });
@@ -7592,6 +7660,17 @@ async function noteRecoveryObservations(
     }
   }
   const lastEnd = ended?.outcome ?? null;
+  // The turn the app stopped to continue in a fresh one (`ui.rotateStopFallback`) shows stopped:
+  // calls may run again, and the continue goes as an ordinary message.
+  const fencedTurn = rotationFenceTurn(conversationId);
+  if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn) {
+    void clearRotationFence(conversationId);
+    void fileRotationContinueAfterStop(sessionId, fencedTurn).then(row => {
+      logInfo(row ? `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; continuing in a fresh turn`
+        : `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; a message was already waiting, so it goes instead of the continue`);
+      changed();
+    }).catch(error => logWarn(`turn rotation: ${String(error)}`));
+  }
   let terminalGrant = activeUntil.get(conversationId);
   if (nativeTerminalFailure && ended.turnId && sessionId && activity.terminal) {
     // A managed work agent owns this occurrence. The notification is how its owner learns a
@@ -7660,8 +7739,15 @@ async function noteRecoveryObservations(
   // The ten-/two-minute budget is silence recovery only. Final response evidence
   // consumes it even if a local call is still draining; runningToolCalls separately
   // guards actual send/compaction. Replayed finals cannot consume newer work.
+  // A rotation is reported as one batch with the rotated turn's end and the fresh turn's start,
+  // which never moves the grant; the fresh turn's later work then renews it under the rotated
+  // turn's id. That turn has ended, so this later completed final spends its grant too. Without
+  // this the chat read as busy, and a message typed after the answer waited for the silence sweep.
+  const grantTurnEnded = !!completedFinal && !!terminalGrant?.turnId && !!finalTurn && terminalGrant.turnId !== finalTurn &&
+    terminalGrant.sessionId === sessionId && activeUntil.get(conversationId) === terminalGrant &&
+    (await readRecentEvents(sessionId!, 20, { kinds: ['turn_end'] })).some(event => event.turnId === terminalGrant.turnId);
   if (completedFinal && terminalGrant && activeUntil.get(conversationId) === terminalGrant &&
-      terminalGrant.sessionId === sessionId && (terminalGrant.turnId ?? null) === (finalTurn ?? null)) endActivity(conversationId);
+      terminalGrant.sessionId === sessionId && ((terminalGrant.turnId ?? null) === (finalTurn ?? null) || grantTurnEnded)) endActivity(conversationId);
   else if (mcpTerminal && terminalGrant && activeUntil.get(conversationId) === terminalGrant) {
     terminalGrant.mcpBacked = true;
     // A completed tool-only response can still acquire its missing final text.
@@ -8621,6 +8707,122 @@ function retireSpentRepairs(): void {
  * out is kept until exactly this line runs, so that a reload which did not help is not repeated
  * — see `retireSpentRepairs`. This call is the proof that it did help.
  */
+/** How long a held call waits for its continue to be sent; once Send is authorized, as long again. */
+let rotationHoldMs = 15_000;
+/** Test seam. */
+export function setRotationHoldForTests(ms: number): void { rotationHoldMs = ms; }
+/** Calls that wait for the app (Session Finish, keep-on): their result is Loop's next instruction, not work. */
+const ROTATION_HOLD_TOOLS: ReadonlySet<string> = new Set(['session_finish', 'keep_astra_on_forever']);
+
+/**
+ * Waits, bounded, until the page has sent a fresh-turn continue into the call held for it (#1662).
+ * Not taken in time, it is withdrawn so it cannot land after the call's answer.
+ */
+async function awaitRotationDelivery(conversationId: string, id: string): Promise<void> {
+  const started = Date.now();
+  changed();
+  for (;;) {
+    const state = await rotationDelivery(id);
+    if (state === 'settled') return;
+    if (state === 'declined') {
+      const turnId = (await listInputs()).find(row => row.id === id)?.queuedTurn?.turnId;
+      if (turnId) noteRotationDeclined(conversationId, turnId);
+      changed();
+      return;
+    }
+    const waited = Date.now() - started;
+    if (state === 'pending' && waited >= rotationHoldMs) {
+      const where = await withdrawUnsentRotation(id);
+      if (where) {
+        const seconds = Math.round(rotationHoldMs / 1000);
+        // Two different faults: a page that never picked the continue up, often a browser worker
+        // that had stopped answering, and one that picked it up but never reached Send.
+        const why = where === 'queued'
+          ? `the page did not pick up the continue within ${seconds} s (the browser is ${browserWakeConnected() ? 'connected' : 'not connected'})`
+          : `the page picked up the continue but did not reach Send within ${seconds} s`;
+        logInfo(`turn rotation: ${conversationId} — ${why}; the call answers and a later one tries again`);
+        changed();
+      }
+      return;
+    }
+    if (waited >= rotationHoldMs * 2) {
+      logWarn(`turn rotation: ${conversationId} — the continue's Send was not confirmed within ${Math.round(rotationHoldMs * 2 / 1000)} s; the call answers now`);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
+/** When each running turn started, read once per turn from its own `turn_start`. */
+const turnStarts = new Map<string, number>();
+const turnRotationDeps: RotationDeps = {
+  now: () => Date.now(),
+  minutes: () => getConfig().ui.rotateTurnMinutes ?? 30,
+  turnStartedAt: async (sessionId, turnId) => {
+    const key = `${sessionId}\u0000${turnId}`;
+    const known = turnStarts.get(key);
+    if (known !== undefined) return known;
+    const [start] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start'] });
+    if (start?.turnId !== turnId) return null;
+    turnStarts.set(key, start.time);
+    if (turnStarts.size > 500) turnStarts.delete(turnStarts.keys().next().value!);
+    return start.time;
+  },
+  file: (sessionId, turnId) => fileRotationInput(sessionId, turnId),
+  log: message => logInfo(message)
+};
+
+/**
+ * #1402: a long turn continues in a fresh one, right after this tool result. Pro thinks long on
+ * purpose, and a worker's or helper's turn end is its report. Goal and Loop chats rotate too: the
+ * rotated turn ends with no final answer, so they decide only at the fresh turn's end. Never at a
+ * hold tool's result, which is Loop's next instruction. #1662: only while this call's answer is
+ * still held (callHoldOpen), so the continue goes in while the call runs; the answer waits until it
+ * is sent or withdrawn.
+ */
+function considerCallRotation(conversationId: string, sessionId: string, sourceTurnId: string | null, pro: boolean,
+  filedSession: SessionSummary | null, tool: string | null): void {
+  if (pro || !sourceTurnId || filedSession?.activeTurnId !== sourceTurnId || isChatBlocked(conversationId) ||
+      filedSession.origin?.kind === 'worker' || filedSession.origin?.kind === 'helper' ||
+      isWorkerConversation(conversationId) || (tool && ROTATION_HOLD_TOOLS.has(tool)) || !callHoldOpen(conversationId)) return;
+  // Fresh turns switched off (0 minutes) since the declines: no fallback.
+  if ((getConfig().ui.rotateTurnMinutes ?? 30) > 0 &&
+      stopFallbackDue(conversationId, sourceTurnId, getConfig().ui.rotateStopFallback !== false, Date.now()) && !rotationFenced(conversationId)) {
+    // ChatGPT offered no Send for this turn's continue twice: stop the turn once this result has
+    // gone out, refusing (not running) any call that comes meanwhile, and continue after the stop.
+    noteStopFallback(conversationId, sourceTurnId, Date.now());
+    // The fence is on disk before the Stop can go out: a restart after ChatGPT took the Stop must
+    // still find it and file the continue.
+    const fenceSaved = armRotationFence(conversationId, sourceTurnId);
+    logInfo(`turn rotation: ${conversationId} — ChatGPT offered no Send for the continue; stopping turn ${sourceTurnId} after this result to continue in a fresh one`);
+    const timer = setTimeout(() => {
+      void fenceSaved.then(saved => {
+        if (!saved) {
+          void clearRotationFence(conversationId);
+          logWarn(`turn rotation: ${conversationId} — not stopping turn ${sourceTurnId}: its fence could not be saved, so a restart could lose the continue`);
+          return;
+        }
+        if (rotationFenceTurn(conversationId) !== sourceTurnId) return;
+        return stopSessionTurn(sessionId, sourceTurnId, { rotation: true });
+      }).catch(error => {
+        void clearRotationFence(conversationId);
+        logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
+      });
+    }, ROTATION_STOP_DELAY_MS);
+    timer.unref?.();
+    return;
+  }
+  let filedId: string | null = null;
+  const deps: RotationDeps = { ...turnRotationDeps, file: async (session, turn) => {
+    const row = await fileRotationInput(session, turn);
+    filedId = row?.id ?? null;
+    return row;
+  } };
+  holdCalls(conversationId, considerTurnRotation(conversationId, sessionId, sourceTurnId, deps)
+    .then(filed => filed && filedId ? awaitRotationDelivery(conversationId, filedId) : undefined)
+    .catch(error => logWarn(`turn rotation: ${String(error)}`)));
+}
+
 function noteCallAttribution(
   conversationId: string | null,
   sessionId: string,
@@ -8630,7 +8832,8 @@ function noteCallAttribution(
   completedFinalAt: number | null = null,
   requestId: string | null = null,
   reopenedTurnId: string | null = null,
-  filedSession: SessionSummary | null = null
+  filedSession: SessionSummary | null = null,
+  tool: string | null = null
 ): void {
   if (conversationId) {
     // MCP truth can grow while a Pro page emits no new observation. The just-filed
@@ -8714,6 +8917,7 @@ function noteCallAttribution(
     void revokeSilenceLoop(conversationId).catch(error => logWarn(`goal: could not withdraw silence pickup: ${String(error)}`));
     grantActivity(conversationId, sessionId, continuingMcp ? Date.now() : pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
       { turnId: sourceTurnId, model: pro ? 'pro' : previous?.model ?? 'unknown', mcpBacked: true });
+    considerCallRotation(conversationId, sessionId, sourceTurnId, pro, filedSession, tool);
     noteRecoveryActivity(conversationId);
     notePickupActivity(conversationId);
     // Scoped to the repair this fact is evidence about. An attributed call proves the request-id
@@ -9863,7 +10067,8 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
         typeof stop.conversationId !== 'string' || !conversationId(stop.conversationId) ||
         typeof stop.turnId !== 'string' || !stop.turnId || stop.turnId.length > 256) return null;
     if (stop.userMessageId !== undefined && (typeof stop.userMessageId !== 'string' || !stop.userMessageId || stop.userMessageId.length > 256)) return null;
-    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}) };
+    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}),
+      ...(stop.rotation === true ? { rotation: true as const } : {}) };
   }
   if (
     version >= 3 &&
@@ -10155,6 +10360,16 @@ export async function restoreCommands(): Promise<void> {
   // This is the only publication point of restore. Everything above operated on local arrays;
   // everything below may again use ordinary live command helpers and timers.
   commands = plan.commands;
+  // Fences of the previous run come back for what is left of them, also when ChatGPT already took
+  // the Stop and only its stopped end is still to come.
+  const fencesBack = await restoreRotationFences();
+  if (fencesBack) logInfo(`turn rotation: restored ${fencesBack} fresh-turn fence(s) from the previous run; the continue follows each stopped end`);
+  // A fresh-turn Stop that survived the restart is still pending: its fence comes back with it, for
+  // what is left of the command's budget.
+  for (const command of commands) {
+    if (command.spec.type === 'stop' && command.spec.rotation)
+      void armRotationFence(command.spec.conversationId, command.spec.turnId, command.createdAt + FENCE_MS - Date.now());
+  }
   commandReceipts = plan.receipts;
   for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
   rearmRetainedCommandDeadlines();
