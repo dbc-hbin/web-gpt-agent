@@ -2341,8 +2341,8 @@
         }
       }
     }
-    publishHistoryRateLimit();
     flushStreamRequestOrigins();
+    publishHistoryRateLimit();
     // Route assignment and authored text can arrive in either order. This receipt is
     // evaluated on the existing observer, rather than only on the one route-change edge.
     if (id && pendingObjectiveSend?.accepted && pendingObjectiveSend.current()) {
