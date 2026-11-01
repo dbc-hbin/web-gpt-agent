@@ -109,3 +109,22 @@ it('masks once, on what the outer call returns, not inside nested calls', async 
   expect(text(result)).not.toContain(KEY);
   expect(state.log.mock.calls.filter(([line]) => String(line).startsWith('secrets shield'))).toHaveLength(1);
 });
+
+it('masks a progress note sent to ChatGPT by the same decision, and keeps it unmasked when the shield is off', async () => {
+  const sent: string[] = [];
+  const mcpReq = { _meta: { progressToken: 'p-1' }, notify: async (message: { params: { message: string } }) => { sent.push(message.params.message); } };
+  const run = () => withInboundRequestId('req-chat-a', () => dispatch('exec', {}, null, 'req-chat-a', 'core', async () => {
+    await currentCall()!.notify!({ type: 'text', text: output });
+    return ok('done');
+  }, undefined, undefined, { sessionId: undefined, mcpReq } as never));
+  await run();
+  expect(sent.at(-1)).not.toContain(KEY);
+  expect(sent.at(-1)).toContain('OPENAI_API_KEY=[OpenAI key hidden]');
+  state.projectOff.mockResolvedValue(true);
+  await run();
+  expect(sent.at(-1)).toContain(KEY);
+  expect(state.projectOff).toHaveBeenCalledWith('session-chat-a');
+  state.shield = false;
+  await run();
+  expect(sent.at(-1)).toContain(KEY);
+});

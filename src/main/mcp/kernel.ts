@@ -43,7 +43,7 @@ import { firstTaskRoot } from '../skill-access.js';
 import { ExecError } from '../exec.js';
 import { getConfig } from '../config.js';
 import { sessionSecretsShieldOff } from '../projects.js';
-import { shieldToolResult } from '../secrets-shield.js';
+import { maskSecrets, shieldToolResult } from '../secrets-shield.js';
 import {
   AgentError,
   IdentityLostError,
@@ -210,17 +210,46 @@ async function shieldOutput(context: CallContext, name: string, result: ToolResu
   const counts = new Map<string, number>();
   for (const kind of shielded.masked) counts.set(kind, (counts.get(kind) ?? 0) + 1);
   const what = [...counts].map(([kind, count]) => `${count} ${kind}${count > 1 ? 's' : ''}`).join(', ');
-  const sessionId = context.caller.sessionId;
-  const projectOff = sessionId ? await sessionSecretsShieldOff(sessionId).catch((error: unknown) => {
-    logWarn(`secrets shield: could not read this chat's project (${error instanceof Error ? error.message : String(error)}); masking anyway`);
-    return false;
-  }) : false;
-  if (projectOff) {
+  if (!await shieldOn(context)) {
     logInfo(`secrets shield: off for this chat's project; the ${name} result went out with ${what} unmasked`);
     return result;
   }
   logInfo(`secrets shield: hid ${what} in the ${name} result`);
   return shielded.result;
+}
+
+/**
+ * Whether this call's output is masked: Settings on and this chat's project not off. Decided once
+ * per call and session (the result, its recording and its progress notes all follow the same
+ * answer); asked only once something matched. A project that cannot be read keeps the shield on.
+ */
+const shieldDecisions = new WeakMap<CallContext, { sessionId: string | null; on: Promise<boolean> }>();
+function shieldOn(context: CallContext): Promise<boolean> {
+  if (getConfig().ui.secretsShield === false) return Promise.resolve(false);
+  const sessionId = context.caller.sessionId ?? null;
+  const known = shieldDecisions.get(context);
+  if (known && known.sessionId === sessionId) return known.on;
+  const on = sessionId ? sessionSecretsShieldOff(sessionId).then(off => !off, (error: unknown) => {
+    logWarn(`secrets shield: could not read this chat's project (${error instanceof Error ? error.message : String(error)}); masking anyway`);
+    return true;
+  }) : Promise.resolve(true);
+  shieldDecisions.set(context, { sessionId, on });
+  return on;
+}
+
+/**
+ * A progress notification goes to ChatGPT like a result, so it is masked by the same decision.
+ * Only the wire text: a code-mode script keeps its real values locally.
+ */
+function shieldedNotifier(context: CallContext, notify: CallContext['notify']): CallContext['notify'] {
+  if (!notify) return undefined;
+  return async content => {
+    if (content.type !== 'text') return notify(content);
+    const masked = maskSecrets(content.text);
+    if (!masked.masked.length || !await shieldOn(context)) return notify(content);
+    logInfo(`secrets shield: hid ${masked.masked.length} value(s) in a progress note`);
+    return notify({ ...content, text: masked.text });
+  };
 }
 
 async function withIdentityRecoveredNotice(context: CallContext, result: ToolResult): Promise<ToolResult> {
@@ -536,7 +565,7 @@ export async function dispatch(
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
   const context: CallContext = {
-    notify: parent?.notify ?? progressNotifier(mcpCtx),
+    notify: parent?.notify,
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
     transportKey,
@@ -546,6 +575,8 @@ export async function dispatch(
     outcome: null,
     evidence: emptyEvidence()
   };
+  // A nested call inherits the outer call's notifier, which already masks by the outer decision.
+  if (!parent) context.notify = shieldedNotifier(context, progressNotifier(mcpCtx));
   try {
     const result = await trackMcpRequest(() =>
       trackInFlight(context, () => dispatchTracked(context, name, args, transportKey, requestId, surface, run, !!parent, external))
