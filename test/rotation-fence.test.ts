@@ -7,7 +7,8 @@ const warned = vi.hoisted(() => [] as string[]);
 vi.mock('../src/main/durable.js', () => ({
   readDurable: async () => structuredClone(durable.rows),
   writeDurableNow: async (_name: string, value: unknown) => {
-    await new Promise(resolve => setTimeout(resolve, 5));
+    // A real write yields before it lands; the fence must not be treated as saved until it does.
+    await new Promise(resolve => setImmediate(resolve));
     if (durable.fail) throw new Error('disk full');
     durable.rows = structuredClone(value); durable.writes.push(value);
   }
