@@ -1776,7 +1776,14 @@ only for the chat the tab shows, takes none while its queue holds 300 or more en
 queued traces first, without a gap marker, when it must evict. The bridge never stores them as
 transcript; `session/request-trace.ts` keeps 256 and adds "the stream of <chat> named it at
 <path>" to the "no page evidence" warning, or logs one line when the trace arrives after a call ran
-out of time. Attribution never uses them.
+out of time. Attribution never uses them. The page also traces whole request-id-shaped tokens inside
+arrays and longer strings (path `…text`, no content; an array keeps its path only under an id-named
+key such as `request_ids`; 16 new ids per message), event streams from any other same-origin
+`/backend-api/` route (prefix `<route with ids as *>>`, other characters as `_`; at most two readers,
+4 MB and 64 traces each, cancelled on page hide; chat from the frame or the page's `/c/<id>` route),
+and every socket message (prefix `socket>`, 256 ids per socket, then again). The app logs once per
+chat and run that the page's tracing works; with these limits a missing trace makes "the page never
+saw it" likely, not certain.
 Journal writes are serialized whole snapshots taken when each write starts; observations that
 arrive while one write is in flight share the single next write, and each reply waits for a
 write containing its own observations.

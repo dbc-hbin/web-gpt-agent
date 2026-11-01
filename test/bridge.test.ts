@@ -1436,6 +1436,9 @@ describe('observations', () => {
     expect(requestTraceNote(placed)).toBe(`; the stream of ${conversationId} named it at /message:v.metadata.request_id`);
     expect(requestTraceNote('11111111-2222-4333-8444-555555555555')).toBe('');
     expect(await findSessionByConversation(conversationId)).toBeNull();
+    // Upstream #1913: each chat says once per run that its page's tracing works, and its limit.
+    expect(getLog().slice(before).map(entry => entry.message).filter(line => line.includes('tracing works')))
+      .toEqual([`request attribution: the page of ${conversationId} reports the ids in its streams (tracing works, up to 16 new ids per message)`]);
   });
   it('logs a ChatGPT announcement a page closed, once a minute per chat and heading, and refuses any other note', async () => {
     vi.useFakeTimers({ toFake: ['Date'] });
