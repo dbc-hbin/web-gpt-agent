@@ -10844,7 +10844,9 @@
     // Publish the user's exact stop intent in the existing journal immediately.
     // Waiting for Stop to disappear loses it when the document closes first.
     if (turnId) {
-      const outcome = { outcome: 'stopped', detail: 'The user pressed native Stop.' };
+      // A trusted click is the person's; the app's own Stop clicks from script. Only the app's own
+      // Stop may lead to a fresh-turn continue (rotation-fence.ts); the person's withdraws it.
+      const outcome = { outcome: 'stopped', detail: 'The user pressed native Stop.', stoppedBy: event.isTrusted ? 'person' : 'app' };
       if (generating) finishGeneration(currentAssistantTurn(), outcome, false);
       else emit({ kind: 'turn_end', turnId, ...outcome });
       void flush();

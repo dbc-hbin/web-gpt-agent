@@ -20435,6 +20435,8 @@ describe('ordinary Continue native recovery', () => {
     button.click(); await live.hook.flush();
     expect(live.document.contains(button)).toBe(true);
     expect(emitted(live.sent, 'turn_end').filter(row => row.event.outcome === 'stopped')).toHaveLength(1);
+    // A script click (the app's own Stop) is not the person's: only a trusted click is.
+    expect(emitted(live.sent, 'turn_end').find(row => row.event.outcome === 'stopped')!.event.stoppedBy).toBe('app');
     expect(await live.runtimeMessage({ type: 'clf-repair-check', conversationId: chat })).toMatchObject({ safe: false });
     button.click(); await live.hook.flush();
     expect(emitted(live.sent, 'turn_end').filter(row => row.event.outcome === 'stopped')).toHaveLength(1);

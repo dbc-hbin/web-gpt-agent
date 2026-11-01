@@ -1405,6 +1405,9 @@ function parseObservations(input: unknown): ChatObservation[] {
         (item['reason'] === 'thinking_failed' || item['reason'] === 'thinking_stopped')) {
       observation.reason = item['reason'];
     }
+    if (kind === 'turn_end' && observation.outcome === 'stopped' && (item['stoppedBy'] === 'person' || item['stoppedBy'] === 'app')) {
+      observation.stoppedBy = item['stoppedBy'];
+    }
     if (
       item['goalEligible'] === true &&
       kind === 'assistant_message' &&
@@ -7684,7 +7687,20 @@ async function noteRecoveryObservations(
   // The turn the app stopped to continue in a fresh one (`ui.rotateStopFallback`) shows stopped:
   // calls may run again, and the continue goes as an ordinary message.
   const fencedTurn = rotationFenceTurn(conversationId);
-  if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn) {
+  if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn && ended.stoppedBy !== 'app') {
+    // The person pressed ChatGPT's own Stop (or the page cannot say it was the app's): their Stop
+    // withdraws the fresh turn. The saved fresh-turn Stop loses its mark first, so a restart
+    // restores neither it nor its fence.
+    const pendingRotation = commands.find(entry => entry.spec.type === 'stop' && entry.spec.conversationId === conversationId &&
+      entry.spec.turnId === fencedTurn && entry.spec.rotation === true);
+    void (pendingRotation ? withdrawStopRotation(pendingRotation) : Promise.resolve(true))
+      .then(saved => clearRotationFence(conversationId).then(cleared => saved && cleared))
+      .then(saved => {
+        logInfo(`turn rotation: ${conversationId} — the person stopped turn ${fencedTurn}; the fresh turn the app was starting is cancelled`);
+        if (!saved) logWarn(`turn rotation: ${conversationId} — the cancelled fresh turn could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after the person's Stop`);
+        changed();
+      }).catch(error => logWarn(`turn rotation: ${String(error)}`));
+  } else if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn) {
     void clearRotationFence(conversationId);
     void fileRotationContinueAfterStop(sessionId, fencedTurn).then(row => {
       logInfo(row ? `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; continuing in a fresh turn`

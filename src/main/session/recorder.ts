@@ -1824,6 +1824,8 @@ export interface ChatObservation {
   outcome?: TurnOutcome;
   /** Exact native failed/interrupted status; recovery separately owns listening. */
   reason?: 'thinking_failed' | 'thinking_stopped';
+  /** turn_end stopped only: a trusted click is the person's Stop; a script click is the app's own. */
+  stoppedBy?: 'person' | 'app';
   detail?: string;
   /** Browser terminal proof; app-owned Goal policy is applied only after this is durable. */
   goalEligible?: boolean;

@@ -398,7 +398,7 @@ describe('stop fallback for fresh turns', () => {
       expect(rotationFenced(chat)).toBe(true);
       expect(goalSwitchFor(chat)).toMatchObject({ enabled: true, mode: 'loop' });
       // ChatGPT shows the turn stopped: the continue goes as an ordinary message, at once.
-      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped' }]);
+      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped', stoppedBy: 'app' }]);
       await vi.waitFor(async () => {
         expect(rotationFenced(chat)).toBe(false);
         expect((await listInputs()).some(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true)).toBe(true);
@@ -463,7 +463,7 @@ describe('stop fallback for fresh turns', () => {
       await restoreCommands();
       expect(rotationFenced(chat)).toBe(true);
       expect(getLog().some(entry => entry.message.includes('restored 1 fresh-turn fence(s) from the previous run'))).toBe(true);
-      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped' }]);
+      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped', stoppedBy: 'app' }]);
       await vi.waitFor(async () => {
         expect(rotationFenced(chat)).toBe(false);
         expect((await listInputs()).some(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true)).toBe(true);
@@ -508,10 +508,40 @@ describe('stop fallback for fresh turns', () => {
       } else {
         await stopSessionTurn(sessionId, turn);
         expect(rotationFenced(chat)).toBe(false);
-        await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped' }]);
+        await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped', stoppedBy: 'app' }]);
         await new Promise(resolve => setTimeout(resolve, 200));
         expect((await listInputs()).some(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true)).toBe(false);
       }
+    } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
+  });
+
+  // A person's own click on ChatGPT's Stop over a fenced turn is theirs: no continue follows it,
+  // and the saved fresh-turn Stop loses its mark so a restart cannot bring the fence back.
+  it("files no continue after the person's own native Stop of a fenced turn", async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, sessions: { ...config.sessions, record: true }, ui: { ...config.ui, rotateStopFallback: true } });
+    setRotationHoldForTests(5_000);
+    const clock = { now: Date.now() };
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock.now);
+    try {
+      const chat = 'f0f00003-1111-4111-8111-000000000420', turn = 'g-stopfb-0-20';
+      const sessionId = await turnFor(chat, turn, 31);
+      await setGoalSwitchNow(chat, 'loop', true);
+      await declineTwice(chat, sessionId, clock);
+      await (await heldCall(chat))();
+      await vi.waitFor(async () => {
+        expect((await request('GET', '/status')).body.stopTurns).toEqual([expect.objectContaining({ conversationId: chat, turnId: turn })]);
+      }, { timeout: 10_000, interval: 50 });
+      await events(chat, [{ kind: 'turn_end', time: clock.now, turnId: turn, outcome: 'stopped', stoppedBy: 'person', detail: 'The user pressed native Stop.' }]);
+      await vi.waitFor(() => {
+        expect(getLog().some(entry => entry.message.includes(`${chat} — the person stopped turn ${turn}`))).toBe(true);
+      }, { timeout: 10_000, interval: 20 });
+      expect(rotationFenced(chat)).toBe(false);
+      expect((await listInputs()).some(entry => entry.sessionId === sessionId && entry.purpose === 'rotation' && entry.afterStop === true)).toBe(false);
+      await flushDurable();
+      resetRotationFencesForTests();
+      await restoreCommands();
+      expect(rotationFenced(chat)).toBe(false);
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
   });
 
