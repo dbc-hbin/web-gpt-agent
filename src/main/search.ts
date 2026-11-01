@@ -754,6 +754,7 @@ export async function search(req: SearchRequest): Promise<SearchOutcome> {
     try {
       directory = await fs.opendir(current.dir);
     } catch {
+      // An unreadable or vanished directory is skipped, like ripgrep does; the scan goes on.
       continue;
     }
     try {
@@ -973,6 +974,7 @@ async function scanOneFile(
     if (decoder !== null) carry += decoder.decode();
     if (carry.length > 0) consider(carry.replace(/\r$/, ''));
   } catch {
+    // A file that fails mid-read keeps the matches already found in it.
     return results;
   } finally {
     stream.destroy();
