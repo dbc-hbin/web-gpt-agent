@@ -714,9 +714,35 @@ function sanitiseCompanionDiagnostics(value: unknown): CompanionDiagnostics | nu
   };
 }
 
+/** The last error-page reload the app has logged (the extension's clock), its count and last skip. */
+let errorPageReloadsLogged: { at: number; count: number; skippedAt?: number } = { at: 0, count: 0 };
+const ERROR_PAGE_SKIPS: Record<string, (nextIn: number) => string> = {
+  offline: () => 'not reloaded while the browser is offline',
+  backoff: nextIn => `the next reload is in ${nextIn} s (it backs off after each reload)`,
+  unreadable: () => 'not reloaded, because the extension could not read when it last reloaded it'
+};
 function recordCompanionDiagnostics(value: unknown): void {
   const next = sanitiseCompanionDiagnostics(value);
   if (!next) return;
+  // A chat tab that loaded offline and sat on Chrome's error page was reloaded by the extension.
+  const reloads = diagnosticObject(diagnosticObject(value)?.errorPageReloads);
+  const reloadedAt = diagnosticNumber(reloads?.lastAt), reloadCount = Math.round(diagnosticNumber(reloads?.count, 100_000));
+  const logged = errorPageReloadsLogged;
+  if (reloadedAt > logged.at && reloadCount > 0) {
+    // A browser restart clears the extension's session storage, and its count starts again.
+    const fresh = reloadCount >= logged.count ? reloadCount - logged.count : reloadCount;
+    logInfo(`browser: reloaded ${Math.max(1, fresh)} ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)`);
+    errorPageReloadsLogged = { ...logged, at: reloadedAt, count: reloadCount };
+  }
+  // A reload the extension skipped, and why: once per skip it reports.
+  const skipped = diagnosticObject(reloads?.skipped);
+  const skippedAt = diagnosticNumber(skipped?.at), reason = String(skipped?.reason ?? '');
+  const skipLine = Object.hasOwn(ERROR_PAGE_SKIPS, reason) ? ERROR_PAGE_SKIPS[reason] : undefined;
+  if (skipLine && skippedAt > (errorPageReloadsLogged.skippedAt ?? 0)) {
+    const nextIn = Math.max(0, Math.ceil((diagnosticNumber(skipped?.nextAt) - skippedAt) / 1000));
+    logInfo(`browser: a ChatGPT tab is on Chrome's error page; ${skipLine(nextIn)}`);
+    errorPageReloadsLogged = { ...errorPageReloadsLogged, skippedAt };
+  }
   latestCompanionDiagnostics = next;
   companionDiagnosticsRevision += 1;
   for (const waiter of companionDiagnosticsWaiters) waiter();
@@ -9742,6 +9768,7 @@ export async function restoreCommands(): Promise<void> {
 export function resetBridgeForTests(): void {
   clearCompanionDiagnostics();
   pageNotesLogged.clear();
+  errorPageReloadsLogged = { at: 0, count: 0 };
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;

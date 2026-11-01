@@ -3127,6 +3127,14 @@ connection/document epochs fence delayed results. The bridge cache is presentati
 clears on disconnect/stop/reset. Request discovery, receipt, exact ownership and recorded tool
 activity remain distinct evidence. Optional embedded-host presentation does not enable or
 implement an embedded browser.
+Its `errorPageReloads` (`{ count, lastAt, skipped? }`) reports chat tabs reloaded off Chrome's error
+page: a chat tab that loaded while offline, where injection fails with "showing error page". Recorder
+restoration (`restoreChatgptTab`) reloads such a tab only while `navigator.onLine`, backing off 1, 2,
+4 … 15 minutes per tab (state in `chrome.storage.session` key `errorPageReloads`, 64 tabs, so a
+restarted worker keeps the backoff and the count; an unreadable saved state reloads nothing; a tab
+whose recorder answers or takes injection is forgotten), and publishes a snapshot after each reload
+or skip, one more if a report was already under way. The bridge logs one line per new `lastAt` and
+per new skip (`offline`, `backoff`, `unreadable`) and stores nothing else.
 
 `tunnel/*` owns pinned-client discovery, child lifetime, health metrics and confirmed outages;
 `diagnostics.ts` tests the chain hop by hop. Transient health evidence must not produce repeated

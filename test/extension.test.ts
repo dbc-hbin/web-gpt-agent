@@ -818,14 +818,36 @@ it.each(['still-frozen', 'woke', 'navigated', 'new-document'] as const)(
   });
 
 describe('accepted helper tab cleanup', () => {
+  // Upstream #1911: a change while a report is under way gets one more report after it.
+  it('sends one more report when something changed while a report was under way', async () => {
+    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics('),
+      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics(')));
+    const releases: Array<() => void> = [];
+    const snapshot = vi.fn(() => new Promise(resolve => { releases.push(() => resolve({ capturedAt: releases.length })); }));
+    const call = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({ token: 'fixture-token', disconnected: false, connectionEpoch: 1, port: 8765,
+      companionDiagnosticsFlight: null, companionDiagnosticsDirty: false, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
+    const publish = vm.runInContext(`${source}\npublishCompanionDiagnostics`, context);
+    const first = publish();
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
+    publish(true);
+    publish(true);
+    releases[0]!();
+    await first;
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    releases[1]!();
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2));
+    expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+
   it('shares pending diagnostic reads and discards a result after disconnect', async () => {
-    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics()'),
-      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics()')));
+    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics('),
+      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics(')));
     let complete!: (value: unknown) => void;
     const snapshot = vi.fn(() => new Promise(resolve => { complete = resolve; }));
     const call = vi.fn(async () => ({ ok: true }));
     const context = vm.createContext({ token: 'fixture-token', disconnected: false, connectionEpoch: 1, port: 8765,
-      companionDiagnosticsFlight: null, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
+      companionDiagnosticsFlight: null, companionDiagnosticsDirty: false, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
     const publish = vm.runInContext(`${source}\npublishCompanionDiagnostics`, context);
     const first = publish();
     const second = publish();
@@ -2120,7 +2142,8 @@ describe('extension command delivery', () => {
     });
     const insertCSS = vi.fn();
     const restore: (id: number) => Promise<boolean> = vm.runInNewContext(`${code}\nrestoreChatgptTab`, {
-      PAGE_RECORDER_VERSION: 18, tabReply: async () => null, chrome: { scripting: { executeScript, insertCSS } }
+      PAGE_RECORDER_VERSION: 18, tabReply: async () => null, chrome: { scripting: { executeScript, insertCSS } },
+      forgetErrorPage: async () => {}, reloadErrorPage: async () => {}
     });
     expect(await restore(41)).toBe(scenario === 'stable');
     expect(orphanRecorder).toBe(false);

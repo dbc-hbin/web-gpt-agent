@@ -497,6 +497,33 @@ describe('direct browser control over the paired bridge', () => {
 });
 
 describe('who is allowed to talk to it', () => {
+  // Upstream #1911: a chat tab the extension reloaded off Chrome's error page says so in the app's log, once.
+  it('logs the extension\'s error-page reloads and skipped reloads once each', async () => {
+    await pair();
+    const before = getLog().length;
+    const report = (errorPageReloads: Record<string, unknown>) => request('POST', '/diagnostics', { body: { capturedAt: Date.now(),
+      status: { connected: true, paired: true }, preferences: { overwrite: true, durations: false }, errorPageReloads } });
+    const lines = () => getLog().slice(before).map(entry => entry.message).filter(line => line.includes("Chrome's error page"));
+    await report({ count: 0, lastAt: 0 });
+    await report({ count: 1, lastAt: 5_000 });
+    await report({ count: 1, lastAt: 5_000 });
+    await report({ count: 3, lastAt: 9_000 });
+    expect(lines()).toEqual([
+      "browser: reloaded 1 ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)",
+      "browser: reloaded 2 ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)"]);
+    const skipped = (value: Record<string, unknown>) => report({ count: 3, lastAt: 9_000, skipped: value });
+    await skipped({ reason: 'offline', at: 30_000 });
+    await skipped({ reason: 'offline', at: 30_000 });
+    await skipped({ reason: 'backoff', at: 31_000, nextAt: 151_000 });
+    await skipped({ reason: 'unreadable', at: 32_000 });
+    await skipped({ reason: 'whatever', at: 33_000 });
+    await skipped({ reason: 'constructor', at: 34_000 });
+    expect(lines().slice(2)).toEqual([
+      "browser: a ChatGPT tab is on Chrome's error page; not reloaded while the browser is offline",
+      "browser: a ChatGPT tab is on Chrome's error page; the next reload is in 120 s (it backs off after each reload)",
+      "browser: a ChatGPT tab is on Chrome's error page; not reloaded, because the extension could not read when it last reloaded it"]);
+  });
+
   it('bounds authenticated companion diagnostics and clears them with the bridge lifecycle', async () => {
     const body = { capturedAt: Date.now(), status: { connected: true, paired: true, appVersion: 'v'.repeat(200) },
       preferences: { overwrite: true, durations: false }, transcript: 'must not be forwarded',
