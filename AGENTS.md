@@ -223,6 +223,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | Projects/cwd | `src/main/projects.ts`, `src/shared/projects.ts`: local folder catalog and session binding; `mcp/tools-core.ts` resolves ordinary tool paths independently from conversations. |
 | Project Files UI | `src/main/project-files.ts`, `project-file-watcher.ts`, `src/shared/project-files.ts`, `src/renderer/{file-panel,file-code-editor,file-pdf-viewer,work-panel-resize}.ts`: bounded project views, revision-checked saves and renderer-owned drafts. |
+| Project Git Review | `src/main/project-git.ts`, `src/shared/project-git.ts`; renderer Review is `file-panel.ts` with `reviewOnly`: read-only Git status, diffs, branch comparison and recorded `apply_patch` edit reviews. |
 | Durable history | `src/main/session/{store,recorder,correlation,retention,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
@@ -851,6 +852,11 @@ failures “Patch didn’t match” / “not applied”; permission and identity
 Partial multi-file failure uses bounded rollback snapshots. Restore only a path still matching
 what **this patch produced**; a concurrent external edit must never be overwritten. Preserve
 the port's explicit line-ending mode and readable parse/match failures.
+
+A successful exact patch also hands each changed file's exact before/after text to the recorder
+through the call context; the recorder stores a bounded immutable review asset per change
+(`FileChange.reviewAssetId`) for the Review panel's recorded-edit view (§18). Failed, inexact or
+oversized edits record no asset.
 
 ### Terminal execution and custody
 
@@ -3040,6 +3046,32 @@ through Reveal or Attach without a fabricated preview. Delete uses the OS Trash 
 The renderer retains at most eight unsaved project drafts during project navigation. Async dialog,
 preview, watcher and save results recheck their original view generation. File attachment staging
 captures the existing ComposerDraftOwner before the await, so a later chat cannot receive it.
+
+`src/main/project-git.ts` is the sole owner of the read-only Review projection. The renderer
+passes only a LocalProject UUID and project-relative path through fixed IPC; main re-resolves the
+approved project/root and Git metadata before reading status or a diff. Git inspection is strictly
+read-only: it strips inherited Git repository/index redirects, uses optional-lock-free bounded
+subprocesses and exposes no stage, commit, reset, checkout or push authority. Review projects
+`M/A/D/R/U`, ancestor-folder markers in the Files tree and bounded unified diffs
+(`createProjectDiffViewer`, `@codemirror/merge`). Review is a second `createFilePanel({ reviewOnly })`
+instance in the same right work slot as Files, Sub-agents and Work, with its own header toggle
+(`reviewPanelToggle`); opening one pane hides the others. The Files toolbar's Changes button opens
+Review. Review adds no second file watcher (it follows `projectGit:changed`) and exposes no
+file-write actions. It names the checked-out branch and offers a searchable, read-only comparison
+against locally known branch refs. Selecting a ref never switches branches or fetches remote
+data. The comparison shows committed changes from the selected ref's merge base to current HEAD,
+scoped to the Local Project; Working tree separately includes uncommitted and untracked changes.
+Its list, line counts and file preview share one comparison identity, and a changed ref/HEAD
+cannot publish an old diff as current. A non-repository, binary file, oversized diff or truncated
+change set is an explicit state rather than a reason to invent content or mutate the worktree.
+
+An exact successful `apply_patch` may also retain a bounded immutable before/after review asset
+beside the session record (`FileChange.reviewAssetId`, `sessions:toolEditReview`). That historical
+review belongs to the recorded tool call, not to HEAD or the file's later contents, and is
+retrieved only by session/call/change identity from the tool row's Review this edit button
+(main timeline, local project chats only). Failed, inexact or oversized edits do not gain
+fabricated review evidence. Current Git changes and recorded edit review share a diff renderer
+but have separate truth owners.
 
 ### Plugins: installation, execution and connector refresh
 

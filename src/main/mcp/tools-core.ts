@@ -1792,7 +1792,9 @@ async function runParsedPatch(
     outputPolicy
   );
 
-  noteChanges(patchFileChanges(execution.delta, resolution.virtualPaths));
+  const recordedChanges = patchFileChanges(execution.delta, resolution.virtualPaths);
+  noteChanges(recordedChanges.map(entry => entry.change), execution.exitCode === 0 && execution.delta.exact
+    ? recordedChanges.map(({ before, after }) => ({ before, after })) : undefined);
   logInfo(`tool apply_patch (${execution.delta.changes.length} file(s), exit ${execution.exitCode})`);
   return {
     result: execution.exitCode === 0 ? ok(content) : fail(content),
@@ -2072,7 +2074,7 @@ function patchResultDetails(
   return sections.join('');
 }
 
-function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): FileChange[] {
+function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<string, string>): Array<{ change: FileChange; before: string; after: string }> {
   return delta.changes.map(({ path, change }) => {
     let realPath = path;
     let before: string;
@@ -2090,10 +2092,14 @@ function patchFileChanges(delta: AppliedPatchDelta, virtualPaths: ReadonlyMap<st
     }
     const counts = lineDelta(before, after);
     return {
-      path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
-      added: counts.added,
-      removed: counts.removed,
-      approximate: counts.approximate || !delta.exact
+      change: {
+        path: virtualPaths.get(realPath) ?? '[unresolved patch path]',
+        added: counts.added,
+        removed: counts.removed,
+        approximate: counts.approximate || !delta.exact
+      },
+      before,
+      after
     };
   });
 }

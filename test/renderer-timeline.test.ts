@@ -8,6 +8,14 @@ import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/sessio
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
 vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+vi.mock('../src/renderer/file-code-editor.js', () => ({
+  createProjectDiffViewer: async ({ parent, baseText, currentText }: { parent: HTMLElement; baseText: string; currentText: string }) => {
+    const view = parent.ownerDocument.createElement('pre');
+    view.textContent = `${baseText}\n---\n${currentText}`;
+    parent.append(view);
+    return { destroy: () => view.remove(), language: 'TypeScript' };
+  }
+}));
 import { positionOf, projectTimeline } from '../src/shared/chronology.js';
 
 /**
@@ -1594,6 +1602,71 @@ it('keeps Projects and Chats separate while preserving disclosure state through 
   projects.open = false; await app.append([]);
   expect(app.w.document.getElementById('projectsSection')).toBe(projects);
   expect(projects.open).toBe(false);
+});
+
+it('reviews only an exact recorded edit without expanding its tool row or querying Git', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const edit = toolCall(2, 'edit-one');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit], true, [], [project]);
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  const reviewCall = vi.fn(() => ok({ callId: edit.call.callId, changeIndex: 0, path: 'src/main.ts', added: 1, removed: 1,
+    baseText: 'before', currentText: 'after' }));
+  app.w.api.getToolEditReview = reviewCall;
+  const row = app.w.document.querySelector<HTMLDetailsElement>('details.tool')!;
+  const review = row.querySelector<HTMLButtonElement>('.tool-open-diff')!;
+  expect(review.getAttribute('aria-label')).toBe('Review this edit');
+  review.click(); await settle();
+  expect(row.open).toBe(false);
+  expect(reviewCall).toHaveBeenCalledWith(expect.any(String), edit.call.callId, 0);
+  expect(app.w.document.querySelector<HTMLElement>('.review-panel .file-changes-view')?.hidden).toBe(false);
+  expect(app.w.document.querySelector('.review-panel .file-preview-meta')?.textContent).toContain('This edit');
+});
+
+it('does not offer a project diff shortcut in an unfiled chat', async () => {
+  const edit = toolCall(2, 'edit-unfiled');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit]);
+  expect(app.w.document.querySelector('.tool-open-diff')).toBeNull();
+});
+
+it('reviews only an exact recorded edit without expanding its tool row or querying Git', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const edit = toolCall(2, 'edit-one');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit], true, [], [project]);
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  const reviewCall = vi.fn(() => ok({ callId: edit.call.callId, changeIndex: 0, path: 'src/main.ts', added: 1, removed: 1,
+    baseText: 'before', currentText: 'after' }));
+  app.w.api.getToolEditReview = reviewCall;
+  const row = app.w.document.querySelector<HTMLDetailsElement>('details.tool')!;
+  const review = row.querySelector<HTMLButtonElement>('.tool-open-diff')!;
+  expect(review.getAttribute('aria-label')).toBe('Review this edit');
+  review.click(); await settle();
+  expect(row.open).toBe(false);
+  expect(reviewCall).toHaveBeenCalledWith(expect.any(String), edit.call.callId, 0);
+  expect(app.w.document.querySelector<HTMLElement>('.review-panel .file-changes-view')?.hidden).toBe(false);
+  expect(app.w.document.querySelector('.review-panel .file-preview-meta')?.textContent).toContain('This edit');
+  expect(app.w.document.getElementById('reviewPanelToggle')?.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('does not offer a project diff shortcut in an unfiled chat', async () => {
+  const edit = toolCall(2, 'edit-unfiled');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit]);
+  expect(app.w.document.querySelector('.tool-open-diff')).toBeNull();
 });
 
 it('starts in New Chat despite active history and selects only the exact acknowledged send', async () => {
