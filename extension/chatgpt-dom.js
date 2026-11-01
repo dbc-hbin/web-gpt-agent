@@ -650,7 +650,8 @@ var CLF_DOM = (() => {
 
   /** A pre-Send draft lease lasts only for this operation and these exact DOM nodes. */
   function captureComposerDraft(value, stillCurrent = () => true) {
-    const box = composer(), host = composerBox() || composerActions()?.host;
+    let box = composer(), host = composerBox() || composerActions()?.host;
+    let withdrawRebound = false;
     // Native rich-text normalization moves line breaks into paragraph structure.
     // Keep the same text comparison used by send receipts; editor identity and
     // trusted edits still revoke the lease even when a user only changes spacing.
@@ -689,6 +690,27 @@ var CLF_DOM = (() => {
           timer = setTimeout(finish, 1500); check();
         });
         return same() && !hasComposerAttachments() && clearPromptExact(value);
+      },
+      /**
+       * Take back text this lease inserted when Send was never clicked. Unlike clear(), this does
+       * not require the operation predicate to remain current: losing it is why the page stops. It
+       * still requires the exact untouched app-owned text and no attachments, and follows at most
+       * one React composer remount before deleting anything.
+       */
+      withdraw() {
+        if (touched || files.length || hasComposerAttachments()) return false;
+        let current = composer();
+        if (!current?.isConnected || compact(current.textContent) !== insertedText) return false;
+        if (current !== box) {
+          if (withdrawRebound) return false;
+          const nextHost = composerBox() || composerActions()?.host;
+          for (const name of events) host?.removeEventListener(name, changed, true);
+          box = current; host = nextHost; withdrawRebound = true;
+          for (const name of events) host?.addEventListener(name, changed, true);
+        }
+        current = composer();
+        if (touched || current !== box || !box?.isConnected || compact(box.textContent) !== insertedText || hasComposerAttachments()) return false;
+        return clearPromptExact(value);
       },
       dispose() { for (const name of events) host?.removeEventListener(name, changed, true); }
     };

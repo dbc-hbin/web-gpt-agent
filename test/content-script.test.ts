@@ -1536,6 +1536,32 @@ describe('desktop input delivery and helper ownership', () => {
     }
   });
 
+  // Upstream #1784: ChatGPT drew its editor again while the app answered the page's authorization
+  // request; Send refused the redrawn editor and nothing was clicked, but the page told the app nothing.
+  it.each([['authorized', true], ['refused', false]] as const)(
+    'reports an authorized Send it never clicked and takes its own text back (%s)', async (_, granted) => {
+      live = await harness(`https://chatgpt.com/c/${chatA}`, {
+        desktop_input: async message => {
+          if (message.authorize) {
+            const editor = live!.document.querySelector('#prompt-textarea')!;
+            editor.replaceWith(editor.cloneNode(true));
+            await Promise.resolve();
+            return { ok: true, data: { ok: granted } };
+          }
+          if (message.ack || message.fail) return { ok: true, data: { ok: true } };
+          return { ok: true, data: { input: claimed() } };
+        }
+      });
+      (live.window as any).CLF_DOM.selectModelSettings = vi.fn(async () => true);
+      const sends = watchSend(live.document);
+      expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA })).toEqual({ ok: false });
+      expect(sends()).toBe(0);
+      expect(live.sent.filter(message => message.type === 'desktop_input' && message.fail)).toEqual(granted ? [
+        expect.objectContaining({ id: inputId, owner: 'input-owner', error: 'Native Send was withdrawn before its click.' })
+      ] : []);
+      if (granted) expect(live.document.querySelector('#prompt-textarea')!.textContent).toBe('');
+    });
+
   it('preserves a user draft when an unavailable model cannot be confirmed', async () => {
     let page: Document;
     live = await harness(`https://chatgpt.com/c/${chatA}`, {

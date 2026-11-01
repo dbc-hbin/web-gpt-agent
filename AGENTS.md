@@ -1051,7 +1051,13 @@ minute per chat and heading. A dialog with a field (Settings, Rename, a form) ke
 Bootstrap (before insertion) and queued input (before its draft check) read ChatGPT's own
 `/api/auth/session`; an answer with neither `user` nor `accessToken` (signed out) fails the delivery
 with "ChatGPT is not signed in in this browser", because a signed-out ChatGPT answers in an anonymous
-chat that is never saved. An unreadable session is not evidence and sends as before. It confirms
+chat that is never saved. An unreadable session is not evidence and sends as before.
+When the app authorized a Send but the page never clicked it (ChatGPT redrew the editor while the
+app answered), the page takes back only its exact untouched text (`draft.withdraw()`, following at
+most one composer remount) and reports `Native Send was withdrawn before its click.`; the app
+requeues an authorized manual input once (`notTakenRetries`), then fails it as not sent. Recovery,
+after-turn pickups, decisions, openings and helpers never requeue, and the report is ignored for a
+claim the app never authorized. It confirms
 model/effort, inserts the full text, uploads native files,
 rechecks composer and attachment nodes, crosses app authorization, then **rechecks again after
 every await before Send**. Native stable user-message and conversation identity establish

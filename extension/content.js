@@ -11304,6 +11304,8 @@
       if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail('The composer changed; your draft was preserved');
       const previousUserId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;
       const submittedText = sendText(CLF_DOM.composer()?.textContent);
+      // The app's answer to this page's one authorization request, once asked.
+      let authorization = null;
       if (input.purpose === 'decision') {
         decision = { id: input.id, owner: input.owner, messageId: null, text: input.text, temporary, onTarget: sendingTarget, conversationId: null, epoch: forEpoch, response: '', publishing: false };
         desktopDecision = decision;
@@ -11327,7 +11329,8 @@
         const authority = await reportAuthorized();
         if (authority.ok !== true) { void fail(authority.error); return false; }
         if (!sendCurrent() || !onTarget() || !draft.current()) return false;
-        const authorized = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, authorize: true });
+        authorization = ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, authorize: true });
+        const authorized = await authorization;
         if (!sendCurrent() || authorized?.data?.ok !== true || !onTarget() || !draft.current()) return false;
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current())) return false;
         sendAttempted = true;
@@ -11340,7 +11343,22 @@
         // may replace it before this async operation resumes; do not rediscover it.
         receipt = { conversation, user: { id: user.id } };
         return true;
-      }))) return false;
+      }))) {
+        // Authorized, yet never clicked: ChatGPT drew the editor again while the app answered, as a
+        // fresh tab does when it moves to its project route. Nothing went out, but the claim reads as
+        // a send that may have, so the message would never be sent at all. With this exact text taken
+        // back out of the composer the app sends it again. Continue and after-turn pickups keep their
+        // own withdrawal. The app's answer comes first, so a report never reaches it ahead of its own
+        // record, and an explicit no needs none. No user row is compared: a fresh tab draws earlier
+        // questions after Send began, and withdraw() takes back only the exact untouched text.
+        const answer = authorization ? await Promise.resolve(authorization).catch(() => null) : null;
+        if (authorization && answer?.data?.ok !== false && !sendAttempted && !receipt && !input.recovery && !claimedSilence && onTarget()) {
+          let withdrawn = false;
+          try { withdrawn = draft.withdraw(); } catch { /* Text not proven ours stays where it is. */ }
+          if (withdrawn) return fail('Native Send was withdrawn before its click.');
+        }
+        return false;
+      }
       if (!receipt || !sendingTarget()) return false;
       // Native Send listeners refresh the receipt; pin only that witnessed object.
       const witnessedSendReceipt = userSendReceipt;
