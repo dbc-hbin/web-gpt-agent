@@ -649,6 +649,11 @@ export async function acceptGoalReplyNow(input: {
   // A Goal step that owes its reply is reviewed if the person asked for that (#1832); never awaited.
   const accepted = goalReplies.get(input.conversationId);
   if (accepted?.replyId === input.replyId.slice(0, 200) && accepted.state === 'pending') {
+    // Only while the very reply accepted here still owes its decision, the session is still bound
+    // to this chat and Goal (not Loop) still holds it: the awaits below can outlive any of them.
+    const stillOwed = async () => (await getSession(input.sessionId))?.conversationId === input.conversationId &&
+      goalReplies.get(input.conversationId) === accepted && accepted.state === 'pending' &&
+      goalArmedFor(input.conversationId) && goalSwitchFor(input.conversationId).mode === 'goal';
     void (async () => {
       // The review scopes the step's edits by its exact turn; a reply alias is resolved, never guessed.
       const turnId = await goalReplySourceTurn(input.sessionId, input.turnId);
@@ -658,8 +663,12 @@ export async function acceptGoalReplyNow(input: {
       }
       // goal-reviewer.ts imports this module, so it is loaded when used rather than at startup.
       const { startStepReview } = await import('./goal-reviewer.js');
+      if (!await stillOwed()) {
+        logInfo(`goal review: step ${turnId} in ${input.conversationId} no longer owes its Goal reply; not reviewed`);
+        return;
+      }
       await startStepReview({ conversationId: input.conversationId, sessionId: input.sessionId, turnId });
-    })().catch(() => undefined);
+    })().catch(error => logWarn(`goal review: could not start the review of step ${input.turnId} in ${input.conversationId}: ${error instanceof Error ? error.message : String(error)}`));
   }
 }
 

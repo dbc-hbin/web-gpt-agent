@@ -30,6 +30,7 @@ vi.mock('../src/main/goal-reviewer.js', async (original) => ({
 const { defaultConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
 const { initSecretsPath, setSecret } = await import('../src/main/secrets.js');
 const { initDurableStore } = await import('../src/main/durable.js');
+const logger = await import('../src/main/logger.js');
 const { appendEvent, createSession, initSessionStore, resetSessionStoreForTests, readRecentEvents } = await import('../src/main/session/store.js');
 const goal = await import('../src/main/goal.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -98,6 +99,23 @@ it('reviews the exact turn behind a reply alias, and says so when the turn is no
   await goal.acceptGoalReplyNow({ conversationId: 'c-unknown', sessionId: unknown, replyId: 'assistant-unknown', turnId: 'reply:assistant-unknown', eventSeq: 3, blocked: false });
   await new Promise(resolve => setTimeout(resolve, 50));
   expect(review.started.map(row => row.conversationId)).toEqual(['c-alias']);
+});
+
+// A review is started only for the exact reply still owed under Goal: Goal stopped while the
+// step's turn was being resolved means no review.
+it('does not start a review once Goal was switched off while the step was being resolved', async () => {
+  const sessionId = await seed('c-late-off');
+  await goal.setGoalSwitchNow('c-late-off', 'goal', true);
+  await appendEvent(sessionId, { time: 2_000, source: 'extension', kind: 'assistant_message', messageId: 'assistant-late-off', turnId: 'g-late-off', final: true,
+    message: { text: 'Done.', truncated: false, chars: 5 } });
+  const logged = vi.spyOn(logger, 'logInfo');
+  try {
+    await goal.acceptGoalReplyNow({ conversationId: 'c-late-off', sessionId, replyId: 'assistant-late-off', turnId: 'reply:assistant-late-off', eventSeq: 3, blocked: false });
+    await goal.setGoalSwitchNow('c-late-off', 'goal', false);
+    await vi.waitFor(() => expect(logged.mock.calls.map(([line]) => String(line)))
+      .toContainEqual(expect.stringContaining('step g-late-off in c-late-off no longer owes its Goal reply')), { timeout: 5_000 });
+    expect(review.started).toEqual([]);
+  } finally { logged.mockRestore(); }
 });
 
 it('puts the reviewer\'s findings after the helper\'s message, and tells the helper they are there', async () => {
