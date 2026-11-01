@@ -1316,7 +1316,10 @@ the claim visibly; after the click a missing receipt leaves the authorized claim
 ambiguous Send, never a retry. Retrying a failed edit from its dock row restores it as an edit of the
 same question when that question is loaded and still editable, asks the reader to scroll up when it
 is in unloaded older history, and otherwise restores a new message with a notice. An edit in progress
-is an unsent draft that a retry cannot replace. Switching back to an older version in ChatGPT's
+is an unsent draft that a retry cannot replace. An edit Send refused before the outbox kept it
+returns to the composer as that edit only while the composer still holds what the send left there
+(same ComposerDraftOwner and text, no other edit); otherwise the newer draft stays and the refused
+edit waits in the delivery dock as a failed row whose Retry delivery restores it. Switching back to an older version in ChatGPT's
 versions view is not handled (the app keeps showing the newest one it saw).
 
 ### Attachments have one staging owner

@@ -186,6 +186,9 @@ const inputDrafts = new Map<string, string>();
 const newChatTasks = new Map<string, { objective: string; automation: string; loopDelivery: string }>();
 const imageDrafts = new Map<string, Array<InputImage | InputAttachment>>();
 const startingInputs = new Map<string, InputEntry>();
+// Edits main refused before the outbox kept them, while a newer draft held the composer. They stay
+// in the delivery dock as failed rows, so Retry delivery can restore them without replacing that draft.
+const refusedInputs = new Map<string, InputEntry>();
 const visibleInputIds = new Set<string>();
 // Window-local presentation only: a new incident or changed status is visible again.
 const dismissedRecoveryNotices = new Map<string, string>();
@@ -198,6 +201,7 @@ const dismissedInputNotices = new Set<string>((() => {
   } catch { return []; }
 })());
 function dismissInputNotice(id: string): void {
+  refusedInputs.delete(id);
   dismissedInputNotices.add(id);
   try { window.localStorage.setItem(INPUT_NOTICE_KEY, JSON.stringify([...dismissedInputNotices].slice(-100))); }
   catch { /* A storage failure still allows dismissal for this window lifetime. */ }
@@ -3752,7 +3756,8 @@ function inputMessageRow(entry: InputEntry, notice: boolean): HTMLElement {
     const dismiss = dockAction(() => t("Dismiss delivery notice"), 'i-x', () => {});
     dismiss.onclick = async () => {
       dismiss.disabled = true;
-      const result = await run(api.cancelInput(entry.id));
+      // A refused edit never reached the outbox, so there is nothing durable to cancel.
+      const result = refusedInputs.has(entry.id) || await run(api.cancelInput(entry.id));
       if (result) dismissInputNotice(entry.id);
       else dismiss.disabled = false;
       void refreshInputQueue();
@@ -3826,7 +3831,7 @@ async function adoptAcceptedOpening(entry: InputEntry): Promise<boolean> {
   return true;
 }
 function paintPendingInputs(): void {
-  const all = pendingComposerInputs;
+  const all = [...pendingComposerInputs, ...[...refusedInputs.values()].filter(entry => !pendingComposerInputs.some(row => row.id === entry.id))];
   const belongsToSelection = (entry: InputEntry): boolean => selectedId === null
     ? pendingNewInput?.generation === selectionGeneration && entry.id === pendingNewInput.id
     : (entry.sessionId ?? entry.deliveredSessionId) === selectedId;
@@ -4143,11 +4148,15 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
   }
   skillPicker?.restore();
   imageDrafts.delete(key); paintComposerImages();
+  // What the composer holds once the send took the draft; a refused edit may only come back over it.
+  const sentOwner = composerDraftOwner(), sentDraft = authoredComposerText();
   if (sessionId === null) pendingNewInput = { id, generation };
   void refreshInputQueue();
   paintDeliveryControls();
   try {
-    const result = await run(api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, ...(edit ? { edit } : {}), stages: plan?.slice(1), objective, authoredSource, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, loopAfterTurn: openingLoopDelivery(), mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings }));
+    const reply = await api.sendInput({ id, sessionId, projectId, text, ...attachmentPayload, ...(edit ? { edit } : {}), stages: plan?.slice(1), objective, authoredSource, automation: mode === 'finish' ? undefined : $<HTMLSelectElement>('chatAutomation').value as InputAutomation, loopAfterTurn: openingLoopDelivery(), mode: mode === 'finish' ? 'finish' : mode === 'auto' ? 'auto' : 'after-turn', dueAt, ...modelSettings });
+    if (!reply.ok) toast(reply.error);
+    const result = reply.ok ? reply.data : null;
     if (cancelledStarts.has(id)) return;
     if (!result) {
       // A disk failure after outbox commit still owns this input. Keep its exact
@@ -4158,10 +4167,15 @@ async function sendComposer(delivery?: 'finish', plan?: string[], planObjective?
         await adoptAcceptedOpening(retained);
         return true;
       }
-      // A refused edit stays an edit of that question, with its text back to send again.
-      if (editing && selectedId === sessionId && selectionGeneration === generation) {
+      // A refused edit stays an edit of that question, with its text back to send again, but only
+      // over the composer the send left behind. A newer draft or edit stays; the refused edit
+      // waits in the delivery dock, where Retry delivery restores it.
+      if (editing && selectedId === sessionId && selectionGeneration === generation && ownsComposerDraft(sentOwner) &&
+          authoredComposerText() === sentDraft && !editingQuestion && !imageDrafts.get(key)?.length) {
         editingQuestion = editing; paintEditNotice();
         inputDrafts.set(key, authoredDraft); input.value = authoredDraft; skillPicker?.restore();
+      } else if (editing) {
+        refusedInputs.set(id, { ...startingInputs.get(id)!, state: 'failed', error: reply.ok ? 'Not sent' : reply.error });
       } else if (selectedId === sessionId && selectionGeneration === generation && !authoredComposerText()) {
         inputDrafts.set(key, authoredDraft); input.value = authoredDraft; skillPicker?.restore();
       }

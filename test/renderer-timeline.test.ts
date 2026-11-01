@@ -3819,6 +3819,27 @@ describe('edit and resubmit', () => {
     expect(notice.hidden).toBe(true);
   });
 
+  it('keeps a newer draft when an edit is refused, and keeps the refused edit retrievable from the dock', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    editButton(w, 'First question')!.click(); await settle();
+    const refused = Promise.withResolvers<{ ok: false; error: string }>();
+    (w as any).api.sendInput = vi.fn(() => refused.promise);
+    await submit(w as any, 'First question, edited');
+    // The person starts a new message while the edit is still on its way.
+    input.value = 'A newer draft'; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    refused.resolve({ ok: false, error: 'ChatGPT is busy' }); await settle();
+    expect(input.value).toBe('A newer draft');
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(live.sent).toHaveLength(0);
+
+    input.value = ''; input.dispatchEvent(new w.Event('input', { bubbles: true }));
+    await retryDelivery(w as any);
+    expect(input.value).toBe('First question, edited');
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 3 later messages');
+    expect(w.document.querySelector('[aria-label="Retry delivery"]')).toBeNull();
+  });
+
   it('retries a failed ordinary message as an ordinary message', async () => {
     const { w, live, append } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
     live.inputs = [failedInput('A follow-up', { error: 'Delivery failed' })]; await append([]);
