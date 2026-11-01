@@ -26,19 +26,19 @@ export const CUA_DRIVER = Object.freeze({
 });
 
 export const TUNNEL_CLIENT = Object.freeze({
-  version: 'v0.0.15',
+  version: 'v0.0.19',
   targets: Object.freeze({
     win32: Object.freeze({
-      x64: Object.freeze({ upstreamArch: 'amd64', sha256: '3b53133a1e24d43f63088d843860cb1701a4c3ed6390de2e19f69089e43bddc1' }),
-      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: '571e0d59ed9e86d1b105dc34f3267865f654de6968b01efd7c847f0af657d11d' })
+      x64: Object.freeze({ upstreamArch: 'amd64', sha256: '1d0ecc3a54f2a51e27a635ac155f40fbb95df58c52cdeddf6c75532cc0bbeb25' }),
+      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: 'a054bfb19d72b446cc9802a7987a17eab517502355d27b18e51814bbb0b32731' })
     }),
     darwin: Object.freeze({
-      x64: Object.freeze({ upstreamArch: 'amd64', sha256: '9dcae1e2fb121287e73271edb7b853dda52aa86b7bfca1df91bc275371261bdb' }),
-      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: 'b2cae3aa9df45b4c2fe9b1d700ebacce39f9feb6a6b46b86e6499f9a51bf72ff' })
+      x64: Object.freeze({ upstreamArch: 'amd64', sha256: 'dff97674c77cac59e6ab3d901e6cff50fb17a5784c01d8959d1f4adb3afdf4bf' }),
+      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: '2243d024b77af8ee4b4ab7a1447949e5fc8d82bcd2d51b178927f2da9e47ecfd' })
     }),
     linux: Object.freeze({
-      x64: Object.freeze({ upstreamArch: 'amd64', sha256: '8c836dc5d68d68b663d9a5c5b28ff9fa780d9f7a3fffb1c306880b8f32fab5f1' }),
-      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: 'c51bfd883fc22e3445494a03c0179875176564bde470661b308fd83af5d01abb' })
+      x64: Object.freeze({ upstreamArch: 'amd64', sha256: '9ee9448592345a9dd1517fb79791ab54d24f051142eb92bcbe8cd355effc9142' }),
+      arm64: Object.freeze({ upstreamArch: 'arm64', sha256: '5a19e556c4a8736ab7a6fde6f0568f6e7411fa2dff21186fc15bc30e9b98a603' })
     })
   })
 });

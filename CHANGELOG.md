@@ -9,6 +9,18 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after replacing the app bundle**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.3.0] — Web GPT Agent fork
+
+- Add Git Review, local branch comparisons, three-way conflict views, per-answer changed-file summaries, and optional per-turn code checkpoints with confirmed restore.
+- Edit and resubmit earlier questions while preserving version history and newer drafts after failed delivery.
+- Preserve exact native composer bytes, opening receipts and completed-turn ownership through editor-local plain-text preparation; prepare restored Compact & Resume drafts before arming Send.
+- Add configurable fresh turns for long non-Pro work and a guarded Stop-and-continue fallback that drains tool responses and yields to a person's Stop.
+- Add an opt-in Goal step reviewer for recorded edits, with blocking findings able to pause Goal.
+- Shield recognizable credentials in tool results, progress and retained code-mode recordings, with global and project controls.
+- Improve history-rate-limit backoff, late worker adoption, withheld-input recovery, signed-out detection, announcement handling and offline-page recovery.
+- Preserve the first exact request owner across UUID-version variants, expand bounded diagnostics, coalesce journal writes, reduce session-read disk writes and idle renderer work, and retain eligible PNG screenshots as lossless WebP.
+- Update the bundled OpenAI tunnel client to v0.0.19 with verified target checksums.
+
 ## [2.2.1] — Web GPT Agent fork
 
 - Upgrade the bundled native Desktop engine to CUA Driver 0.31.0 and move native input onto the driver's token/capture ownership. An element token still requires the exact observation's snapshot; a screenshot-only window result now authorizes pixel input from its delivered image plus a non-empty capture id, with the same caller, window, epoch and single-use checks. Expose host-owned agent-cursor inspection without granting session administration, and keep the optional Perception extension unshipped.

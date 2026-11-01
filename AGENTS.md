@@ -22,7 +22,7 @@ the code currently does it. Known implementation gaps are collected in §21 inst
 mixed into the happy path as features.
 
 Source alignment: **2026-11-01** (upstream port through `2fdc777d`, see
-`docs/worklog-2026-11-01-upstream-port.md`). App/extension **2.2.1**,
+`docs/worklog-2026-11-01-upstream-port.md`). App/extension **2.3.0**,
 bridge protocol **16** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 
