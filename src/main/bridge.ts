@@ -22,7 +22,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, queuedInputOfferBlocker, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
+import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, queuedInputOfferBlocker, continueAsOrdinaryMessage, deferSilenceInput, revokeSilenceInputs } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -8231,6 +8231,10 @@ const PICKUP_BACKOFF_MS = [2, 5, 10, 15].map((minutes) => minutes * 60_000) as [
  */
 const pickupWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; expiresAt: number }>();
 const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
+/** How long an automatic Continue may sit untaken before it becomes an ordinary message. */
+const RECOVERY_ORDINARY_AFTER_MS = 10 * 60_000;
+/** Refused ordinary-message conversions already logged, by chat, input and reason. */
+const ordinaryRefusalLogged = new Set<string>();
 
 /**
  * The browser pickups a compaction ticket gets, by what the ticket is waiting for.
@@ -8398,6 +8402,32 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
         expiresAt: reply.acceptedAt + PICKUP_WATCH_LIFETIME_MS,
         dueAt: Math.max(reply.acceptedAt, floor) + PICKUP_BACKOFF_MS[0] };
       pickupWatch.set(reply.conversationId, watch);
+    }
+    // An automatic Continue nothing took for long becomes an ordinary message rather than more
+    // reloads (upstream #1960, 2026-10-31: a plain Continue typed into the same chat was taken at
+    // once). Checked between reloads; the conversion itself refuses while anything newer happened
+    // in the chat or anything runs.
+    if (reply.queued && reply.inputId && now - reply.acceptedAt >= RECOVERY_ORDINARY_AFTER_MS) {
+      const stuck = watch.attempts >= 1 ? `not claimed after ${watch.attempts} reload(s)` : await queuedInputOfferBlocker(reply.inputId);
+      if (stuck) {
+        const outcome = await continueAsOrdinaryMessage(reply.inputId, stuck, RECOVERY_ORDINARY_AFTER_MS);
+        if ('row' in outcome) {
+          pickupWatch.delete(reply.conversationId);
+          wakeBrowserWork();
+          queued = true;
+          continue;
+        }
+        // Why it stays, once per chat, input and reason. Not for a ticket that is no automatic
+        // Continue or not old enough: those are ordinary waits.
+        if (!/no longer a queued automatic Continue|not old enough/.test(outcome.refused)) {
+          const key = `${reply.conversationId}|${reply.inputId}|${outcome.refused}`;
+          if (!ordinaryRefusalLogged.has(key)) {
+            ordinaryRefusalLogged.add(key);
+            if (ordinaryRefusalLogged.size > 200) ordinaryRefusalLogged.delete(ordinaryRefusalLogged.values().next().value!);
+            logInfo(`bridge: the automatic Continue in ${reply.conversationId} is not sent as an ordinary message yet — ${outcome.refused}`);
+          }
+        }
+      }
     }
     if (now < watch.dueAt || now < reply.listenUntil) continue;
     // A reload inside a history limit cannot bring the page back and can extend the limit.
@@ -10404,6 +10434,7 @@ export function resetBridgeForTests(): void {
   providerHistoryBackoffUntil.clear();
   providerHistoryStreaks.clear();
   pickupHeldLogged.clear();
+  ordinaryRefusalLogged.clear();
   providerDeferredColdStarts.clear();
   activeUntil.clear();
   awaitingReturn.clear();

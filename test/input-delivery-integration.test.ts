@@ -42,6 +42,7 @@ const { bridgePort, startBridge, stopBridge } = await import('../src/main/bridge
 const input = await import('../src/main/session/input.js');
 const goal = await import('../src/main/goal.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
+const logger = await import('../src/main/logger.js');
 let directory: string;
 let bearer: string;
 const pushed = vi.fn();
@@ -1924,6 +1925,163 @@ describe('native progress silence authority', () => {
     if (repair.requiresClaim) expect((await post('/repairs/claim', { conversationId, token: repair.token })).body.allowed).toBe(true);
     await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [conversationId] });
   }
+
+  // Upstream #1960 (2026-10-31): an automatic Continue no page took after a stalled turn; a plain
+  // Continue in the same chat was taken at once. The fallback turns it into that ordinary message,
+  // once, and only while nothing newer happened in the chat.
+  it('turns an automatic Continue no page took into an ordinary message, only while nothing newer happened', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toEqual({ refused: 'its turn is still open in the record' });
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test', 60 * 60_000)).toEqual({ refused: 'it is not old enough yet' });
+    const outcome = await input.continueAsOrdinaryMessage(ticket.id, 'not claimed after its reloads');
+    const ordinary = 'row' in outcome ? outcome.row : null;
+    expect(ordinary).toMatchObject({ id: ticket.id, text: ticket.text, mode: 'auto', state: 'queued', continuedFrom: 'recovery',
+      continuesQuestionId: ticket.recovery!.questionId });
+    expect(ordinary).not.toHaveProperty('recovery');
+    expect(ordinary).not.toHaveProperty('silenceBoundary');
+    expect(logger.getLog().some(entry => entry.message.includes(`input ${ticket.id}: no page took the automatic Continue (not claimed after its reloads); sending it as an ordinary message`))).toBe(true);
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'again')).toEqual({ refused: 'it is no longer a queued automatic Continue' });
+    // Offered and sent like a typed message once the chat's activity window has passed.
+    let now = Date.now() + 15 * 60_000; const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const offered = (await input.pendingBrowserInputs()).find(row => row.id === ticket.id);
+      expect(offered).toBeDefined();
+      expect(offered).not.toHaveProperty('recovery');
+      expect(await input.claimBrowserInput(ticket.id, 'page-owner', source.conversationId, true)).toMatchObject({ id: ticket.id });
+      now++;
+      expect(await input.authorizeBrowserInput(ticket.id, 'page-owner', source.conversationId)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('withdraws a Continue sent on as an ordinary message once the person asks something newer', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toHaveProperty('row');
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'user_message', messageId: randomUUID(), text: 'Do this instead', time: Date.now(), authoredNow: true }
+    ] });
+    expect(await input.claimBrowserInput(ticket.id, 'page-owner', source.conversationId, true)).toBeNull();
+    expect((await input.listInputs()).find(row => row.id === ticket.id)).toMatchObject({
+      state: 'cancelled', error: 'Automatic Continue cancelled: another user message arrived.'
+    });
+  });
+
+  it('refuses Send for a converted Continue claimed before a newer question arrived', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toHaveProperty('row');
+    let now = Date.now() + 15 * 60_000; const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      expect(await input.claimBrowserInput(ticket.id, 'page-owner', source.conversationId, true)).not.toBeNull();
+      await deliveryStore.appendEvent(source.session.id, { kind: 'user_message', source: 'app', time: ++now, messageId: randomUUID(),
+        message: { text: 'Do this instead', truncated: false, chars: 15 } });
+      expect(await input.authorizeBrowserInput(ticket.id, 'page-owner', source.conversationId)).toBe(false);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('lets authored input replace a Continue sent on as an ordinary message', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toHaveProperty('row');
+    const authored = await input.enqueueInput({ ...message(source.session.id, 'off'), mode: 'auto', text: 'My own next step.' });
+    expect((await input.listInputs()).find(row => row.id === ticket.id)).toMatchObject({
+      state: 'cancelled', error: 'Replaced by your new instruction before delivery.' });
+    expect((await input.listInputs()).find(row => row.id === authored.id)?.state).toBe('queued');
+  });
+
+  it('never converts an automatic Continue whose Send was authorized', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    expect(await input.claimBrowserInput(ticket.id, 'page-owner', source.conversationId, true)).not.toBeNull();
+    expect(await input.authorizeBrowserInput(ticket.id, 'page-owner', source.conversationId)).toBe(true);
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toEqual({ refused: 'it is no longer a queued automatic Continue' });
+  });
+
+  it('sends an automatic Continue no page claims as an ordinary message after a reload and ten minutes', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+      await post('/events', { conversationId: source.conversationId, events: [
+        { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: now }
+      ] });
+      let reloads = 0;
+      for (let minute = 1; minute <= 16; minute++) {
+        now += 60_000;
+        await (await bridge()).sweepStaleSwarm(now);
+        const repairs = (await post('/status', { openConversations: [source.conversationId] })).body.repairs ?? [];
+        for (const repair of (repairs as Array<{ conversationId: string; token: string; requiresClaim?: boolean }>).filter(row => row.conversationId === source.conversationId)) {
+          if (repair.requiresClaim) await post('/repairs/claim', { conversationId: source.conversationId, token: repair.token });
+          await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [source.conversationId] });
+          reloads += 1;
+        }
+        if (!(await input.listInputs()).find(row => row.id === ticket.id)?.recovery) break;
+      }
+      const row = (await input.listInputs()).find(entry => entry.id === ticket.id)!;
+      expect(row).toMatchObject({ state: 'queued', mode: 'auto', text: ticket.text, continuedFrom: 'recovery' });
+      expect(row.recovery).toBeUndefined();
+      expect(reloads).toBeGreaterThanOrEqual(1);
+      expect(reloads).toBeLessThanOrEqual(3);
+      expect(logger.getLog().some(entry => entry.message.includes(`input ${ticket.id}: no page took the automatic Continue (not claimed after`))).toBe(true);
+      expect((await input.pendingBrowserInputs()).some(entry => entry.id === ticket.id)).toBe(true);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('says once why an automatic Continue is not sent as an ordinary message yet', async () => {
+    let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      const source = await open('gpt-5.6-sol');
+      expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+      const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+      for (let minute = 1; minute <= 16; minute++) {
+        now += 60_000;
+        await (await bridge()).sweepStaleSwarm(now);
+        const repairs = (await post('/status', { openConversations: [source.conversationId] })).body.repairs ?? [];
+        for (const repair of (repairs as Array<{ conversationId: string; token: string; requiresClaim?: boolean }>).filter(row => row.conversationId === source.conversationId)) {
+          if (repair.requiresClaim) await post('/repairs/claim', { conversationId: source.conversationId, token: repair.token });
+          await post(`/status?repaired=${repair.token}&repairAction=reloaded`, { openConversations: [source.conversationId] });
+        }
+      }
+      expect((await input.listInputs()).find(row => row.id === ticket.id)?.recovery).toBeDefined();
+      expect(logger.getLog().map(entry => entry.message).filter(line => line.includes(`automatic Continue in ${source.conversationId} is not sent as an ordinary message yet`))).toEqual([
+        `bridge: the automatic Continue in ${source.conversationId} is not sent as an ordinary message yet — its turn is still open in the record`
+      ]);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('leaves an automatic Continue alone once the person asked something newer', async () => {
+    const source = await open('gpt-5.6-sol');
+    expect(await input.fileRecoveryInput(source.session.id, source.conversationId, source.turnId, false, () => true)).toBe(true);
+    const ticket = (await input.listInputs()).find(row => row.recovery && row.state === 'queued')!;
+    await post('/events', { conversationId: source.conversationId, events: [
+      { kind: 'turn_end', turnId: source.turnId, outcome: 'stalled', time: Date.now() },
+      { kind: 'user_message', messageId: randomUUID(), text: 'Actually, do this instead', time: Date.now(), authoredNow: true }
+    ] });
+    expect(await input.continueAsOrdinaryMessage(ticket.id, 'test')).toHaveProperty('refused');
+    expect((await input.listInputs()).find(row => row.id === ticket.id)?.continuedFrom).toBeUndefined();
+  });
 
   it('keeps authored queued work ahead of automatic Continue after a committed handoff', async () => {
     let now = Date.now(); const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
