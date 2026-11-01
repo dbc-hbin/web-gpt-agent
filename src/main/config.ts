@@ -250,6 +250,8 @@ const capabilitiesSchema = z
  */
 export const MAX_MCP_INSTRUCTIONS_CHARS = 4000;
 const DEFAULT_MCP = { instructions: '' } as const;
+/** Off for fresh installs and for every config written before the switch existed. */
+const DEFAULT_PROJECTS = { codeCheckpoints: false } as const;
 
 const configSchema = z.object({
   // A config written by hand — or by a build before `/skills` was reserved — must not be
@@ -443,7 +445,15 @@ const configSchema = z.object({
     })
     .optional()
     .default({ ...DEFAULT_MCP })
-    .catch({ ...DEFAULT_MCP })
+    .catch({ ...DEFAULT_MCP }),
+  // Opt-in, so a malformed value repairs to off without touching the rest of the file.
+  projects: z
+    .object({
+      codeCheckpoints: z.boolean().optional().default(DEFAULT_PROJECTS.codeCheckpoints).catch(DEFAULT_PROJECTS.codeCheckpoints)
+    })
+    .optional()
+    .default({ ...DEFAULT_PROJECTS })
+    .catch({ ...DEFAULT_PROJECTS })
 });
 
 /**
@@ -471,7 +481,8 @@ export function defaultConfig(platform: NodeJS.Platform = process.platform, rele
     compaction: { ...DEFAULT_COMPACTION },
     multiAgent: { ...FIRST_LAUNCH_MULTI_AGENT },
     goal: { ...DEFAULT_GOAL },
-    mcp: { ...DEFAULT_MCP }
+    mcp: { ...DEFAULT_MCP },
+    projects: { ...DEFAULT_PROJECTS }
   };
 }
 

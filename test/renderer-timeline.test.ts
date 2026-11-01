@@ -8,6 +8,14 @@ import type { Handoff, SessionEvent, SessionSummary } from '../src/shared/sessio
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import type { LocalProject } from '../src/shared/projects.js';
 vi.mock('../src/renderer/workspace-terminal.js', () => ({ createWorkspaceTerminal: () => ({ update: vi.fn() }) }));
+vi.mock('../src/renderer/file-code-editor.js', () => ({
+  createProjectDiffViewer: async ({ parent, baseText, currentText }: { parent: HTMLElement; baseText: string; currentText: string }) => {
+    const view = parent.ownerDocument.createElement('pre');
+    view.textContent = `${baseText}\n---\n${currentText}`;
+    parent.append(view);
+    return { destroy: () => view.remove(), language: 'TypeScript' };
+  }
+}));
 import { positionOf, projectTimeline } from '../src/shared/chronology.js';
 
 /**
@@ -1596,6 +1604,71 @@ it('keeps Projects and Chats separate while preserving disclosure state through 
   expect(projects.open).toBe(false);
 });
 
+it('reviews only an exact recorded edit without expanding its tool row or querying Git', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const edit = toolCall(2, 'edit-one');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit], true, [], [project]);
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  const reviewCall = vi.fn(() => ok({ callId: edit.call.callId, changeIndex: 0, path: 'src/main.ts', added: 1, removed: 1,
+    baseText: 'before', currentText: 'after' }));
+  app.w.api.getToolEditReview = reviewCall;
+  const row = app.w.document.querySelector<HTMLDetailsElement>('details.tool')!;
+  const review = row.querySelector<HTMLButtonElement>('.tool-open-diff')!;
+  expect(review.getAttribute('aria-label')).toBe('Review this edit');
+  review.click(); await settle();
+  expect(row.open).toBe(false);
+  expect(reviewCall).toHaveBeenCalledWith(expect.any(String), edit.call.callId, 0);
+  expect(app.w.document.querySelector<HTMLElement>('.review-panel .file-changes-view')?.hidden).toBe(false);
+  expect(app.w.document.querySelector('.review-panel .file-preview-meta')?.textContent).toContain('This edit');
+});
+
+it('does not offer a project diff shortcut in an unfiled chat', async () => {
+  const edit = toolCall(2, 'edit-unfiled');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit]);
+  expect(app.w.document.querySelector('.tool-open-diff')).toBeNull();
+});
+
+it('reviews only an exact recorded edit without expanding its tool row or querying Git', async () => {
+  const project: LocalProject = { id: '33333333-3333-4333-8333-333333333333', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const edit = toolCall(2, 'edit-one');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit], true, [], [project]);
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  const reviewCall = vi.fn(() => ok({ callId: edit.call.callId, changeIndex: 0, path: 'src/main.ts', added: 1, removed: 1,
+    baseText: 'before', currentText: 'after' }));
+  app.w.api.getToolEditReview = reviewCall;
+  const row = app.w.document.querySelector<HTMLDetailsElement>('details.tool')!;
+  const review = row.querySelector<HTMLButtonElement>('.tool-open-diff')!;
+  expect(review.getAttribute('aria-label')).toBe('Review this edit');
+  review.click(); await settle();
+  expect(row.open).toBe(false);
+  expect(reviewCall).toHaveBeenCalledWith(expect.any(String), edit.call.callId, 0);
+  expect(app.w.document.querySelector<HTMLElement>('.review-panel .file-changes-view')?.hidden).toBe(false);
+  expect(app.w.document.querySelector('.review-panel .file-preview-meta')?.textContent).toContain('This edit');
+  expect(app.w.document.getElementById('reviewPanelToggle')?.getAttribute('aria-expanded')).toBe('true');
+});
+
+it('does not offer a project diff shortcut in an unfiled chat', async () => {
+  const edit = toolCall(2, 'edit-unfiled');
+  if (edit.kind !== 'tool_call') throw new Error('Expected a tool call');
+  edit.call.tool = 'apply_patch';
+  edit.call.summary = { kind: 'edit', title: 'Edited src/main.ts', metric: '+1 −1', tone: 'good' };
+  edit.call.changes = [{ path: '/repo/src/main.ts', added: 1, removed: 1, approximate: false, reviewAssetId: 'deadbeef.txt' }];
+  const app = await boot([edit]);
+  expect(app.w.document.querySelector('.tool-open-diff')).toBeNull();
+});
+
 it('starts in New Chat despite active history and selects only the exact acknowledged send', async () => {
   const app = await boot([], false);
   const { w, live } = app;
@@ -2175,6 +2248,59 @@ it('retains the New Chat objective through Goal, Off and Goal toggles', async ()
   }
   expect(w.document.getElementById('clearSessionObjective')).toBeNull();
   expect(w.document.getElementById('showHandoff')).toBeNull();
+});
+
+it('puts Review\'s conflict request in the composer as a new draft and hides a narrow pane', async () => {
+  const project: LocalProject = { id: '55555555-5555-4555-8555-555555555555', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const { w, live } = await boot([], false, [], [project]);
+  const api = (w as any).api;
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  api.getProjectGitSnapshot = () => ok({ projectId: project.id, state: 'ready', truncated: false, revision: 'merging',
+    changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }] });
+  api.getProjectGitDiff = () => ok({ projectId: project.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+    binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD' });
+  Object.defineProperty(w, 'matchMedia', { configurable: true,
+    value: (query: string) => ({ matches: query.includes('850px'), addEventListener: vi.fn(), removeEventListener: vi.fn() }) });
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Unfinished';
+  w.document.getElementById('reviewPanelToggle')!.click(); await settle();
+  w.document.querySelector<HTMLButtonElement>('.review-panel .file-change-row[data-path="src/both.ts"]')!.click(); await settle();
+  [...w.document.querySelectorAll<HTMLButtonElement>('.review-panel .file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+  await settle();
+  expect(input.value).toMatch(/^Help me resolve the merge conflict in src\/both\.ts\..*\n\nUnfinished$/s);
+  expect(w.document.querySelector<HTMLElement>('.review-panel')?.hidden).toBe(true);
+  expect(w.document.activeElement).toBe(input);
+  expect(live.sent).toHaveLength(0);
+});
+
+it('does not put Review\'s conflict request in the composer while a prepared plan is waiting to be sent', async () => {
+  // Send starts the prepared plan, so the request the composer showed would never have been sent.
+  const project: LocalProject = { id: '55555555-5555-4555-8555-555555555555', name: 'Workspace', path: '/workspace', createdAt: T0 };
+  const { w, live } = await boot([], false, [], [project]);
+  const api = (w as any).api;
+  (w.document.querySelector(`.project-heading > [data-new-project="${project.id}"]`) as HTMLButtonElement).click(); await settle();
+  (await api.getState()).data.config.ui.finishTool = true;
+  const ok = <T>(data: T) => Promise.resolve({ ok: true as const, data });
+  api.draftTaskPlan = vi.fn(async () => ({ ok: true, data: ['Build foundation', 'Verify it'] }));
+  api.getProjectGitSnapshot = () => ok({ projectId: project.id, state: 'ready', truncated: false, revision: 'merging',
+    changes: [{ status: 'C', path: 'src/both.ts', additions: null, deletions: null, binary: false }] });
+  api.getProjectGitDiff = () => ok({ projectId: project.id, status: 'C', path: 'src/both.ts', additions: null, deletions: null,
+    binary: false, tooLarge: false, baseText: 'ours', currentText: '<<<<<<< HEAD' });
+  const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+  input.value = 'Build the whole task';
+  input.dispatchEvent(new w.Event('input'));
+  w.document.getElementById('createPlan')!.click();
+  await settle();
+  expect(w.document.getElementById('taskPlanPreview')!.textContent).toContain('Build foundation');
+  w.document.getElementById('reviewPanelToggle')!.click(); await settle();
+  w.document.querySelector<HTMLButtonElement>('.review-panel .file-change-row[data-path="src/both.ts"]')!.click(); await settle();
+  [...w.document.querySelectorAll<HTMLButtonElement>('.review-panel .file-preview-actions button')].find(button => button.title === 'Ask chat to resolve')!.click();
+  await settle();
+  expect(input.value).toBe('');
+  expect(w.document.querySelector('.toast')?.textContent).toBe('Start or cancel the prepared plan first, then ask again.');
+  expect(w.document.getElementById('taskPlanPreview')!.textContent).toContain('Build foundation');
+  expect(live.sent).toHaveLength(0);
 });
 
 it('keeps editable stages and sends the original request with the full workflow exactly once', async () => {

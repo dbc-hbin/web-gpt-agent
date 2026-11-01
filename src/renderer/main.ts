@@ -490,6 +490,7 @@ function save(over: { readOnly?: boolean; fileAccessMode?: AppState['config']['f
       theme: over.theme ?? previous.ui.theme,
       appearance: over.appearance ?? previous.ui.appearance
     },
+    projects: { codeCheckpoints: $<HTMLInputElement>('codeCheckpoints').checked },
     ...chatPatch
   };
   requestedSettings = patch;
@@ -522,6 +523,7 @@ async function saveSnapshot(patch: SettingsPatch, previous: AppState['config']):
     sessions: previous.sessions,
     compaction: previous.compaction,
     mcp: previous.mcp ?? { instructions: '' },
+    projects: previous.projects ?? { codeCheckpoints: false },
     multiAgent: previous.multiAgent,
     goal: previous.goal
   };
@@ -1031,6 +1033,7 @@ function apply(next: AppState): void {
     previousState?.config.ui.privacyScreenshots
   );
   applyChecked($<HTMLInputElement>('secretsShield'), config.ui.secretsShield !== false, previousState ? previousState.config.ui.secretsShield !== false : undefined);
+  applyChecked($<HTMLInputElement>('codeCheckpoints'), config.projects?.codeCheckpoints === true, previousState?.config.projects?.codeCheckpoints);
   $('privacyScreenshotsSetting').hidden = !(next.platform?.desktopAutomation ?? true);
   if (next.platform?.family === 'macos') {
     ui($('backgroundRunningCopy'), 'textContent', () => t("Leave it running while you use the connector. It stays available from the menu bar and Dock when you close the window."));
@@ -1790,6 +1793,7 @@ for (const id of [
   'developerMode',
   'privacyScreenshots',
   'secretsShield',
+  'codeCheckpoints',
   'tunnelKind',
   'tunnelId',
   'desktopTunnelId'
