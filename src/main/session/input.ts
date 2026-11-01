@@ -1094,10 +1094,10 @@ export async function hasQueuedAfterTurnInput(sessionId: string): Promise<boolea
 
 /** Read the same visible head as claims, including its still-running listening window.
  * Historical restored tickets without an acceptance timestamp never arm browser recovery. */
-export function pendingQueuedPickups(): Promise<Array<{ conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }>> {
+export function pendingQueuedPickups(): Promise<Array<{ conversationId: string; sessionId: string; inputId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }>> {
   return serial(async () => {
     const rows = await load();
-    const result: Array<{ conversationId: string; sessionId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }> = [];
+    const result: Array<{ conversationId: string; sessionId: string; inputId: string; sourceTurnId: string; acceptedAt: number; listenUntil: number; pro: boolean }> = [];
     const pending = ordered(rows).filter(row => row.sessionId && row.purpose !== 'decision' && ['queued', 'browser', 'tool'].includes(row.state));
     for (const sessionId of new Set(pending.map(row => row.sessionId))) {
       const candidates = pending.filter(row => row.sessionId === sessionId);
@@ -1115,7 +1115,7 @@ export function pendingQueuedPickups(): Promise<Array<{ conversationId: string; 
       const acceptedAt = row.silenceBoundary?.acceptedAt ?? (!row.silenceBoundary && completed ? end.time : undefined);
       if (acceptedAt === undefined) continue;
       const selection = session.selectedModel;
-      result.push({ conversationId: session.conversationId, sessionId: row.sessionId, sourceTurnId, acceptedAt,
+      result.push({ conversationId: session.conversationId, sessionId: row.sessionId, inputId: row.id, sourceTurnId, acceptedAt,
         listenUntil: completed && !row.silenceBoundary?.nativeBusy ? 0 : row.silenceBoundary?.listenUntil ?? 0,
         pro: selection?.conversationId === session.conversationId && isProModel(selection.model, selection.reasoningEffort) });
     }
@@ -1364,6 +1364,59 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
     return result;
   });
 }
+/**
+ * Why a queued message is not on the offer list, in the order `pendingBrowserInputs` checks; null
+ * when it is offered. A page cannot claim a message the app itself withholds, so a pickup reload
+ * for it changes nothing (upstream #1960, 2026-10-31).
+ */
+export function queuedInputOfferBlocker(id: string): Promise<string | null> {
+  return serial(async () => {
+    const current = await load();
+    const entry = current.find(row => row.id === id);
+    if (!entry || entry.state !== 'queued') return 'it is no longer queued';
+    if (companionOf(current, entry)) return 'it rides with another message of this chat';
+    if (!preparable(entry)) return 'it cannot be prepared for the browser';
+    if (entry.dueAt > Date.now()) return 'it is not due yet';
+    if (queuedFollowup(entry) && !(await completedStageBoundary(entry, current))) {
+      const first = ordered(current).find(row => row.sessionId === entry.sessionId && queuedFollowup(row) && row.state === 'queued');
+      if (first && first.id !== entry.id) return `an earlier queued message of this chat (${first.id}) goes first`;
+      if (!await browserInputAllowed(entry)) return await notOfferedReason(entry);
+      const turnId = await eligibleStageEnd(entry);
+      if (!turnId) return 'the turn it follows has not ended';
+      if (current.some(row => row !== entry && row.sessionId === entry.sessionId && row.state === 'queued' && row.silenceBoundary?.turnId === turnId))
+        return 'another queued message owns the same turn';
+      const other = current.find(row => row.sessionId === entry.sessionId && (consumedTurn(row, turnId) || row.state === 'tool' || row.state === 'browser'));
+      if (other) return other.state === 'browser' || other.state === 'tool'
+        ? `another message of this chat (${other.id}) is still being sent` : `another message (${other.id}) already continued this turn`;
+      return 'a message to send right away goes first';
+    }
+    if (!await browserInputAllowed(entry)) {
+      if (entry.recovery) {
+        const invalid = await recoveryInvalidReason(entry);
+        if (invalid) return `its automatic Continue no longer applies: ${invalid}`;
+      }
+      return await notOfferedReason(entry);
+    }
+    try { await target(entry); } catch (error) { return `its chat cannot be resolved (${(error as Error).message})`; }
+    return null;
+  });
+}
+
+async function notOfferedReason(entry: InputEntry): Promise<string> {
+  if (entry.error?.startsWith('Local chat setup failed:')) return 'its local chat setup failed';
+  if (entry.delivery === 'tool' || entry.attachmentDelivery === 'tool') return 'it goes out with a tool result, not through the page';
+  if (entry.generatedBy) return 'the feature that generated it no longer allows it';
+  if (entry.workInput) return 'the work that asked for it is paused or ended';
+  const session = entry.sessionId ? await getSession(entry.sessionId) : null;
+  if (session?.browserRecoveryDismissedAt !== undefined) return "its chat's tab was closed";
+  if (entry.silenceBoundary) return "the turn it continues is no longer the chat's open turn";
+  if (!session?.conversationId) return 'its chat has no ChatGPT conversation yet';
+  if (isChatBlocked(session.conversationId)) return 'its chat is blocked';
+  if (session.activeTurnId) return "its chat's turn is still running";
+  if (entry.directTurn) return 'the turn it was typed into has ended';
+  return 'ChatGPT or a running tool call still shows work in its chat';
+}
+
 export function claimBrowserInput(id: string, owner: string, conversationId: string | null, requiresAuthorization = false): Promise<InputEntry | null> {
   return serial(async () => {
     const current = await load();

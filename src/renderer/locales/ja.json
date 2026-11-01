@@ -1442,5 +1442,10 @@
   "Secrets are not hidden: this is off in Settings for every chat": "シークレットは隠されません：設定ですべてのチャットに対してオフになっています",
   "Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them": "このプロジェクトのツール結果ではシークレットを ChatGPT から隠しています。クリックすると隠すのをやめます",
   "Secrets are not hidden in this project's tool results; click to hide them": "このプロジェクトのツール結果ではシークレットを隠していません。クリックすると隠します",
-  "Hide secrets from ChatGPT in {0}": "{0} でシークレットを ChatGPT から隠す"
+  "Hide secrets from ChatGPT in {0}": "{0} でシークレットを ChatGPT から隠す",
+  "ChatGPT history temporarily rate-limited": "ChatGPT の履歴が一時的にレート制限されています",
+  "Automatic recovery is paused during the history rate-limit wait. Reloading earlier can prolong the limit.": "履歴へのアクセス制限による待機中は自動復旧を一時停止します。早く再読み込みすると制限が長引く可能性があります。",
+  "Retry check in {0}": "{0} 後に再確認",
+  "Retry window ended": "再試行待機期間が終了しました",
+  "{0} started late": "{0}が遅れて開始しました"
 }

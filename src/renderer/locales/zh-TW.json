@@ -1440,5 +1440,10 @@
   "Secrets are not hidden: this is off in Settings for every chat": "不會隱藏機密：已在設定中對所有聊天關閉",
   "Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them": "此專案的工具結果會向 ChatGPT 隱藏機密；點選即可停止隱藏",
   "Secrets are not hidden in this project's tool results; click to hide them": "此專案的工具結果不會隱藏機密；點選即可隱藏",
-  "Hide secrets from ChatGPT in {0}": "在 {0} 中向 ChatGPT 隱藏機密"
+  "Hide secrets from ChatGPT in {0}": "在 {0} 中向 ChatGPT 隱藏機密",
+  "ChatGPT history temporarily rate-limited": "ChatGPT 歷史記錄暫時受到速率限制",
+  "Automatic recovery is paused during the history rate-limit wait. Reloading earlier can prolong the limit.": "因對話歷史存取限流而等待期間，自動復原將暫停。提前重新載入可能延長限制。",
+  "Retry check in {0}": "{0} 後重新檢查",
+  "Retry window ended": "重試等待時間已結束",
+  "{0} started late": "{0} 延遲啟動"
 }

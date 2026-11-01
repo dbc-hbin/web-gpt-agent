@@ -1406,5 +1406,10 @@
   "Secrets are not hidden: this is off in Settings for every chat": "Los secretos no se ocultan: está desactivado en Ajustes para todos los chats",
   "Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them": "Los secretos se ocultan a ChatGPT en los resultados de herramientas de este proyecto; haz clic para dejar de ocultarlos",
   "Secrets are not hidden in this project's tool results; click to hide them": "Los secretos no se ocultan en los resultados de herramientas de este proyecto; haz clic para ocultarlos",
-  "Hide secrets from ChatGPT in {0}": "Ocultar secretos a ChatGPT en {0}"
+  "Hide secrets from ChatGPT in {0}": "Ocultar secretos a ChatGPT en {0}",
+  "ChatGPT history temporarily rate-limited": "Historial de ChatGPT limitado temporalmente",
+  "Automatic recovery is paused during the history rate-limit wait. Reloading earlier can prolong the limit.": "La recuperación automática se pausa mientras se espera por el límite de acceso al historial. Recargar antes puede prolongar el límite.",
+  "Retry check in {0}": "Volver a comprobar en {0}",
+  "Retry window ended": "Intervalo de reintento finalizado",
+  "{0} started late": "{0} empezó con retraso"
 }

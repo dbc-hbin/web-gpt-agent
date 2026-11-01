@@ -26,6 +26,12 @@ import type { Config } from '../src/shared/types.js';
 const recoveryBrowserWake = vi.hoisted(() => vi.fn(async (_url: string, _retry?: boolean, _background?: boolean,
   _authority?: { current(): boolean | Promise<boolean> }) => {}));
 vi.mock('../src/main/browser-startup.js', () => ({ wakeBrowserUrl: recoveryBrowserWake }));
+// Makes the app withhold one queued input from the page, with a reason (upstream #1960).
+const withheldInput = vi.hoisted(() => ({ id: null as string | null, reason: '' }));
+vi.mock('../src/main/session/input.js', async original => {
+  const real = await original<typeof import('../src/main/session/input.js')>();
+  return { ...real, queuedInputOfferBlocker: async (id: string) => id === withheldInput.id ? withheldInput.reason : real.queuedInputOfferBlocker(id) };
+});
 
 /**
  * The continuity manager, with its snapshot entry recorded.
@@ -168,6 +174,7 @@ const {
   resetSwarm,
   restoreSwarm,
   snapshotSwarm,
+  swarmRunning,
   swarmState,
   swarmStateForCaller,
   WORKER_CONTEXT_CEILING_TOKENS,
@@ -2524,6 +2531,77 @@ describe('automatic compaction', () => {
     expect(after.body.repairs?.some((row: { token: string }) => row.token === repair.token)).toBe(false);
   });
 
+  // Upstream #1927 (#1922): a page kept its stall clock for a turn that had already ended and
+  // reported it after the replacement turn completed. A recoverable error for an ended turn,
+  // with a newer turn since, is stale.
+  it('does not recover a chat for a stall report about a turn that ended before a newer one', async () => {
+    await pair();
+    const conversationId = randomUUID();
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    const t0 = Date.now();
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'user_message', time: t0, text: 'Continue the long job', messageId: 'stale-q-1' },
+      { kind: 'turn_start', time: t0 + 1, turnId: 'stale-old-turn' },
+      { kind: 'turn_end', time: t0 + 2, turnId: 'stale-old-turn', outcome: 'stalled' },
+      { kind: 'user_message', time: t0 + 3, text: 'Continue', messageId: 'stale-q-2' },
+      { kind: 'turn_start', time: t0 + 4, turnId: 'stale-new-turn' },
+      { kind: 'turn_end', time: t0 + 5, turnId: 'stale-new-turn', outcome: 'completed' }
+    ] } });
+    await settled();
+    await request('POST', '/events', { body: { conversationId, events: [
+      { kind: 'chat_error', time: t0 + 6, turnId: 'stale-old-turn', recoverable: true,
+        text: 'No visible progress for ten minutes. The app could not confirm that this turn finished.' }
+    ] } });
+    await settled();
+    const status = await request('GET', '/status');
+    expect((status.body.repairs as Array<{ conversationId: string }>).some(row => row.conversationId === conversationId)).toBe(false);
+    const lines = info.mock.calls.map(([line]) => String(line));
+    expect(lines.some(line => line.includes('asking the browser to recover ' + conversationId))).toBe(false);
+    expect(lines).toContain(`bridge: ignored an error report for ${conversationId}: its turn stale-old-turn ended before a newer turn`);
+    info.mockRestore();
+  });
+
+  it('treats a report about an ended turn as stale when the newer turn has the same time, also when it comes in the same batch', async () => {
+    await pair();
+    const logger = await import('../src/main/logger.js');
+    const info = vi.spyOn(logger, 'logInfo');
+    const t0 = Date.now();
+    const sameTime = randomUUID();
+    await request('POST', '/events', { body: { conversationId: sameTime, events: [
+      { kind: 'user_message', time: t0, text: 'Continue the long job', messageId: 'same-q-1' },
+      { kind: 'turn_start', time: t0, turnId: 'same-old' },
+      { kind: 'turn_end', time: t0, turnId: 'same-old', outcome: 'stalled' },
+      { kind: 'user_message', time: t0, text: 'Continue', messageId: 'same-q-2' },
+      { kind: 'turn_start', time: t0, turnId: 'same-new' },
+      { kind: 'turn_end', time: t0, turnId: 'same-new', outcome: 'completed' }
+    ] } });
+    await settled();
+    await request('POST', '/events', { body: { conversationId: sameTime, events: [
+      { kind: 'chat_error', time: t0, turnId: 'same-old', recoverable: true, text: 'No visible progress for ten minutes.' }
+    ] } });
+    const together = randomUUID();
+    await request('POST', '/events', { body: { conversationId: together, events: [
+      { kind: 'user_message', time: t0, text: 'Continue the long job', messageId: 'tog-q-1' },
+      { kind: 'turn_start', time: t0 + 1, turnId: 'tog-old' }
+    ] } });
+    await settled();
+    await request('POST', '/events', { body: { conversationId: together, events: [
+      { kind: 'turn_end', time: t0 + 2, turnId: 'tog-old', outcome: 'stalled' },
+      { kind: 'user_message', time: t0 + 3, text: 'Continue', messageId: 'tog-q-2' },
+      { kind: 'turn_start', time: t0 + 4, turnId: 'tog-new' },
+      { kind: 'chat_error', time: t0 + 5, turnId: 'tog-old', recoverable: true, text: 'No visible progress for ten minutes.' }
+    ] } });
+    await settled();
+    const repairs = ((await request('GET', '/status')).body.repairs as Array<{ conversationId: string }>).map(row => row.conversationId);
+    expect(repairs).not.toContain(sameTime);
+    expect(repairs).not.toContain(together);
+    const lines = info.mock.calls.map(([line]) => String(line));
+    expect(lines).toContain(`bridge: ignored an error report for ${sameTime}: its turn same-old ended before a newer turn`);
+    expect(lines).toContain(`bridge: ignored an error report for ${together}: its turn tog-old ended before a newer turn`);
+    info.mockRestore();
+  });
+
   it('keeps the concrete pre-send failure and refuses a stale page abort of a newer ticket', async () => {
     await pair();
     const conversationId = randomUUID();
@@ -3128,7 +3206,7 @@ describe('automatic compaction', () => {
    * ticket itself is never failed by a pickup here; it stays open for the page to finish. The
    * writing phase's three are its own — the asking phase spent none of them.
    */
-  it('reloads one automatic ticket at 5-minute checkpoints while the brief is being written', async () => {
+  it('reloads one automatic ticket at 5-minute checkpoints while the brief is being written, then every 15 minutes', async () => {
     vi.useFakeTimers();
     try {
       await pair();
@@ -3168,8 +3246,14 @@ describe('automatic compaction', () => {
         await request('GET', `/status?repaired=${handout!.token}&repairAction=reloaded`);
       }
 
-      await vi.advanceTimersByTimeAsync(2 * 60 * 60_000);
+      // Past its quick pickups the still-owed ticket keeps one every 15 minutes, and says so.
+      await vi.advanceTimersByTimeAsync(15 * 60_000 - 1);
       expect(await takeRepair()).toBeNull();
+      await vi.advanceTimersByTimeAsync(1);
+      const slow = await takeRepair();
+      expect(slow).toMatchObject({ conversationId, reason: 'compaction' });
+      await request('GET', `/status?repaired=${slow!.token}&repairAction=reloaded`);
+      expect(getLog().filter(entry => entry.message.includes(`compaction ticket ${token.slice(0, 8)} writing pickup 4 (slow retry)`))).toHaveLength(1);
       expect(continuationByToken(token)).toMatchObject({ automatic: true, state: 'awaiting-summary' });
     } finally {
       vi.useRealTimers();
@@ -6788,6 +6872,106 @@ describe('a worker chat that never opens', () => {
   });
 });
 
+// --------------------------------------------------- late starts
+
+/**
+ * A worker the app gave up on for time, whose chat received its task anyway (upstream #1644/#1086).
+ *
+ * On a memory-starved machine pages sent their task within the deadline, but their reports reached
+ * the app 20-90 s late. The app failed the worker, its chat went on working, and nothing tracked it.
+ * The late truth is accepted: the worker rejoins its run when it still can, and is fenced when not.
+ */
+describe('a worker whose chat starts after the app gave up on it', () => {
+  const ack = (id: string, conversationId: string, client = 'tab-1') =>
+    request('POST', '/commands/ack', { body: { id, status: 'sent', conversationId, agent: 'worker-1', client } });
+  const primeReports = (): string[] =>
+    snapshotSwarm()!.agents.find(entry => entry.info.id === 'prime')!.queue.map(message => message.text);
+  const workerOne = () => swarmState().agents.find(agent => agent.id === 'worker-1');
+  const LATE_CHAT = 'abababab-5555-4444-3333-222222222222';
+
+  it('rejoins its live run and the prime is told to expect its result', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first half' }, { task: 'second half' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      const first = await redeem(new URL(opened[0]!).searchParams.get('clf')!);
+      const second = await redeem(new URL(opened[1]!).searchParams.get('clf')!, 'tab-2');
+      expect((await request('POST', '/commands/ack', { body: { id: second.id, status: 'sent',
+        conversationId: 'cdcdcdcd-5555-4444-3333-222222222222', agent: second.agent, client: 'tab-2' } })).status).toBe(200);
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      expect(workerOne()?.state).toBe('failed');
+
+      const late = await ack(first.id, LATE_CHAT);
+      expect(late.status).toBe(200);
+      expect(late.body).toMatchObject({ final: true, committed: true, conversationId: LATE_CHAT });
+      expect(workerOne()).toMatchObject({ state: 'active', conversationId: LATE_CHAT });
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late\] .*do not redo its work/);
+      // A retried ACK after a lost response gets the same final answer, and changes nothing.
+      expect((await ack(first.id, LATE_CHAT)).body).toEqual(late.body);
+      expect(primeReports().filter(text => text.startsWith('[worker-1 started late]'))).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('wakes its parked run when it was the last worker', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'the only half' }], caller: { conversationId: PRIME_CHAT } });
+      const bootstrap = await redeem();
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      expect(swarmRunning()).toBe(false);
+
+      const late = await ack(bootstrap.id, 'abababab-7777-4444-3333-222222222222');
+      expect(late.body, JSON.stringify(late.body)).toMatchObject({ final: true, committed: true });
+      expect(swarmRunning()).toBe(true);
+      expect(workerOne()).toMatchObject({ state: 'active', conversationId: 'abababab-7777-4444-3333-222222222222' });
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late\]/);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('is fenced as a stray when its slot went to a replacement, and the prime is told', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first half' }, { task: 'second half' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      const first = await redeem(new URL(opened[0]!).searchParams.get('clf')!);
+      const second = await redeem(new URL(opened[1]!).searchParams.get('clf')!, 'tab-2');
+      await request('POST', '/commands/ack', { body: { id: second.id, status: 'sent',
+        conversationId: 'cdcdcdcd-5555-4444-3333-222222222222', agent: second.agent, client: 'tab-2' } });
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      // The prime did what the failure report told it to: it started a replacement.
+      spawn({ workers: [{ task: 'first half, again' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(3));
+      const replacement = await redeem(new URL(opened[2]!).searchParams.get('clf')!, 'tab-3');
+      await request('POST', '/commands/ack', { body: { id: replacement.id, status: 'sent',
+        conversationId: 'efefefef-5555-4444-3333-222222222222', agent: replacement.agent, client: 'tab-3' } });
+
+      const late = await ack(first.id, LATE_CHAT);
+      expect(late.status).toBe(200);
+      expect(late.body).toMatchObject({ final: true, committed: false, conversationId: LATE_CHAT });
+      expect(retiredWorkerForConversation(LATE_CHAT)).toMatchObject({ id: 'worker-1' });
+      expect(swarmState().agents.filter(agent => agent.conversationId === LATE_CHAT)).toEqual([]);
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late, outside the run\] .*tool calls are refused/);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('takes no late ACK from a page other than the one that claimed it', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'the only half' }], caller: { conversationId: PRIME_CHAT } });
+      const bootstrap = await redeem();
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      const otherChat = 'abababab-6666-4444-3333-222222222222';
+      expect((await ack(bootstrap.id, otherChat, 'another-tab')).status).toBe(404);
+      expect(swarmRunning()).toBe(false);
+      expect(retiredWorkerForConversation(otherChat)).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+});
+
 // --------------------------------------------------- unattributed recovery
 
 /**
@@ -8670,6 +8854,108 @@ describe('unattributed activity recovery', () => {
       expect(await maintenance()).toBeNull();
       await vi.advanceTimersByTimeAsync(180_000);
       expect(await maintenance()).toBeNull();
+    } finally { vi.useRealTimers(); }
+  });
+
+  // Upstream d1170dfb/db04ea9e: an observed history 429 holds automatic recovery to its deadline.
+  it('holds automatic recovery until the history Retry-After deadline and exposes that wait', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limited')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      const retryAt = Date.now() + CHAT_SILENCE_MS + 60_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limited', recoverable: false, blocking: true,
+        retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+      const session = (await findSessionByConversation(PRIME))!;
+      expect((await sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'provider-limit', deadline: retryAt }]);
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toBeNull();
+      // The queued silence repair owns the notice; the provider deadline extends it.
+      expect((await sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'silence', deadline: retryAt }]);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await maintenance()).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('refuses a pre-existing repair handout while a newer history Retry-After is active', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limit-race')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      const handout = await maintenance();
+      expect(handout).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+      const retryAt = Date.now() + 31_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limit-race', recoverable: false, blocking: true,
+        retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      // The refusal names the chat, the repair and the refusing condition, once a minute.
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      expect(getLog().filter(entry => entry.message ===
+        `bridge: automatic silence recovery for ${PRIME} withheld — the page's claim was refused: ChatGPT is limiting its history`)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(31_001);
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  // Upstream #1936 (2026-10-30): a 327k-token chat was limited for half an hour while every reload
+  // after the 60-second hold drew another 429.
+  it('backs off further each time a retry after the history limit is limited again', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limit-streak')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      const session = (await findSessionByConversation(PRIME))!;
+      const limited = async (retryAfterMs: number) => {
+        await events(PRIME, [{ kind: 'chat_error', time: Date.now(), turnId: 'history-limit-streak', recoverable: false,
+          blocking: true, retryAt: Date.now() + retryAfterMs, text: 'ChatGPT temporarily rate-limited loading this conversation history.' }]);
+        const [hold] = (await sessionControlsFor(session.id)).recovery ?? [];
+        return hold!.deadline - Date.now();
+      };
+      expect(await limited(60_000)).toBe(60_000);
+      // A second limit inside the first hold is the same episode, not a failed retry.
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(await limited(60_000)).toBe(60_000);
+      for (const expected of [120_000, 240_000, 480_000, 900_000, 900_000]) {
+        const [hold] = (await sessionControlsFor(session.id)).recovery ?? [];
+        await vi.advanceTimersByTimeAsync(hold!.deadline - Date.now() + 1_000);
+        expect(await limited(60_000)).toBe(expected);
+      }
+      expect(getLog().filter(entry => entry.message.includes(`${PRIME} history was limited again after its wait`))
+        .map(entry => /holding automatic recovery (\d+) minutes/.exec(entry.message)?.[1])).toEqual(['2', '4', '8', '15', '15']);
+      // A longer Retry-After from ChatGPT still wins.
+      const [held] = (await sessionControlsFor(session.id)).recovery ?? [];
+      await vi.advanceTimersByTimeAsync(held!.deadline - Date.now() + 1_000);
+      expect(await limited(20 * 60_000)).toBe(20 * 60_000);
+      // A limit that returns after a quiet quarter of an hour starts over.
+      await vi.advanceTimersByTimeAsync(20 * 60_000 + 15 * 60_000 + 1_000);
+      expect(await limited(60_000)).toBe(60_000);
     } finally { vi.useRealTimers(); }
   });
 
@@ -12521,6 +12807,117 @@ describe('the goal loop over the bridge', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('defers the queued Goal cold-browser startup until a history Retry-After expires', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = 'cafe0174-0000-4000-8000-000000000174';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-cold-limit' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'g-cold-limit' },
+        { kind: 'turn_end', time: Date.now(), turnId: 'g-cold-limit', outcome: 'completed' },
+        { kind: 'assistant_message', time: Date.now(), turnId: 'g-cold-limit', messageId: 'a-cold-limit', text: 'First part done.',
+          state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } });
+      expect(goalPendingReplyFor(chat)).not.toBeNull();
+      const retryAt = Date.now() + 3 * 60_000;
+      await request('POST', '/events', { body: { conversationId: chat, events: [{
+        kind: 'chat_error', time: Date.now(), recoverable: false, blocking: true, retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }] } });
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await sweepStaleSwarm(Date.now());
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+      // The pickup is not even queued inside the limit (#1936), so the start comes with the
+      // first maintenance pass after Retry-After.
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+      await sweepStaleSwarm(Date.now());
+      await vi.advanceTimersByTimeAsync(1);
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+      expect(await recoveryBrowserWake.mock.calls[0]?.[3]?.current()).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('cold-starts again after Retry-After when an unclaimed Goal handout lost its browser', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = 'cafe0176-0000-4000-8000-000000000176';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-handed-limit' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'g-handed-limit' },
+        { kind: 'turn_end', time: Date.now(), turnId: 'g-handed-limit', outcome: 'completed' },
+        { kind: 'assistant_message', time: Date.now(), turnId: 'g-handed-limit', messageId: 'a-handed-limit', text: 'First part done.',
+          state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } });
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await sweepStaleSwarm(Date.now());
+      const handout = (await request('GET', '/status')).body.repairs?.[0];
+      expect(handout).toMatchObject({ conversationId: chat, reason: 'goal' });
+      recoveryBrowserWake.mockClear();
+      const retryAt = Date.now() + 31_000;
+      await request('POST', '/events', { body: { conversationId: chat, events: [{
+        kind: 'chat_error', time: Date.now(), recoverable: false, blocking: true, retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }] } });
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+      // The handed token stays unclaimed while the browser is absent; the app-side deadline owns
+      // one cold start when Retry-After expires.
+      await vi.advanceTimersByTimeAsync(31_001);
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+      expect(await recoveryBrowserWake.mock.calls[0]?.[3]?.current()).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  // Upstream #1936 (2026-10-30): reload 1 was counted when queued, sat seven minutes behind the
+  // history limit, and reload 2 followed it 61 seconds later, still inside the limit.
+  it('spends no pickup reload while the history limit holds, and keeps the full gap after a delayed one', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = 'cafe0178-0000-4000-8000-000000000178';
+      const goal = await import('../src/main/goal.js');
+      await goal.setGoalSwitchNow(chat, 'goal', true);
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'work', messageId: 'limited-pickup-user' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'limited-pickup-turn' }
+      ] } });
+      await vi.advanceTimersByTimeAsync(1);
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'turn_end', time: Date.now(), turnId: 'limited-pickup-turn', outcome: 'completed' },
+        { kind: 'assistant_message', time: Date.now(), messageId: 'limited-pickup-final', turnId: 'limited-pickup-turn',
+          text: 'First part done.', state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } });
+      const repairFor = async () => (await request('GET', '/status')).body.repairs
+        ?.find((item: { conversationId: string }) => item.conversationId === chat);
+      await vi.advanceTimersByTimeAsync(2 * 60_000 - 10_000);
+      const retryAt = Date.now() + 7 * 60_000;
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'chat_error', time: Date.now(), recoverable: false, blocking: true, retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.' }
+      ] } });
+      for (let minute = 0; minute < 6; minute++) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await sweepStaleSwarm(Date.now());
+        expect(await repairFor(), `no reload inside the limit (minute ${minute + 1})`).toBeUndefined();
+      }
+      expect(getLog().filter(entry => entry.message.includes(`next automation/input step in ${chat} waits for its history limit`))).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(retryAt - Date.now() + 1_000);
+      await sweepStaleSwarm(Date.now());
+      const first = await repairFor();
+      expect(first).toMatchObject({ reason: 'goal' });
+      await request('GET', `/status?repaired=${first.token}&repairAction=reloaded`);
+
+      // The second reload keeps its full five-minute gap from the reload that actually ran.
+      await vi.advanceTimersByTimeAsync(5 * 60_000 - 10_000);
+      await sweepStaleSwarm(Date.now());
+      expect(await repairFor()).toBeUndefined();
+      await vi.advanceTimersByTimeAsync(20_000);
+      await sweepStaleSwarm(Date.now());
+      expect(await repairFor()).toMatchObject({ reason: 'goal' });
+    } finally { vi.useRealTimers(); }
+  });
+
   it('gives a queued head the bounded pickup schedule without an enabled Goal', async () => {
     const { enqueueInput, cancelInput, reorderQueuedInputs, resetInputForTests } = await import('../src/main/session/input.js');
     vi.useFakeTimers();
@@ -12564,6 +12961,85 @@ describe('the goal loop over the bridge', () => {
       await writeDurableNow('session-input', []);
       resetInputForTests();
       vi.useRealTimers();
+    }
+  });
+
+  // Upstream #1960 (2026-10-31): an automatic Continue the app itself withheld was "uncollected";
+  // the pickup reloaded the chat three times for it and nothing said which gate held it.
+  it('spends no reload on a queued message the app does not offer, and says which gate holds it', async () => {
+    vi.useFakeTimers();
+    const input = await import('../src/main/session/input.js');
+    const { resetInputForTests, enqueueInput } = input;
+    resetInputForTests();
+    const id = 'abca0176-0000-4000-8000-000000000176';
+    try {
+      await writeDurableNow('session-input', []);
+      await pair();
+      const chat = 'cafe0176-0000-4000-8000-000000000176';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'work', messageId: 'withheld-user' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'withheld-turn' }
+      ] } });
+      const session = (await findSessionByConversation(chat, { requireUnique: true }))!;
+      await enqueueInput({ id, sessionId: session.id, text: 'next step', mode: 'after-turn', dueAt: Date.now(), model: null, reasoningEffort: null });
+      await vi.advanceTimersByTimeAsync(1);
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'turn_end', time: Date.now(), turnId: 'withheld-turn', outcome: 'completed' }
+      ] } });
+      await recordFinalForTest(chat, 'withheld-turn');
+      withheldInput.id = id; withheldInput.reason = 'an earlier queued message of this chat (x) goes first';
+      for (const minutes of [2, 5, 10]) {
+        await vi.advanceTimersByTimeAsync(minutes * 60_000);
+        await sweepStaleSwarm(Date.now());
+        expect((await request('GET', '/status')).body.repairs?.some((repair: { conversationId: string }) => repair.conversationId === chat) ?? false).toBe(false);
+      }
+      const lines = getLog().filter(entry => entry.message.includes(`next automation/input step in ${chat} is not offered to the page`));
+      expect(lines.length).toBeGreaterThan(0);
+      expect(lines.length).toBeLessThanOrEqual(17);
+      expect(lines[0]!.message).toBe(`bridge: next automation/input step in ${chat} is not offered to the page — an earlier queued message of this chat (x) goes first; no reload is spent on it`);
+      // Once the gate opens, the ordinary pickup schedule takes over again.
+      withheldInput.id = null;
+      await vi.advanceTimersByTimeAsync(30_000);
+      await sweepStaleSwarm(Date.now());
+      expect((await request('GET', '/status')).body.repairs?.[0]).toMatchObject({ conversationId: chat, reason: 'goal' });
+    } finally {
+      withheldInput.id = null;
+      await writeDurableNow('session-input', []);
+      resetInputForTests();
+      vi.useRealTimers();
+    }
+  });
+
+  it('names the gate that holds a queued message from the page, and none for one it offers', async () => {
+    const input = await import('../src/main/session/input.js');
+    const { resetInputForTests, enqueueInput, claimBrowserInput, queuedInputOfferBlocker } = input;
+    resetInputForTests();
+    try {
+      await writeDurableNow('session-input', []);
+      await pair();
+      const chat = 'cafe0177-0000-4000-8000-000000000177';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'work', messageId: 'gate-user' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'gate-turn' }
+      ] } });
+      const session = (await findSessionByConversation(chat, { requireUnique: true }))!;
+      const first = 'abca0177-0000-4000-8000-000000000001', second = 'abca0177-0000-4000-8000-000000000002', later = 'abca0177-0000-4000-8000-000000000003';
+      for (const id of [first, second]) await enqueueInput({ id, sessionId: session.id, text: id, mode: 'after-turn', dueAt: Date.now(), model: null, reasoningEffort: null });
+      await enqueueInput({ id: later, sessionId: session.id, text: 'later', mode: 'after-turn', dueAt: Date.now() + 60 * 60_000, model: null, reasoningEffort: null });
+      expect(await queuedInputOfferBlocker(first)).toBe("its chat's turn is still running");
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'turn_end', time: Date.now(), turnId: 'gate-turn', outcome: 'completed' }
+      ] } });
+      await recordFinalForTest(chat, 'gate-turn');
+      expect(await queuedInputOfferBlocker(first)).toBeNull();
+      expect(await queuedInputOfferBlocker(second)).toBe(`an earlier queued message of this chat (${first}) goes first`);
+      expect(await queuedInputOfferBlocker(later)).toBe('it is not due yet');
+      expect(await claimBrowserInput(first, 'page-owner', chat)).toBeTruthy();
+      expect(await queuedInputOfferBlocker(second)).toBe(`another message of this chat (${first}) is still being sent`);
+      expect(await queuedInputOfferBlocker(first)).toBe('it is no longer queued');
+    } finally {
+      await writeDurableNow('session-input', []);
+      resetInputForTests();
     }
   });
 

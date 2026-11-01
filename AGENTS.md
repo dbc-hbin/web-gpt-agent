@@ -641,6 +641,14 @@ only those bounded format fields per HTTP response, or per linked conversation/t
 stream. Missing predecessors, malformed/unknown encoding and retired streams discard that
 state. Identity still requires both ids in one complete root value; partial values, message
 text and cached answer branches never supply the join.
+The same fetch wrapper passively observes same-origin `GET /backend-api/conversation(s)/<uuid>`
+responses that return HTTP 429. It reads no body, request headers, cookies or credentials: only the
+exact conversation id and a bounded deadline are projected as `cos-history-rate-limit`
+(`{conversationId, retryAt, observedAt}`). `Retry-After` (seconds or HTTP date), then
+`x-oai-history-initial-retry-after`, set the deadline; a missing or unusable value gets a fixed
+60-second local cooldown that is not presented as a provider deadline. Content accepts the
+projection only for its current exact route and records one blocking, non-recoverable
+`chat_error` with `retryAt` per deadline (§14 history hold).
 A 64-pair document cache deduplicates both transports and replays IDs at content readiness.
 Content requires the matching route and document epoch, retaining one-shot stream proof through
 temporary ACK failures for at most 15 minutes using the existing observer/backoff. Missing stream
@@ -2169,7 +2177,14 @@ unchanged rows, provider identity/HTML/time enrichment and same-item label revis
 An adopted document's first Fiber transcript is a history baseline; subsequent new work is
 compared using the existing retained snapshot and stable message identities. Canonical `seq`
 remains a delivery cursor; `contentSeq`/origin tracks actual work. Explicit historical backfill
-has no new work stamp. Recent-work reads cannot let a late old-row revision hide newer work.
+has no new work stamp. A non-final assistant note tagged with a turn the recorder has seen end, and not
+reopened, stays in history without a work stamp even when reported as just appeared (ChatGPT can
+draw a finished turn's pre-tool progress note only when it collapses that turn's steps). The
+recorder logs the first such report once. `readCompletedFinal` and the finish-turn work stamp
+apply the same rule from the stored owner and turn index, so older saved notes, notes of turns
+before a restart and notes re-reported without a turn id settle too. A final, a note of another
+newer turn, a turn the same request reopened, or a fresh note reopening a thinking-failed turn
+still count as work. Recent-work reads cannot let a late old-row revision hide newer work.
 An existing user message reserialized after reload keeps its work stamp unless the recorder
 observed it as newly authored. Its text and history cursor still update. A different user
 message identity remains new work. Historical text changes cannot cancel a pending Continue
@@ -2294,6 +2309,22 @@ Goal pickup. Genuine new work in the same batch keeps its ordinary rearming auth
 accepted terminal boundary still retires its pending repair, including after handout. Ordinary
 chats retain their no-reload behavior for these blocking notices; no new grant comes from a dialog.
 
+**History 429 hold.** A blocking `chat_error` carrying `retryAt` comes only from an observed
+conversation-history HTTP 429 (§12 `usage.js`), a signal distinct from the access dialog above.
+The bridge keeps an in-memory `providerHistoryBackoffUntil` per chat. While it is live it delays
+every queued repair's `notBefore`, refuses `/repairs/claim`, and replaces future recovery notices
+with a read-only `provider-limit` countdown (a handed repair keeps its own row). It never creates
+recovery authority. A deferred Goal/compaction repair whose browser is gone gets one cold start
+from the existing silence timer once the hold ends. Repeated limits escalate: a limit seen after
+the previous hold ran out is a failed retry and holds at least 2, 4, 8, then 15 minutes; a limit
+inside a running hold or a replayed notice is the same episode; ChatGPT's longer Retry-After wins;
+a limit after 15 quiet minutes starts over. Each longer hold logs `history was limited again after
+its wait (retry N)`. The 2/5/10/15 pickup schedule is neither queued nor counted inside a hold: the
+pickup logs once per hold that it `waits for its history limit to end` and runs on the first
+maintenance pass after it, keeping its full gap to the next reload. A restart clears the hold and
+its escalation. The recorder writes an identical repeated history-limit notice once within 30
+minutes of the newest blocking error; its stored `retryAt` is the first deadline, not authority.
+
 | Trigger | Required meaning |
 | --- | --- |
 | Missing tab | Current non-retired binding plus still-owed/live work and recovery policy; ordinary chats need recorded tool work, workers use broker attachment state. |
@@ -2344,6 +2375,14 @@ CSS to that same document. Navigation cannot carry a recorder without its adapte
 replacement document; missing document proof or injection failure grants no new tab opening.
 First sightings and announced states share one bounded map, reset with the bridge. Repeated no-tab/stalled refusals
 are logged once per chat/cause/minute; handout logs and confirmed browser-action logs remain distinct.
+Every other automatic recovery refusal or withdrawal uses the same bounded set through
+`noticeRecoveryWithheld`: one line `bridge: automatic <reason> recovery for <chat> withheld — <condition>`
+per chat/reason/condition/minute. It covers `queueBrowserRecovery` refusals (no session, worker slot not
+working, blocked, user Stop, spent error budget, a repair already held), a page claim refused at
+`/repairs/claim` (naming the first failing check, including the history-limit hold and in-flight
+event writes), queued repairs dropped at handout (closed page, stale source) and silence the
+watchdog spends without a reload (no MCP/native-failure proof, blocked, every recovery switch off,
+superseded source). The line is diagnostic only; it neither grants nor revokes a browser action.
 Assistant-error repairs retain their three-minute cooldown. Attribution, silence, Goal,
 compaction and no-tab follow their own eligibility and schedules.
 Marked continuation outcomes use a bounded per-chat/token/outcome diagnostic set. Replayed
@@ -2365,6 +2404,10 @@ A claimed attempt is never reissued on missing acknowledgement. Progress stays a
 the original source turn. A recoverable transport banner does not end a natively generating
 turn; exact Thinking failed uses the activity-based two/five-minute silence rule. Exact native final evidence
 supersedes a stale transport banner and retains ordinary Goal/Loop eligibility.
+A recoverable `chat_error` naming a turn that already ended while a newer turn exists (by recorder
+`origin`, not clock) is stale: a page kept through recovery can retain the old turn's stall clock.
+It is logged and ignored, checked again after the yielding repair-source read. A report for the
+current or a still-open turn, a turn with no newer successor, or one without a turn id is unchanged.
 
 Automatic response recovery follows the shared decision and conditional busy wait above.
 Authored queue delivery retains its own input eligibility under §11 and takes precedence over
@@ -2382,6 +2425,16 @@ custody; status polling does not issue a fresh token. Startup restores eligible 
 with the normal first grace period. A twelve-hour source age retires automatic pickup authority
 without deleting queued text. Newer questions veto older Goal debt. Fresh
 source/session/stop/block/continuation and listening checks apply again at repair handout.
+A queued input the app itself does not offer to pages (`input.ts::queuedInputOfferBlocker`
+names the first gate, in `pendingBrowserInputs` order) spends no pickup reload: the bridge logs
+`next automation/input step in <chat> is not offered to the page — <gate>; no reload is spent on it`
+once per chat/input/gate/minute (upstream #1960). Upstream's conversion of an untaken automatic
+Continue into an ordinary message is not ported. A retried pickup that reaches its twelve-hour
+lifetime logs one warning and writes one timeline progress row saying recovery ended and the
+step stays saved. Compaction `writing`/`opening` tickets past their quick pickups keep one pickup
+every 15 minutes within the ticket's own lifetime (the pickup is idempotent: stable marker or the
+destination pre-Send checkpoint) and keep one mutable timeline row saying so; the `asking`
+abandonment after five unsent pickups is unchanged and already writes its abandonment note.
 Publishing a repair wakes the extension over the existing authenticated socket; due repairs run
 before window layout, input preparation and idle-tab pruning. The MV3 30-second maintenance
 alarm remains a recovery cadence, not the normal pickup path.
@@ -2653,6 +2706,18 @@ it does not consume the two-attempt terminal failure budget. Only a document-own
 consume that budget. An unclaimed wait neither resets earlier owned failures nor permits automatic
 replay of an ambiguous owned send. The three-minute delivery deadline and native readiness checks
 remain unchanged.
+**Late worker starts.** A worker command that expires after a page claimed it, with no
+page-reported failure, is a late-start candidate for `LATE_START_WINDOW_MS` (15 minutes, in memory,
+at most 32): on a memory-starved machine a page's reports reached the app 20-90 s after it sent
+(upstream #1644/#1086). A `sent` ACK with a conversation from the page that claimed it is then
+settled once by `agents.ts::adoptLateWorker`, durable before it is answered. The same failed worker
+rejoins its family (live, or parked and reactivated) when its chat and a slot are free; its inbox
+is restored and the prime gets `[worker-N started late]` (timeline title "worker-N started late").
+Otherwise a free chat goes on the retired-worker fence and the prime gets `[worker-N started late,
+outside the run]` with the reason. A retried ACK replays the stored receipt; any other late ACK is
+still `no_such_command`. The page side looks for a worker's new chat id for up to
+`WORKER_RECEIPT_WAIT_MS` (10 minutes) within its exact send lifetime, and re-sends the ACK with
+2-30 s backoff while the extension gives no answer; a resume keeps its original 40 s bound.
 Historical worker failures remain visible in status and history, but only live workers produce
 the transient waiting caption. A current canonical final
 uses the same completion reader as Continue/Goal and releases the worker before silence,
@@ -2958,7 +3023,8 @@ status updates preserve the user's current disclosure state.
 
 The recovery row above Goal/Loop shows read-only countdowns from `bridge.ts::sessionControlsFor`:
 activity-based silence and confirmed reload listening, an outbox/Goal native-busy deferral, and each unresolved
-attribution incident's exact candidate deadline. `renderer/recovery.ts` updates only the seconds
+attribution incident's exact candidate deadline. A live history-429 hold projects a
+`provider-limit` row that says when retry is checked and never promises a reload. `renderer/recovery.ts` updates only the seconds
 using the existing visible-chat clock; zero says checking/pending, never sent/reloaded. Fresh
 work or attribution removes the relevant countdown, and native busy projects the same owner's
 extended deadline. Pro silence becomes visible after five minutes without work and counts

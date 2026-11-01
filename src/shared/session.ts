@@ -398,7 +398,8 @@ export type SessionEvent =
    */
   | (BaseEvent & { kind: 'turn_start'; detail?: string })
   | (BaseEvent & { kind: 'turn_end'; outcome: TurnOutcome; detail?: string; reason?: 'thinking_failed' | 'thinking_stopped' })
-  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; reason?: 'thinking_failed' | 'thinking_stopped' })
+  /** `retryAt` is the first history Retry-After ChatGPT gave for this notice; the live hold is the bridge's. */
+  | (BaseEvent & { kind: 'chat_error'; message: StoredText; recoverable?: boolean; blocking?: boolean; retryAt?: number; reason?: 'thinking_failed' | 'thinking_stopped' })
   | (BaseEvent & { kind: 'tool_call'; call: ToolCallRecord; origin?: number })
   /**
    * An app-authored line. `continuation` names the Compact & Resume it is about, so the
