@@ -105,6 +105,29 @@ it('reports a clean repository and a non-repository without inventing changes', 
   expect(await readProjectGitSnapshot(plain.id)).toMatchObject({ state: 'not-repository', changes: [] });
 });
 
+it('reads a repository outside the approved folders only with all-files access', async () => {
+  // The worktree root and .git sit above the approved folder; the project is inside it.
+  const repository = directory;
+  await git(repository, 'init');
+  await git(repository, 'config', 'user.email', 'test@example.com');
+  await git(repository, 'config', 'user.name', 'CoS Test');
+  const projectRoot = path.join(approved, 'nested');
+  await fs.mkdir(projectRoot);
+  await fs.writeFile(path.join(projectRoot, 'app.ts'), 'export const value = 1;\n');
+  await git(repository, 'add', '.');
+  await git(repository, 'commit', '-m', 'baseline');
+  const project = await addProject(projectRoot);
+  expect(await readProjectGitSnapshot(project.id)).toMatchObject({
+    state: 'unavailable', message: 'The Git repository metadata is outside the approved folders'
+  });
+
+  await saveConfig({ ...defaultConfig(), roots: [{ name: 'work', path: approved }], fileAccessMode: 'all-files' });
+  await fs.writeFile(path.join(projectRoot, 'app.ts'), 'export const value = 2;\n');
+  const snapshot = await readProjectGitSnapshot(project.id);
+  expect(snapshot.state, snapshot.message).toBe('ready');
+  expect(snapshot.changes.map(change => [change.status, change.path])).toEqual([['M', 'app.ts']]);
+});
+
 it('compares committed branch history without changing the checkout or including local edits', async () => {
   const { root, id } = await committedProject();
   const original = (await exec('git', ['branch', '--show-current'], { cwd: root })).stdout.trim();

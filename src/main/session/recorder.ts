@@ -29,7 +29,7 @@ import type {
   ToolOutcome,
   TurnOutcome
 } from '../../shared/session.js';
-import { estimateTokens, originTitle } from '../../shared/session.js';
+import { estimateTokens, isWorkerAgent, originTitle } from '../../shared/session.js';
 import { chatErrorMessageKey } from '../../shared/chat-error.js';
 import { overlappingRequestTurns, recordedRequestTurn, responseTurnId } from '../../shared/chronology.js';
 import { getConfig } from '../config.js';
@@ -1336,7 +1336,7 @@ async function fileToolCall(
         callModel = { model: selection.model, ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}) };
       }
       const origin = sessionSummary?.origin;
-      if (origin?.kind === 'worker' && origin.agentId && /^worker-\d+$/.test(origin.agentId)) {
+      if (origin?.kind === 'worker' && isWorkerAgent(origin.agentId)) {
         // Request/session ownership is older and stronger than whatever live broker role this
         // conversation may hold now. A stale request from worker-1 must stay worker-1 even if
         // the same ChatGPT conversation later participates in another run as prime.

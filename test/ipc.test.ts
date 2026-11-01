@@ -9,6 +9,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
+import type { IpcClientLease } from '../src/main/ipc.js';
 
 type Handler = (event: unknown, payload: unknown) => Promise<unknown>;
 const handlers = new Map<string, Handler>();
@@ -68,6 +69,7 @@ const { app, nativeTheme, safeStorage, shell, dialog } = await import('electron'
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
 
 let dir: string;
+let lease: IpcClientLease;
 let currentWindow: {
   setBackgroundColor: ReturnType<typeof vi.fn>;
   setTitleBarOverlay: ReturnType<typeof vi.fn>;
@@ -422,6 +424,49 @@ it('does not install a stale Git watch after a newer Files project watch', async
   }
 });
 
+it('closes the Git watch too and retires an in-flight watch on root removal and client disposal', async () => {
+  const { ProjectFileWatchSet } = await import('../src/main/project-file-watcher.js');
+  const { ProjectGitWatchSet } = await import('../src/main/project-git.js');
+  const contents = Object.assign(new EventEmitter(), { send: vi.fn(), isDestroyed: () => false });
+  currentWindow = { isDestroyed: () => false, webContents: contents } as unknown as typeof currentWindow;
+  const projectId = '11111111-1111-4111-8111-111111111111';
+  await saveConfig({ ...defaultConfig(), roots: [{ name: 'project', path: 'C:\\Users\\example\\project' }] });
+  const gitClose = vi.spyOn(ProjectGitWatchSet.prototype, 'close');
+  const gitSync = vi.spyOn(ProjectGitWatchSet.prototype, 'sync').mockResolvedValue();
+  let finish!: () => void;
+  let started = Promise.withResolvers<void>();
+  const fileSync = vi.spyOn(ProjectFileWatchSet.prototype, 'sync').mockImplementation(() => {
+    const deferred = Promise.withResolvers<void>();
+    finish = deferred.resolve;
+    started.resolve();
+    return deferred.promise;
+  });
+  try {
+    const watch = (): Promise<unknown> => handlers.get('projectFiles:watch')!(null, { projectId, directories: [''] });
+    const pendingRemove = watch();
+    await started.promise;
+    const beforeRemove = gitClose.mock.calls.length;
+    expect((await removeRoot({ name: 'project' })).ok).toBe(true);
+    expect(gitClose.mock.calls.length).toBe(beforeRemove + 1);
+    finish();
+    expect(await pendingRemove).toMatchObject({ ok: true, data: false });
+
+    started = Promise.withResolvers<void>();
+    const pendingDispose = watch();
+    await started.promise;
+    const beforeDispose = gitClose.mock.calls.length;
+    lease.disposeClient();
+    expect(gitClose.mock.calls.length).toBe(beforeDispose + 1);
+    finish();
+    expect(await pendingDispose).toMatchObject({ ok: true, data: false });
+    expect(gitSync).not.toHaveBeenCalled();
+  } finally {
+    fileSync.mockRestore();
+    gitSync.mockRestore();
+    gitClose.mockRestore();
+  }
+});
+
 /** The whole settings object the renderer sends, with the parts a test cares about set. */
 function settings(over: { record: boolean; multiAgent: boolean }) {
   const base = defaultConfig();
@@ -448,7 +493,7 @@ beforeAll(async () => {
   onSwarmPersistNow((snapshot) => writeDurableNow('ipc-swarm', snapshot));
   onRetiredWorkersPersist(() => writeDurableSoon('ipc-retired-workers', snapshotRetiredWorkers()));
   onRetiredWorkersPersistNow((snapshot) => writeDurableNow('ipc-retired-workers', snapshot));
-  registerIpc(() => currentWindow as any);
+  lease = registerIpc(() => currentWindow as any);
 });
 
 afterAll(async () => {

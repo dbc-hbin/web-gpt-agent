@@ -7,10 +7,8 @@
  * guesses. A worker's edits belong to the worker's own answers.
  */
 
-import type { SessionEvent } from '../../shared/session.js';
+import { isWorkerAgent, type SessionEvent } from '../../shared/session.js';
 import { lineDelta } from '../diffstat.js';
-
-const WORKER = /^worker-\d+$/;
 
 export interface EditAt { callId: string; index: number; assetId?: string }
 
@@ -35,7 +33,7 @@ export function turnFileEdits(events: readonly SessionEvent[], turnId: string): 
   const files = new Map<string, TurnFileEdits>();
   const firstMissing = new Map<string, boolean>();
   for (const event of events) {
-    if (event.kind !== 'tool_call' || event.turnId !== turnId || (event.agent && WORKER.test(event.agent))) continue;
+    if (event.kind !== 'tool_call' || event.turnId !== turnId || isWorkerAgent(event.agent)) continue;
     if (event.call.outcome !== 'ok') continue;
     const kind = event.call.summary.kind;
     for (const [index, change] of (event.call.changes ?? []).entries()) {

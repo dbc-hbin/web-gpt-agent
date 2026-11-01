@@ -10,8 +10,8 @@ import { CHECKPOINT_REF_PREFIX, type CheckpointRestoreResult, type ProjectGitSna
 import { getConfig } from '../config.js';
 import { logInfo, logWarn } from '../logger.js';
 import { currentCall } from '../mcp/call-context.js';
-import { projectRestoreTarget, revalidateProjectFileTarget } from '../project-files.js';
-import { decode, readProjectGitSnapshot, repositoryContext, runGit, withTemporaryIndex, type RepositoryContext } from '../project-git.js';
+import { projectRestoreTarget, revalidateProjectRestoreTarget } from '../project-files.js';
+import { decode, readProjectGitSnapshot, repositoryContext, repositoryPath, runGit, withTemporaryIndex, type RepositoryContext } from '../project-git.js';
 import { rawPromises as fs } from '../rawfs.js';
 import { isContained } from '../sandbox.js';
 import { getSession } from '../session/store.js';
@@ -201,10 +201,6 @@ async function hashFile(git: Git, repoPath: string, real: string): Promise<strin
   return oid;
 }
 
-function repositoryPath(context: RepositoryContext, relative: string): string {
-  return context.prefix ? context.prefix + '/' + relative : relative;
-}
-
 /**
  * A Git tree cannot be restored as a file path. If a checkpoint wants a folder where the
  * working tree has a file, or a file where it has a folder, skip that whole path group before
@@ -259,21 +255,27 @@ async function restoreFile(context: RepositoryContext, fromTree: string, guardTr
   const content = wanted ? await git(['cat-file', '--filters', `${fromTree}:${repoPath}`], MAX_RESTORE_FILE_BYTES) : null;
   if (content && content.code !== 0) return 'failed';
   const target = await projectRestoreTarget(context.projectId, relative);
-  if (content) await fs.mkdir(path.dirname(target.real), { recursive: true });
-  // Last check before the write: a file edited since the guard snapshot is left alone.
-  if (await currentOid() !== observed) return 'changed';
+  // Last checks before the pathname mutation: a file edited since the guard snapshot, or a
+  // target/parent that moved since it was resolved, is left alone.
+  const unchanged = async (): Promise<boolean> => {
+    if (await currentOid() !== observed) return false;
+    try { await revalidateProjectRestoreTarget(target); } catch { return false; }
+    return true;
+  };
   if (!content) {
-    if (target.kind === 'file') {
-      await revalidateProjectFileTarget({ ...target, kind: 'file' });
-      await fs.rm(target.real);
-    }
+    if (target.kind !== 'file') return await currentOid() === observed ? 'restored' : 'changed';
+    if (!(await unchanged())) return 'changed';
+    await fs.rm(target.real);
     return 'restored';
   }
+  await fs.mkdir(path.dirname(target.real), { recursive: true });
   const previousMode = target.kind === 'file' ? (await fs.stat(target.real)).mode & 0o777 : 0o644;
   const mode = wanted!.mode === '100755' ? previousMode | 0o111 : previousMode & ~0o111;
   const temporary = `${target.real}.cos-restore-${randomBytes(6).toString('hex')}`;
   try {
+    // Stage the complete replacement first, so the final checks run right before the rename.
     await fs.writeFile(temporary, content.stdout, { flag: 'wx', mode });
+    if (!(await unchanged())) return 'changed';
     await fs.rename(temporary, target.real);
     await fs.chmod(target.real, mode).catch(() => undefined);
   } finally { await fs.rm(temporary, { force: true }).catch(() => undefined); }

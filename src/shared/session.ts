@@ -243,6 +243,11 @@ export interface ToolCallRecord {
 
 export type MessageState = 'streaming' | 'final';
 
+/** A swarm worker's agent id (`worker-1`, `worker-2`, ...), as opposed to the prime chat or a helper. */
+export function isWorkerAgent(agent: string | null | undefined): agent is string {
+  return !!agent && /^worker-\d+$/.test(agent);
+}
+
 /** A persisted launch acknowledgement never proves that its child is still alive. */
 export function toolCallSummary(call: Pick<ToolCallRecord, 'tool' | 'summary'>): ActivitySummary {
   return call.tool === 'exec_command' && call.summary.metric === 'running'

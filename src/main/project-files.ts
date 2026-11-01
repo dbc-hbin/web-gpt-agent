@@ -21,13 +21,14 @@ const MAX_IMAGE_PREVIEW_BYTES = 5 * 1024 * 1024;
 const MAX_PDF_PREVIEW_BYTES = 20 * 1024 * 1024;
 const activeSaves = new Set<string>();
 
-function sameFile(left: Stats, right: Stats): boolean {
+/** The same file, unchanged: identity plus size and modification/change times. */
+export function sameFile(left: Stats, right: Stats): boolean {
   return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
     left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
 }
 
-async function recheckTarget(target: Omit<ProjectFileTarget, 'kind'>): Promise<void> {
-  const current = await resolveTarget(target.projectId, target.path);
+async function recheckTarget(target: Omit<ProjectFileTarget, 'kind'>, allowMissing = false): Promise<void> {
+  const current = await resolveTarget(target.projectId, target.path, { allowMissing });
   if (!sameRealPath(current.real, target.real) || !sameRealPath(current.projectReal, target.projectReal)) {
     throw new Error('The project file changed location. Reload it before continuing.');
   }
@@ -48,6 +49,12 @@ async function recheckMutationParent(target: Omit<ProjectFileTarget, 'kind'>): P
 /** Revalidate an already-resolved Files target at the last practical pathname boundary. */
 export async function revalidateProjectFileTarget(target: ProjectFileTarget): Promise<void> {
   await recheckTarget(target);
+  await recheckMutationParent(target);
+}
+
+/** Like revalidateProjectFileTarget, for a restore whose leaf may not exist yet (its parent must). */
+export async function revalidateProjectRestoreTarget(target: Omit<ProjectFileTarget, 'kind'>): Promise<void> {
+  await recheckTarget(target, true);
   await recheckMutationParent(target);
 }
 

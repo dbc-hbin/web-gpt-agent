@@ -1318,7 +1318,10 @@ the claim visibly; after the click a missing receipt leaves the authorized claim
 ambiguous Send, never a retry. Retrying a failed edit from its dock row restores it as an edit of the
 same question when that question is loaded and still editable, asks the reader to scroll up when it
 is in unloaded older history, and otherwise restores a new message with a notice. An edit in progress
-is an unsent draft that a retry cannot replace. Switching back to an older version in ChatGPT's
+is an unsent draft that a retry cannot replace. An edit Send refused before the outbox kept it
+returns to the composer as that edit only while the composer still holds what the send left there
+(same ComposerDraftOwner and text, no other edit); otherwise the newer draft stays and the refused
+edit waits in the delivery dock as a failed row whose Retry delivery restores it. Switching back to an older version in ChatGPT's
 versions view is not handled (the app keeps showing the newest one it saw).
 
 ### Attachments have one staging owner
@@ -3325,7 +3328,9 @@ captures the existing ComposerDraftOwner before the await, so a later chat canno
 
 `src/main/project-git.ts` is the sole owner of the read-only Review projection. The renderer
 passes only a LocalProject UUID and project-relative path through fixed IPC; main re-resolves the
-approved project/root and Git metadata before reading status or a diff. Git inspection is strictly
+approved project/root and Git metadata before reading status or a diff (under the live file-access
+mode: Approved folders requires the worktree and Git metadata inside an approved root; All files
+does not). Git inspection is strictly
 read-only: it strips inherited Git repository/index redirects, uses optional-lock-free bounded
 subprocesses and exposes no stage, commit, reset, checkout or push authority. Review projects
 `M/A/D/R/U`, plus `C` for every unmerged index state (`DD/AU/UD/UA/DU/AA/UU`) so an
@@ -3340,7 +3345,9 @@ resolved. Review also projects ancestor-folder markers in the Files tree and bou
 (`createProjectDiffViewer`, `@codemirror/merge`). Review is a second `createFilePanel({ reviewOnly })`
 instance in the same right work slot as Files, Sub-agents and Work, with its own header toggle
 (`reviewPanelToggle`); opening one pane hides the others. The Files toolbar's Changes button opens
-Review. Review adds no second file watcher (it follows `projectGit:changed`) and exposes no
+Review. Review adds no second file watcher: the visible pane (Files or Review) owns the window's
+project watch, and an open Review registers only the project's Git watch (no folder watches), so
+it keeps following `projectGit:changed` after replacing Files. It exposes no
 Files write actions. It names the checked-out branch and offers a searchable, read-only comparison
 against locally known branch refs. Selecting a ref never switches branches or fetches remote
 data. The comparison shows committed changes from the selected ref's merge base to current HEAD,

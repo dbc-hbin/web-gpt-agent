@@ -67,6 +67,12 @@ const cleanGit = (project = projectA): ProjectGitSnapshot => ({
   projectId: project.id, state: 'ready', changes: [], truncated: false, revision: 'clean'
 });
 const tick = async (): Promise<void> => { await Promise.resolve(); await Promise.resolve(); await new Promise(resolve => setTimeout(resolve, 0)); };
+/** Runs a watch event under fake timers and advances exactly past the panel's 120 ms Git debounce. */
+const afterDebounce = async (trigger: () => void): Promise<void> => {
+  vi.useFakeTimers();
+  try { trigger(); await vi.advanceTimersByTimeAsync(120); } finally { vi.useRealTimers(); }
+  await tick();
+};
 const submitEntryDialog = async (value: string): Promise<void> => {
   const dialog = document.querySelector<HTMLDialogElement>('.file-entry-dialog')!;
   const input = dialog.querySelector<HTMLInputElement>('.file-entry-dialog-input')!;
@@ -222,15 +228,13 @@ it('shows real Git groups, tree markers, unified diffs, and reconciles metadata 
   let finishDiff!: (result: { ok: true; data: ProjectGitDiff }) => void;
   (window.api.getProjectGitDiff as any).mockImplementationOnce(() => new Promise(resolve => { finishDiff = resolve; }));
   snapshot = { ...snapshot, revision: 'dirty-1b' };
-  projectGitChanged?.({ projectId: projectA.id });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectGitChanged?.({ projectId: projectA.id }));
   expect(host.querySelector('.test-diff-viewer')).toBeNull();
   expect(host.textContent).toContain('Loading diff');
   finishDiff({ ok: true, data: { ...diff, currentText: '# revised' } }); await tick();
   expect(host.querySelector('.test-diff-viewer')?.textContent).toContain('# revised');
   (window.api.getProjectGitDiff as any).mockImplementationOnce(() => ok({ ...diff, currentText: '# same-count edit' }));
-  projectGitChanged?.({ projectId: projectA.id });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectGitChanged?.({ projectId: projectA.id }));
   expect(host.querySelector('.test-diff-viewer')?.textContent).toContain('# same-count edit');
   expect(host.querySelector('.file-panel-body')?.classList.contains('is-diff-open')).toBe(true);
   expect(host.querySelector<HTMLElement>('.file-changes-list')?.hidden).toBe(true);
@@ -260,18 +264,15 @@ it('shows real Git groups, tree markers, unified diffs, and reconciles metadata 
     revision: 'dirty-2',
     changes: snapshot.changes.map(change => change.path === 'src/new.ts' ? { ...change, additions: 7 } : change)
   };
-  projectFilesChanged?.({ projectId: projectA.id, directory: 'src' });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectFilesChanged?.({ projectId: projectA.id, directory: 'src' }));
   expect(host.querySelector('[data-path="src/new.ts"] .file-change-stats')?.textContent).toBe('7 lines');
 
   // A push/metadata event is not authority to clear Changes; only the reread snapshot is.
-  projectGitChanged?.({ projectId: projectA.id });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectGitChanged?.({ projectId: projectA.id }));
   expect(host.querySelector('.file-panel-changes-badge')?.textContent).toBe('5');
 
   snapshot = { ...cleanGit(), revision: 'clean-2' };
-  projectGitChanged?.({ projectId: projectA.id });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectGitChanged?.({ projectId: projectA.id }));
   expect(host.textContent).toContain('Working tree is clean');
   expect(host.querySelector('.file-panel-changes-badge')?.hasAttribute('hidden')).toBe(true);
   expect(host.querySelector('.test-diff-viewer')).toBeNull();
@@ -541,8 +542,7 @@ it('marks every ancestor folder, including paths of deleted and renamed files, t
   expect(host.querySelector('[data-path="src/nested/loose.ts"] .file-tree-git-status')?.textContent).toBe('U');
   expect(host.querySelector('[data-path="src/nested/new.ts"] .file-tree-git-status')?.textContent).toBe('R');
   snapshot = { ...cleanGit(), revision: 'nested-clean' };
-  projectGitChanged?.({ projectId: projectA.id });
-  await new Promise(resolve => setTimeout(resolve, 150)); await tick();
+  await afterDebounce(() => projectGitChanged?.({ projectId: projectA.id }));
   expect(label('src')).toBeUndefined();
   expect(label('docs')).toBeUndefined();
   expect(label('src/nested')).toBeUndefined();
@@ -599,8 +599,32 @@ it('shows Files and the read-only Review projection at once without a second fil
   expect(bottom.querySelector('.file-changes-header-content')?.contains(bottom.querySelector('.file-changes-header-title'))).toBe(true);
   expect(bottom.querySelector('.file-changes-header-content')?.contains(bottom.querySelector('.file-panel-refresh'))).toBe(false);
   expect(window.api.listProjectFiles).toHaveBeenCalledTimes(1);
-  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(fileWatchCalls);
+  // Review watches the project's Git state only; it adds no folder watches of its own.
+  expect(window.api.watchProjectFiles).toHaveBeenCalledTimes(fileWatchCalls + 1);
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, []);
   expect(window.api.getProjectGitSnapshot).toHaveBeenCalled();
+});
+
+it('keeps the project Git watch while Review replaces Files in the shared slot, and releases it when Review closes', async () => {
+  // The chat wiring: opening either pane hides the other one.
+  let files: { hide(): void } | null = null;
+  let review: { hide(): void; show(): Promise<void> } | null = null;
+  const reviewToggle = document.createElement('button');
+  const filesPanel = files = createFilePanel({ host, toggle, onShow: () => review?.hide(), onOpenChanges: () => void review?.show() });
+  const reviewPanel = review = createFilePanel({ host, toggle: reviewToggle, reviewOnly: true, onShow: () => files?.hide() });
+  filesPanel.update(projectA); reviewPanel.update(projectA);
+  await filesPanel.show(); await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, ['']);
+
+  await reviewPanel.show(); await tick();
+  expect(filesPanel.visible()).toBe(false);
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(projectA.id, []);
+  const reads = vi.mocked(window.api.getProjectGitSnapshot).mock.calls.length;
+  await afterDebounce(() => projectGitChanged!({ projectId: projectA.id }));
+  expect(window.api.getProjectGitSnapshot).toHaveBeenCalledTimes(reads + 1);
+
+  reviewPanel.hide(); await tick();
+  expect(window.api.watchProjectFiles).toHaveBeenLastCalledWith(null, []);
 });
 
 it('returns a recorded edit to Review rather than exposing Files actions', async () => {
@@ -697,9 +721,7 @@ it('retires a pending Git reconciliation when the panel closes', async () => {
   const panel = createFilePanel({ host, toggle });
   panel.update(projectA); toggle.click(); await tick(); await tick();
   const before = (window.api.getProjectGitSnapshot as any).mock.calls.length;
-  projectGitChanged?.({ projectId: projectA.id });
-  toggle.click();
-  await new Promise(resolve => setTimeout(resolve, 150));
+  await afterDebounce(() => { projectGitChanged?.({ projectId: projectA.id }); toggle.click(); });
   expect((window.api.getProjectGitSnapshot as any)).toHaveBeenCalledTimes(before);
 });
 

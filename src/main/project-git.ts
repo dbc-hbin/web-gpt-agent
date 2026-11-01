@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { statSync, watch as watchFs, type FSWatcher } from 'node:fs';
-import type { Stats } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { ProjectGitChange, ProjectGitChanged, ProjectGitDiff, ProjectGitSnapshot, ProjectGitStatus } from '../shared/project-git.js';
@@ -9,8 +8,8 @@ import { CHECKPOINT_REF_PREFIX } from '../shared/project-git.js';
 import { findCheckpoint, listCheckpoints } from './checkpoints/store.js';
 import { getConfig } from './config.js';
 import { rawPromises as fs } from './rawfs.js';
-import { projectFileTarget } from './project-files.js';
-import { isContained } from './sandbox.js';
+import { projectFileTarget, sameFile } from './project-files.js';
+import { approvedRootContaining } from './sandbox.js';
 import { logInfo, logWarn } from './logger.js';
 
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -23,11 +22,6 @@ const CHANGE_DEBOUNCE_MS = 180;
 
 interface GitResult { code: number; stdout: Buffer; stderr: string; }
 export interface RepositoryContext { projectId: string; projectReal: string; root: string; gitDir: string; commonDir: string; prefix: string; }
-
-function sameFile(left: Stats, right: Stats): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.size === right.size &&
-    left.mtimeMs === right.mtimeMs && left.ctimeMs === right.ctimeMs;
-}
 
 async function readWorkingBytes(projectId: string, relative: string, limit: number): Promise<{ bytes: Buffer; tooLarge: boolean }> {
   const target = await projectFileTarget(projectId, relative, { allowRoot: false });
@@ -203,9 +197,15 @@ export async function repositoryContext(projectId: string): Promise<RepositoryCo
   const root = path.resolve(lines[0]!);
   const gitDir = path.resolve(project.real, lines[1]!);
   const commonDir = path.resolve(project.real, lines[2]!);
-  const approved = getConfig().roots.map(entry => path.resolve(entry.path));
-  if (![root, gitDir, commonDir].every(candidate => approved.some(parent => isContained(parent, candidate)))) {
-    throw new Error('The Git repository metadata is outside the approved folders');
+  // The same authority that admitted the project: all-files access reaches any native path, while
+  // approved-roots access requires the worktree and Git metadata inside a currently approved root.
+  const config = getConfig();
+  if (config.fileAccessMode !== 'all-files') {
+    for (const candidate of [root, gitDir, commonDir]) {
+      if (!(await approvedRootContaining(config.roots, candidate).catch(() => null))) {
+        throw new Error('The Git repository metadata is outside the approved folders');
+      }
+    }
   }
   const relative = path.relative(root, project.real);
   if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
@@ -508,7 +508,7 @@ export async function readProjectGitSnapshot(projectId: string, baseRef?: string
   }
 }
 
-function repositoryPath(context: RepositoryContext, relative: string): string {
+export function repositoryPath(context: RepositoryContext, relative: string): string {
   return context.prefix ? `${context.prefix}/${relative}` : relative;
 }
 
@@ -642,6 +642,7 @@ export class ProjectGitWatchSet {
     this.projectId = projectId;
     if (!projectId) return;
     let context: RepositoryContext | null;
+    // An unavailable project or repository has nothing to watch; the next snapshot read reports why.
     try { context = await repositoryContext(projectId); } catch { return; }
     if (!context || generation !== this.generation || this.projectId !== projectId) return;
     // One native recursive watch covers working-tree writes even when their folders are not
