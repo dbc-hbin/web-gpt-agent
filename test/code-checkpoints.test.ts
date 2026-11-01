@@ -272,6 +272,21 @@ it('never fails or blocks the patch when the capture fails', async () => {
   expect(await listCheckpoints(projectId)).toEqual([]);
 });
 
+it.skipIf(IS_WINDOWS)('rechecks the patch paths after the checkpoint capture, so a swap during it is refused', async () => {
+  const secret = path.join(approved, 'secret.ts');
+  await fs.writeFile(secret, 'export const value = 1;\n');
+  const real = projectGit.withTemporaryIndex;
+  // The patched file becomes a link out of the project while the checkpoint is being read.
+  vi.spyOn(projectGit, 'withTemporaryIndex').mockImplementation(async (work) => {
+    await fs.rm(path.join(root, 'app.ts'));
+    await fs.symlink(secret, path.join(root, 'app.ts'));
+    return real(work);
+  });
+  const result = await applyPatch(editApp('export const value = 1;', 'export const value = 2;'));
+  expect(result.isError).toBe(true);
+  expect(await fs.readFile(secret, 'utf8')).toBe('export const value = 1;\n');
+});
+
 it('takes no later checkpoint in a turn whose first capture failed, since its patch already ran', async () => {
   vi.spyOn(projectGit, 'withTemporaryIndex').mockRejectedValueOnce(new Error('disk full'));
   const info = vi.spyOn(logger, 'logInfo');

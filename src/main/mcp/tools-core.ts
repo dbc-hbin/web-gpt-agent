@@ -1747,8 +1747,9 @@ async function runParsedPatch(
     }
   }
 
-  // Verification and rollback capture await disk. Recheck every original spelling immediately
-  // before the port's synchronous resolver can mutate a previously authorized native path.
+  await checkpointBeforePatch([...resolution.virtualPaths.keys()]);
+  // Verification, rollback and checkpoint capture await disk. Recheck every original spelling
+  // immediately before the port's synchronous resolver can mutate a previously authorized native path.
   try {
     const mode = getConfig().fileAccessMode;
     await recheckPath(roots, effectiveBase.virtual, effectiveBase.real);
@@ -1759,7 +1760,6 @@ async function runParsedPatch(
   } catch (error) {
     return { result: fail(friendlyError(error)), content: null, exitCode: null };
   }
-  await checkpointBeforePatch([...resolution.virtualPaths.keys()]);
   const execution = await executeApplyPatch({
     patch: effectiveArgs.patch,
     cwd: effectiveBase.real,
