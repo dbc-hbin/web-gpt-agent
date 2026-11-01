@@ -253,7 +253,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Permissions and settings | `config.ts` / `config.json` | Validate every load/save; enforce effective current capabilities at use. |
 | Credentials | `secrets.ts` / encrypted `secrets.bin`; plugin OAuth's encrypted installation store | Main process only; publish updated cache after the encrypted write. |
 | Session/current chat/project | `store.ts` / `sessions/<id>/meta.json` | Rebind is the semantic A→B commit. |
-|Exact request ownership|`correlation.ts` / `state/request-correlations.sqlite` plus recorded proof|First exact proof wins; synchronous SQLite commit before publication; bounded RAM cache falls back to disk; legacy JSON migrates on startup.|
+|Exact request ownership|`correlation.ts` / `state/request-correlations.sqlite` plus recorded proof|First exact proof wins; synchronous SQLite commit before publication; bounded RAM cache falls back to disk; legacy JSON migrates on startup. Keys are `joinKey` (UUID version digit → `x`, upstream #1752); rows stored under an exact UUID spelling migrate to it when the store opens, the earliest proof owning the id over a younger joined row of another chat. Pending request plans (`request-plans.ts`) use the same key.|
 | Authored message | `store.ts` / canonical message shard | Replace by stable identity, preserving origin chronology. |
 | Agent progress plan | `request-plans.ts` → `store.ts::updateSessionPlan` / `sessions/<id>/plan.json` | Request-scoped storage before proof; exact session and invocation ordering on attachment; atomically replace the whole plan. |
 | Input and checkpoints | `input.ts` / `state/session-input.json` | Serialized acceptance, frozen payload, exclusive claim and receipt; stages belong here. |

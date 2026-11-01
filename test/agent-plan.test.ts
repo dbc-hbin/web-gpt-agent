@@ -102,6 +102,16 @@ it('persists a request-scoped plan across restart and attaches it when exact cha
   expect(await readSessionPlan(session.id)).toEqual({ ...update, updatedAt: 500 });
 });
 
+// A call can name its request with another UUID version digit than the page (upstream #1752): the
+// pending plan is keyed like the correlation, so the page's spelling attaches the call's plan.
+it('attaches a pending plan by the page\'s version spelling of the call\'s request id', async () => {
+  const conversationId = 'plan-request-spelling';
+  const session = await createSession({ conversationId });
+  expect(await updateRequestPlan('93ff44d2-cfea-9f32-8ea7-7a991c9cfe49', update, 700)).toBe(true);
+  expect(await attachRequestPlan({ requestId: '93FF44D2-cfea-4f32-8ea7-7a991c9cfe49', conversationId, sessionId: session.id })).toBe('attached');
+  expect(await readSessionPlan(session.id)).toEqual({ ...update, updatedAt: 700 });
+});
+
 it('recovers an accepted request plan after two handoffs without admitting post-handoff source work', async () => {
   const session = await createSession({ conversationId: 'pending-plan-a' });
   const clock = vi.spyOn(Date, 'now').mockReturnValue(10_000);

@@ -166,6 +166,7 @@ function ownershipDatabase(): DatabaseSync | null {
     opened.exec('PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; CREATE TABLE IF NOT EXISTS request_owners (request_id TEXT PRIMARY KEY, payload TEXT NOT NULL) WITHOUT ROWID');
     selectOwner = opened.prepare('SELECT payload FROM request_owners WHERE request_id = ?');
     saveOwner = opened.prepare('INSERT INTO request_owners(request_id,payload) VALUES (?,?) ON CONFLICT(request_id) DO UPDATE SET payload=excluded.payload');
+    migrateLegacyOwners(opened);
     database = opened;
     databasePath = filename;
     return opened;
@@ -189,8 +190,7 @@ function lookup(requestId: string): RequestCorrelation | null {
   const key = joinKey(requestId);
   const cached = byRequest.get(key);
   if (cached) return cached;
-  // Rows written before joinKey are stored under their exact id.
-  const row = selectOwner?.get(key) ?? (key === requestId ? undefined : selectOwner?.get(requestId));
+  const row = selectOwner?.get(key);
   if (!row) return null;
   if (typeof row.payload !== 'string') throw new Error('Invalid request ownership row');
   const owner = storedOwner(JSON.parse(row.payload));
@@ -198,6 +198,45 @@ function lookup(requestId: string): RequestCorrelation | null {
   byRequest.set(key, owner);
   trim();
   return owner;
+}
+
+/**
+ * Moves rows stored under their exact UUID spelling (before joinKey) to the joined key. Every
+ * joined row is younger than such a row, and while lookups missed the other spellings a later
+ * sighting could file a joined row for another chat. The legacy row is the first proof, so it
+ * owns the id (the earliest of several spellings); a joined row of the same chat descends from
+ * it and is kept.
+ */
+function migrateLegacyOwners(db: DatabaseSync): void {
+  // Joined keys carry `x` in the version slot; only a 36-character id without it can be legacy.
+  const rows = db.prepare("SELECT request_id, payload FROM request_owners WHERE length(request_id) = 36 AND substr(request_id, 15, 1) <> 'x'").all()
+    .filter(row => typeof row.request_id === 'string' && joinKey(row.request_id) !== row.request_id);
+  if (!rows.length) return;
+  const first = new Map<string, RequestCorrelation>();
+  for (const row of rows) {
+    const key = joinKey(row.request_id as string);
+    const owner = typeof row.payload === 'string' ? storedOwner(JSON.parse(row.payload)) : null;
+    if (!owner || joinKey(owner.requestId) !== key) continue;
+    const held = first.get(key);
+    if (!held || owner.observedAt < held.observedAt) first.set(key, owner);
+  }
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const remove = db.prepare('DELETE FROM request_owners WHERE request_id = ?');
+    for (const [key, owner] of first) {
+      const joinedRow = selectOwner?.get(key);
+      const joined = typeof joinedRow?.payload === 'string' ? storedOwner(JSON.parse(joinedRow.payload)) : null;
+      if (joined?.conversationId !== owner.conversationId) {
+        if (joined) logWarn(`request ${key}: a later sighting from another chat had shadowed its first owner; the first owner keeps it`);
+        saveOwner?.run(key, JSON.stringify(owner));
+      }
+    }
+    for (const row of rows) remove.run(row.request_id as string);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 /**

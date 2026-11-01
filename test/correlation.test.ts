@@ -286,6 +286,35 @@ describe('request correlation ownership', () => {
     }
   });
 
+  // A legacy exact-id row is the first proof of its id under every version spelling: a lookup by
+  // another spelling finds it, and a later sighting from another chat cannot take the id over.
+  it('finds a legacy exact-id owner by another version spelling and keeps it as the first owner', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-legacy-'));
+    try {
+      resetDurableForTests();
+      initDurableStore(dir);
+      requestCorrelation('wfr-open-store');
+      const legacy = 'bbbbbbbb-cccc-4ddd-8eee-ffffffffffff', other = 'BBBBBBBB-cccc-9ddd-8eee-ffffffffffff';
+      const db = new DatabaseSync(path.join(dir, 'state', 'request-correlations.sqlite'));
+      db.prepare('INSERT INTO request_owners(request_id,payload) VALUES (?,?)').run(legacy, JSON.stringify({
+        requestId: legacy, conversationId: 'conv-first', sessionId: 'session-first', messageId: 'msg-l', tool: '', observedAt: 2 }));
+      // What a build that missed the other spelling filed afterwards, for a different chat.
+      const joined = 'bbbbbbbb-cccc-xddd-8eee-ffffffffffff';
+      db.prepare('INSERT INTO request_owners(request_id,payload) VALUES (?,?)').run(joined, JSON.stringify({
+        requestId: other, conversationId: 'conv-later', sessionId: 'session-later', messageId: 'msg-x', tool: '', observedAt: 9 }));
+      db.close();
+      resetCorrelationRegistryForTests();
+      expect(requestCorrelation(other)?.conversationId).toBe('conv-first');
+      expect(observeRequestCorrelation({ requestId: other, conversationId: 'conv-later', sessionId: 'session-later',
+        messageId: 'msg-y', tool: 'read', observedAt: 10 })).toBe('refused');
+      expect(requestCorrelation(legacy)?.conversationId).toBe('conv-first');
+    } finally {
+      resetCorrelationRegistryForTests();
+      resetDurableForTests();
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('restores proven request ownership from durable state after an app restart', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'clf-correlation-'));
     try {

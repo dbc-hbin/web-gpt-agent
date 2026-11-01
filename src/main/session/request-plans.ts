@@ -8,7 +8,7 @@
 import { agentPlanUpdateSchema, type AgentPlanUpdate } from '../../shared/agent-plan.js';
 import { readDurable, writeDurableNow } from '../durable.js';
 import { updateSessionPlan } from './store.js';
-import type { RequestCorrelation } from './correlation.js';
+import { joinKey, type RequestCorrelation } from './correlation.js';
 
 const STATE_NAME = 'request-plans';
 const STATE_VERSION = 1;
@@ -60,7 +60,9 @@ async function load(): Promise<void> {
   if (saved?.version === STATE_VERSION && Array.isArray(saved.entries)) {
     for (const raw of saved.entries.slice(-MAX_PENDING_PLANS)) {
       const entry = validEntry(raw);
-      if (entry) pending.set(entry.requestId, entry);
+      // Saved before plans were keyed like correlations (joinKey): the newest plan of a request wins.
+      const held = entry ? pending.get(joinKey(entry.requestId)) : undefined;
+      if (entry && !(held && held.startedAt > entry.startedAt)) pending.set(joinKey(entry.requestId), entry);
     }
   }
   prune();
@@ -86,11 +88,14 @@ export function updateRequestPlan(requestId: string, input: AgentPlanUpdate, sta
   const update = agentPlanUpdateSchema.parse(input);
   return serial(async () => {
     await load();
-    const previous = pending.get(requestId);
+    // Keyed like request correlations, so the call's and the page's version spelling of one
+    // UUID name the same pending plan.
+    const key = joinKey(requestId);
+    const previous = pending.get(key);
     if (previous && previous.startedAt > startedAt) return false;
     const before = new Map(pending);
-    pending.delete(requestId);
-    pending.set(requestId, { requestId, update, startedAt, storedAt: Date.now() });
+    pending.delete(key);
+    pending.set(key, { requestId, update, startedAt, storedAt: Date.now() });
     prune();
     try {
       await persist();
@@ -109,14 +114,15 @@ export function attachRequestPlan(
 ): Promise<'missing' | 'attached' | 'stale'> {
   return serial(async () => {
     await load();
-    const entry = pending.get(owner.requestId);
+    const key = joinKey(owner.requestId);
+    const entry = pending.get(key);
     if (!entry) return 'missing';
     const accepted = await updateSessionPlan(owner.sessionId, owner.conversationId, entry.update, entry.startedAt, { storedAt: entry.storedAt });
-    pending.delete(owner.requestId);
+    pending.delete(key);
     try {
       await persist();
     } catch (error) {
-      pending.set(owner.requestId, entry);
+      pending.set(key, entry);
       throw error;
     }
     return accepted ? 'attached' : 'stale';
@@ -129,7 +135,7 @@ export async function reconcileRequestPlans(
 ): Promise<void> {
   const ids = await serial(async () => {
     await load();
-    return [...pending.keys()];
+    return [...pending.values()].map(entry => entry.requestId);
   });
   for (const requestId of ids) {
     const owner = resolve(requestId);
