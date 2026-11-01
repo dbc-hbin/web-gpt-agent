@@ -1481,6 +1481,9 @@ function atBottom(view: HTMLElement): boolean {
 function stickToNewest(id: string): void {
   if (pinned.get(id) === false) return;
   const view = $(id);
+  // Reading scrollHeight forces layout and the app logs every few seconds. A hidden feed
+  // is pinned again by showTab when its panel opens.
+  if (!view.closest('.panel')?.classList.contains('is-active')) return;
   view.scrollTop = view.scrollHeight;
 }
 

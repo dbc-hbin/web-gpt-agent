@@ -48,3 +48,28 @@ describe('custom appearance', () => {
     expect(windowBackgroundForTheme('dark', appearance)).toBe('#391c56');
   });
 });
+
+describe('renderer appearance listeners', () => {
+  it('notify canvas renderers only when the applied appearance changes', async () => {
+    const { JSDOM } = await import('jsdom');
+    const dom = new JSDOM('<div class="sidebar"></div>', { url: 'https://local.test' });
+    const previous = { window: globalThis.window, document: globalThis.document };
+    Object.assign(globalThis, { window: dom.window, document: dom.window.document });
+    try {
+      const { applyAppearance, onAppearanceChanged } = await import('../src/renderer/appearance.js');
+      let told = 0;
+      const stop = onAppearanceChanged(() => { told++; });
+      applyAppearance('dark', defaultAppearance());
+      // Every state push applies the same appearance again.
+      applyAppearance('dark', { ...defaultAppearance() });
+      expect(told).toBe(1);
+      applyAppearance('light', defaultAppearance());
+      applyAppearance('light', { ...defaultAppearance(), fontSize: 16 });
+      expect(told).toBe(3);
+      stop();
+    } finally {
+      Object.assign(globalThis, previous);
+      dom.window.close();
+    }
+  });
+});

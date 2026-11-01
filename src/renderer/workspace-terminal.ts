@@ -35,8 +35,9 @@ export function createWorkspaceTerminal() {
     return { background, foreground, cursor: foreground, cursorAccent: background };
   };
   const stopAppearance = onAppearanceChanged(() => {
-    const theme = terminalTheme();
-    for (const tab of tabs.values()) tab.term.options.theme = theme;
+    const theme = terminalTheme(), colors = JSON.stringify(theme);
+    // The same colors again would only clear xterm's width cache and remeasure every glyph.
+    for (const tab of tabs.values()) if (JSON.stringify(tab.term.options.theme) !== colors) tab.term.options.theme = theme;
   });
   let project: LocalProject | null = null, selected: string | null = null, open = false;
   const setHeight = (height: number): void => {

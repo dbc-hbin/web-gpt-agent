@@ -7,6 +7,8 @@ const FONT_FAMILIES = {
   serif: 'Georgia, "Times New Roman", serif', mono: '"Cascadia Mono", Consolas, monospace'
 };
 const appearanceListeners = new Set<() => void>();
+/** The theme and settings the listeners were last told about. */
+let toldAppearance = '';
 /** Canvas/terminal renderers must refresh after the CSS palette has been applied. */
 export function onAppearanceChanged(listener: () => void): () => void {
   appearanceListeners.add(listener);
@@ -31,6 +33,11 @@ export function applyAppearance(theme: AppearanceTheme, settings?: AppearanceSet
   for (const element of document.querySelectorAll<HTMLElement>('.sidebar, .app-topbar, .appearance-preview-sidebar, .connection-popover')) {
     tokens(element, paletteTokens(sidebarBackground, palette.accent, palette.contrast));
   }
+  // Every state push applies the appearance again. Listeners re-theme terminals, which makes
+  // xterm measure every glyph again, so they hear only of a real change.
+  const told = JSON.stringify([theme, value]);
+  if (told === toldAppearance) return;
+  toldAppearance = told;
   for (const listener of appearanceListeners) listener();
 }
 
