@@ -2983,6 +2983,11 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
 .tool-group[open] > summary .activity-chevron { transform: rotate(90deg); }
 .tool-group > summary:hover { color: var(--ink); }
 .tool-group-body { padding: 4px 0 0 0; }
+/* Edit & resubmit: the conversation an edit replaced, folded under the edited question. Open,
+   it reads as a side branch: indented on a guide line, like routine activity, and a little quieter. */
+.earlier-version > .tool-group-body { padding: 4px 0 4px 18px; margin-left: 7px; border-left: 1px solid var(--line); }
+.earlier-version > .tool-group-body > .ev { opacity: .82; }
+.said.is-user .message-edited { display: block; margin-top: 6px; color: var(--faint); font-size: calc(11.5px * var(--text-scale, 1)); line-height: 1.3; }
 .tool-group-body .ev { margin: 0; }
 .tool-group-body .tool > summary, .tool-group-body .agent-communication > summary { min-height: 24px; }
 .agent-avatar { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; flex: 0 0 16px; border-radius: 6px; font-size: calc(9px * var(--text-scale, 1)); line-height: 1; background: #7d6198; color: #fff; }

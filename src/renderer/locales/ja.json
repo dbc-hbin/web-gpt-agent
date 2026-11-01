@@ -1519,5 +1519,8 @@
   "Save a checkpoint before each turn's first edit": "各ターンの最初の編集の前にチェックポイントを保存",
   "This checkpoint is no longer available. Git has cleaned it up.": "このチェックポイントは利用できなくなりました。Git によって整理されました。",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "チェックポイントは一時的なものです。古いものは Git に整理されることがあります。オフ: 新しいチェックポイントは作成されません。",
-  "Cleaned up": "整理済み"
+  "Cleaned up": "整理済み",
+  "Edited version": "編集済みのバージョン",
+  "Earlier version · {0} messages": "以前のバージョン · {0}件のメッセージ",
+  "Earlier versions · {0} messages": "以前のバージョン · {0}件のメッセージ"
 }

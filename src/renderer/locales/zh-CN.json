@@ -1483,5 +1483,8 @@
   "Save a checkpoint before each turn's first edit": "在每个轮次的首次编辑前保存检查点",
   "This checkpoint is no longer available. Git has cleaned it up.": "此检查点已不可用。Git 已将其清理。",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "检查点是临时的：Git 可能会清理旧的检查点。关闭：不再创建新的检查点。",
-  "Cleaned up": "已清理"
+  "Cleaned up": "已清理",
+  "Edited version": "已编辑的版本",
+  "Earlier version · {0} messages": "较早版本 · {0} 条消息",
+  "Earlier versions · {0} messages": "较早版本 · {0} 条消息"
 }

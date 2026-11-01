@@ -1483,5 +1483,8 @@
   "Save a checkpoint before each turn's first edit": "Guardar un punto de control antes de la primera edición de cada turno",
   "This checkpoint is no longer available. Git has cleaned it up.": "Este punto de control ya no está disponible. Git lo ha limpiado.",
   "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "Los puntos de control son temporales: Git puede limpiar los antiguos. Desactivado: no se crean nuevos.",
-  "Cleaned up": "Limpiado"
+  "Cleaned up": "Limpiado",
+  "Edited version": "Versión editada",
+  "Earlier version · {0} messages": "Versión anterior · {0} mensajes",
+  "Earlier versions · {0} messages": "Versiones anteriores · {0} mensajes"
 }
