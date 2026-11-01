@@ -8,7 +8,7 @@ import { resolvePath } from './sandbox.js';
 import { bindSessionProject, findSessionByConversation, getSession } from './session/store.js';
 import type { LocalProject } from '../shared/projects.js';
 
-const projectSchema = z.object({ id: z.string().uuid(), name: z.string().min(1).max(160), path: z.string().min(1).max(32768), createdAt: z.number().finite().nonnegative(), ungrouped: z.boolean().optional() });
+const projectSchema = z.object({ id: z.string().uuid(), name: z.string().min(1).max(160), path: z.string().min(1).max(32768), createdAt: z.number().finite().nonnegative(), ungrouped: z.boolean().optional(), secretsShieldOff: z.boolean().optional() });
 const catalogSchema = z.array(projectSchema).max(200);
 let mutations: Promise<unknown> = Promise.resolve();
 const samePath = (a: string, b: string) => process.platform === 'win32' ? a.toLowerCase() === b.toLowerCase() : a === b;
@@ -60,6 +60,37 @@ export function removeProject(id: string): Promise<LocalProject> {
   mutations = operation.catch(() => undefined);
   return operation;
 }
+/** Turns the secrets shield off (or back on) for one project's chats. On leaves no flag behind. */
+export function setProjectSecretsShieldOff(projectId: string, off: boolean): Promise<LocalProject> {
+  const operation = mutations.then(async () => {
+    z.string().uuid().parse(projectId);
+    const projects = await listProjects();
+    const project = projects.find(row => row.id === projectId);
+    if (!project) throw new Error('Project not found');
+    if ((project.secretsShieldOff === true) === off) return project;
+    const { secretsShieldOff: _, ...without } = project;
+    const updated: LocalProject = off ? { ...without, secretsShieldOff: true } : without;
+    try {
+      await writeDurableNow('projects', projects.map(row => row.id === projectId ? updated : row));
+    } catch (error) {
+      // The store retries a failed write later. A switch reported as failed must not land then,
+      // so the unchanged list becomes the write to retry.
+      await writeDurableNow('projects', projects).catch(() => undefined);
+      throw error;
+    }
+    return updated;
+  });
+  mutations = operation.catch(() => undefined);
+  return operation;
+}
+
+/** Whether this chat's project turned the secrets shield off. A chat without a project never has. */
+export async function sessionSecretsShieldOff(sessionId: string): Promise<boolean> {
+  const session = await getSession(sessionId);
+  if (!session?.projectId) return false;
+  return (await getProject(session.projectId))?.secretsShieldOff === true;
+}
+
 export async function assignSessionProject(sessionId: string, projectId: string): Promise<void> {
   const project = await getProject(projectId);
   if (!project) throw new Error('Project not found');

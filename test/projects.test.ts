@@ -7,7 +7,7 @@ import { bindBrowserInputProject, claimBrowserInput, enqueueInput, listInputs, r
 import { defaultConfig, initConfigPath, saveConfig } from '../src/main/config.js';
 import { initDurableStore, resetDurableForTests } from '../src/main/durable.js';
 import { createSession, getSession, initSessionStore, rebindSession, resetSessionStoreForTests, setSessionOrigin } from '../src/main/session/store.js';
-import { addProject, assignSessionProject, getSessionProject, inheritSessionProject, listProjects, removeProject } from '../src/main/projects.js';
+import { addProject, assignSessionProject, getSessionProject, inheritSessionProject, listProjects, removeProject, sessionSecretsShieldOff, setProjectSecretsShieldOff } from '../src/main/projects.js';
 import { validateNewRoot } from '../src/main/sandbox.js';
 
 let directory: string, approved: string;
@@ -122,4 +122,20 @@ it('fails closed when explicit project permission is removed and follows approve
   await saveConfig({ ...defaultConfig(), roots: [] });
   await expect(getSessionProject(session.id)).rejects.toThrow();
   expect((await getSession(session.id))?.projectId).toBe(project.id);
+});
+
+it('turns the secrets shield off for one project durably, and back on without leaving a flag', async () => {
+  const project = await addProject(path.join(approved, 'first'));
+  const session = await createSession({ title: 'shielded', conversationId: 'shield-chat' });
+  await assignSessionProject(session.id, project.id);
+  const other = await createSession({ title: 'unfiled', conversationId: 'unfiled-chat' });
+  expect(await sessionSecretsShieldOff(session.id)).toBe(false);
+  expect((await setProjectSecretsShieldOff(project.id, true)).secretsShieldOff).toBe(true);
+  resetDurableForTests(); initDurableStore(directory);
+  expect(await sessionSecretsShieldOff(session.id)).toBe(true);
+  expect(await sessionSecretsShieldOff(other.id)).toBe(false);
+  const restored = await setProjectSecretsShieldOff(project.id, false);
+  expect('secretsShieldOff' in restored).toBe(false);
+  expect(await listProjects()).toEqual([restored]);
+  await expect(setProjectSecretsShieldOff(randomUUID(), true)).rejects.toThrow(/not found/);
 });

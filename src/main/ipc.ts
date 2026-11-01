@@ -62,7 +62,7 @@ import { runDiagnostics } from './diagnostics.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, onLog } from './logger.js';
 import { markStartup } from './startup-timing.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject } from './projects.js';
+import { addProject, getSessionProject, listProjects, projectWorkspace, removeProject, setProjectSecretsShieldOff } from './projects.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
@@ -163,6 +163,7 @@ const settingsPatch = z.object({
     autoConnect: z.boolean(),
     startAtLogin: z.boolean().optional(),
     privacyScreenshots: z.boolean(),
+    secretsShield: z.boolean().optional(),
     theme: z.enum(['light', 'dark'])
   }),
   sessions: z.object({
@@ -294,6 +295,8 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         base.ui.privacyScreenshots,
         wanted.ui.privacyScreenshots
       ),
+      // Missing means on, here as in the saved settings; a form without the field keeps it.
+      secretsShield: pick(current.ui.secretsShield !== false, base.ui.secretsShield !== false, wanted.ui.secretsShield ?? current.ui.secretsShield !== false),
       theme: pick(current.ui.theme, base.ui.theme, wanted.ui.theme)
     },
     sessions: {
@@ -628,6 +631,13 @@ export function registerIpc(
   handle('projects:remove', async (payload) => {
     const { id } = z.object({ id: z.string().uuid() }).parse(payload);
     const project = await removeProject(id);
+    push('session:changed');
+    return project;
+  });
+  handle('projects:secrets-shield', async (payload) => {
+    const { id, off } = z.object({ id: z.string().uuid(), off: z.boolean() }).strict().parse(payload);
+    const project = await setProjectSecretsShieldOff(id, off);
+    logInfo(`secrets shield: turned ${off ? 'off' : 'back on'} for a project's chats`);
     push('session:changed');
     return project;
   });

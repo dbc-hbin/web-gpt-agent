@@ -42,6 +42,8 @@ import {
 import { firstTaskRoot } from '../skill-access.js';
 import { ExecError } from '../exec.js';
 import { getConfig } from '../config.js';
+import { sessionSecretsShieldOff } from '../projects.js';
+import { shieldToolResult } from '../secrets-shield.js';
 import {
   AgentError,
   IdentityLostError,
@@ -189,6 +191,33 @@ function rememberIdentityRefusal(requestId: string | null, tool: string): void {
   identityRecovery.delete(requestId);
   identityRecovery.set(requestId, pending);
   if (identityRecovery.size > MAX_IDENTITY_RECOVERY) identityRecovery.delete(identityRecovery.keys().next().value!);
+}
+
+/**
+ * A tool's own output as ChatGPT should receive it, with unmistakable credentials masked.
+ *
+ * Off only when Settings turns it off for everyone or this chat's project turns it off. The
+ * project is read only once something matched, so ordinary output costs one quick test. A
+ * project that cannot be read keeps the shield on. The log names what was hidden, never a value.
+ */
+async function shieldOutput(context: CallContext, name: string, result: ToolResult): Promise<ToolResult> {
+  if (getConfig().ui.secretsShield === false) return result;
+  const shielded = shieldToolResult(result);
+  if (!shielded.masked.length) return result;
+  const counts = new Map<string, number>();
+  for (const kind of shielded.masked) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  const what = [...counts].map(([kind, count]) => `${count} ${kind}${count > 1 ? 's' : ''}`).join(', ');
+  const sessionId = context.caller.sessionId;
+  const projectOff = sessionId ? await sessionSecretsShieldOff(sessionId).catch((error: unknown) => {
+    logWarn(`secrets shield: could not read this chat's project (${error instanceof Error ? error.message : String(error)}); masking anyway`);
+    return false;
+  }) : false;
+  if (projectOff) {
+    logInfo(`secrets shield: off for this chat's project; the ${name} result went out with ${what} unmasked`);
+    return result;
+  }
+  logInfo(`secrets shield: hid ${what} in the ${name} result`);
+  return shielded.result;
 }
 
 async function withIdentityRecoveredNotice(context: CallContext, result: ToolResult): Promise<ToolResult> {
@@ -794,7 +823,15 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
-  const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
+  const ownResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
+  // The tool's own output is masked once, on the outer call, before anything the app adds
+  // (inbox, notices, the user's own new messages): those are not tool output.
+  const baseResult = nested ? ownResult : await shieldOutput(context, name, ownResult);
+  // A clipped code-mode preview retains its full output for the recorder only. When the
+  // preview was masked, mask that copy the same way so the record matches what was sent.
+  if (baseResult !== ownResult && context.recordingContent) {
+    context.recordingContent = shieldToolResult({ content: context.recordingContent }).result.content;
+  }
   // An unproven caller gets no identity prose here. The call ran, its result is the answer, and a
   // paragraph explaining attribution on every response is output the model pays for and the user
   // reads as noise. Attribution stays a recorder fact: `tool_call` rows and the Activity view are

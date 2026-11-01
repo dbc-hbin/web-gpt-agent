@@ -211,6 +211,7 @@ const api = {
   listProjects: () => call<LocalProject[]>('projects:list'),
   addProject: () => call<LocalProject | null>('projects:add'),
   removeProject: (id: string) => call<LocalProject>('projects:remove', { id }),
+  setProjectSecretsShieldOff: (id: string, off: boolean) => call<LocalProject>('projects:secrets-shield', { id, off }),
   listProjectFiles: (projectId: string, directory = '') => call<ProjectDirectoryListing>('projectFiles:list', { projectId, directory }),
   watchProjectFiles: (projectId: string | null, directories: string[]) => call<boolean>('projectFiles:watch', { projectId, directories }),
   onProjectFilesChanged: (listener: (event: ProjectFilesChanged) => void): (() => void) => {

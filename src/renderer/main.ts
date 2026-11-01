@@ -486,6 +486,7 @@ function save(over: { readOnly?: boolean; fileAccessMode?: AppState['config']['f
       minimizeToTray: $<HTMLInputElement>('minimizeToTray').checked,
       developerMode: $<HTMLInputElement>('developerMode').checked,
       privacyScreenshots: $<HTMLInputElement>('privacyScreenshots').checked,
+      secretsShield: $<HTMLInputElement>('secretsShield').checked,
       theme: over.theme ?? previous.ui.theme,
       appearance: over.appearance ?? previous.ui.appearance
     },
@@ -1029,6 +1030,7 @@ function apply(next: AppState): void {
     config.ui.privacyScreenshots,
     previousState?.config.ui.privacyScreenshots
   );
+  applyChecked($<HTMLInputElement>('secretsShield'), config.ui.secretsShield !== false, previousState ? previousState.config.ui.secretsShield !== false : undefined);
   $('privacyScreenshotsSetting').hidden = !(next.platform?.desktopAutomation ?? true);
   if (next.platform?.family === 'macos') {
     ui($('backgroundRunningCopy'), 'textContent', () => t("Leave it running while you use the connector. It stays available from the menu bar and Dock when you close the window."));
@@ -1787,6 +1789,7 @@ for (const id of [
   'minimizeToTray',
   'developerMode',
   'privacyScreenshots',
+  'secretsShield',
   'tunnelKind',
   'tunnelId',
   'desktopTunnelId'

@@ -3493,3 +3493,17 @@ it('keeps a cancelled automatic draft at its creation time as later messages arr
   expect(timeline.textContent).not.toContain('Unused automatic instruction');
   expect(live.sent).toHaveLength(0);
 });
+
+it('switches the secrets shield off for one project from its sidebar heading', async () => {
+  const project = { id: 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee', name: 'Shielded', path: '/shielded', createdAt: 1 };
+  const { w } = await boot([], false, [], [project], { sessions: [{ ...summary([]), projectId: project.id }] });
+  const api = (w as any).api;
+  const shield = () => w.document.querySelector<HTMLButtonElement>(`[data-project-id="${project.id}"] .project-shield`)!;
+  expect(shield().getAttribute('aria-checked')).toBe('true');
+  api.setProjectSecretsShieldOff = vi.fn(async () => ({ ok: true, data: { ...project, secretsShieldOff: true } }));
+  shield().click();
+  await settle();
+  expect(api.setProjectSecretsShieldOff).toHaveBeenCalledExactlyOnceWith(project.id, true);
+  expect(shield().getAttribute('aria-checked')).toBe('false');
+  expect(shield().classList.contains('is-off')).toBe(true);
+});

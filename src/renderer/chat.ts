@@ -707,6 +707,30 @@ function paintSessions(): void {
       const create = el('button', 'btn project-new'); create.append(icon('i-pencil')); create.setAttribute('type', 'button'); create.dataset.newProject = id;
       ui(create, 'title', () => t("New chat in this project")); create.setAttribute('aria-label', create.title);
       create.addEventListener('click', event => { event.preventDefault(); event.stopPropagation(); selectNewChat(id); }); heading.append(create);
+      // The secrets shield masks credentials in this project's tool results unless switched off
+      // here; Settings can turn it off for every chat, which this switch then only reports.
+      const shield = el('button', 'btn project-shield') as HTMLButtonElement;
+      const globallyOff = deps.state()?.config.ui.secretsShield === false, on = !globallyOff && project.secretsShieldOff !== true;
+      shield.type = 'button'; shield.append(icon('i-lock'));
+      shield.setAttribute('role', 'switch'); shield.setAttribute('aria-checked', String(on));
+      shield.classList.toggle('is-off', !on); shield.disabled = globallyOff;
+      ui(shield, 'title', () => globallyOff ? t("Secrets are not hidden: this is off in Settings for every chat")
+        : on ? t("Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them")
+          : t("Secrets are not hidden in this project's tool results; click to hide them"));
+      ui(shield, 'aria-label', () => t("Hide secrets from ChatGPT in {0}", [project.name]));
+      shield.addEventListener('click', async event => {
+        event.preventDefault(); event.stopPropagation();
+        if (shield.disabled) return;
+        shield.disabled = true;
+        try {
+          const updated = await run(api.setProjectSecretsShieldOff(id, project.secretsShieldOff !== true));
+          if (!updated) return;
+          ++sessionsLoadGeneration;
+          projects = projects.map(row => row.id === id ? updated : row);
+          paintSessions();
+        } finally { shield.disabled = deps.state()?.config.ui.secretsShield === false; }
+      });
+      heading.append(shield);
       const remove = el('button', 'btn project-remove') as HTMLButtonElement;
       remove.type = 'button'; remove.append(icon('i-trash'));
       ui(remove, 'title', () => t("Remove project from sidebar; keep conversations and files"));

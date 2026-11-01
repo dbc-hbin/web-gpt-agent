@@ -467,6 +467,21 @@ internal length and closing boundary; authored whitespace after the frame remain
 Malformed frame-looking native user text remains literal history. Waiting for a canonical
 source requires the existing app-owned send receipt, not a CONTEXT/COS_CONTEXT prefix alone.
 
+### Secrets shield
+
+`main/secrets-shield.ts` masks unmistakable credentials in what a tool returns before ChatGPT
+receives it: provider key shapes (OpenAI, Anthropic, GitHub, AWS access key, Stripe, Slack,
+Google API key), JSON Web Tokens, PEM/PGP private key blocks, and the value of a setting whose
+name ends in a secret word (`…_API_KEY`, `…_SECRET`, `…_TOKEN`, `…_PASSWORD`, …). It never
+guesses from randomness, and examples/references (`${VAR}`, `<your key>`, `changeme`) stay.
+Markers are neutral (`[OpenAI key hidden]`, `[value hidden]`). `kernel.ts::shieldOutput` applies
+it once to the outer result's text and structured copy, before inbox, notices or user input are
+appended; nested code-mode children keep the real value locally. A clipped code-mode recording
+copy is masked the same way, so history shows what ChatGPT received. Files and terminals keep
+their bytes. `config.ui.secretsShield` (missing = on) turns it off everywhere; a project's
+`secretsShieldOff: true` (sidebar lock button) turns it off for that project's chats. An
+unreadable project keeps masking. Each masking logs kinds and counts, never a value.
+
 ### Text Skills
 
 `main/skills.ts` owns the empty-by-default `<userData>/skills/<id>/SKILL.md` library,

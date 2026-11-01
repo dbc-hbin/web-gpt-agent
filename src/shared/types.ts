@@ -155,6 +155,8 @@ export interface UiPrefs {
   startAtLogin?: boolean;
   /** Default screenshots to the active window instead of the whole primary monitor. */
   privacyScreenshots: boolean;
+  /** Mask API keys, tokens, private keys and secret settings in what tools return to ChatGPT. Missing means on. */
+  secretsShield?: boolean;
   /** Browser for app-originated launches; connected source tabs retain placement ownership. */
   chatBrowser?: ChatBrowser;
   /** Explicit choice, never inherited from the OS: the window looks how you left it. */
