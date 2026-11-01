@@ -864,10 +864,12 @@ async function dispatchTracked(
   // The tool's own output is masked once, on the outer call, before anything the app adds
   // (inbox, notices, the user's own new messages): those are not tool output.
   const baseResult = nested ? ownResult : await shieldOutput(context, name, ownResult);
-  // A clipped code-mode preview retains its full output for the recorder only. When the
-  // preview was masked, mask that copy the same way so the record matches what was sent.
-  if (baseResult !== ownResult && context.recordingContent) {
-    context.recordingContent = shieldToolResult({ content: context.recordingContent }).result.content;
+  // A clipped code-mode preview retains its full output for the recorder only. Mask that copy by the
+  // same decision whether or not the preview itself held anything to mask: a secret past the clip
+  // is in the record only.
+  if (!nested && context.recordingContent) {
+    const recorded = shieldToolResult({ content: context.recordingContent });
+    if (recorded.masked.length && await shieldOn(context)) context.recordingContent = recorded.result.content;
   }
   // An unproven caller gets no identity prose here. The call ran, its result is the answer, and a
   // paragraph explaining attribution on every response is output the model pays for and the user

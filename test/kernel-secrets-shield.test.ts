@@ -1,7 +1,7 @@
 import { beforeEach, expect, it, vi } from 'vitest';
 import { z } from 'zod';
 // What a tool returns reaches ChatGPT with credentials masked, unless the shield is off.
-const state = vi.hoisted(() => ({ shield: true as boolean | undefined, projectOff: vi.fn(async (_sessionId: string) => false), log: vi.fn(), warn: vi.fn() }));
+const state = vi.hoisted(() => ({ recorded: [] as Array<{ content: Array<{ text?: string }> }>, shield: true as boolean | undefined, projectOff: vi.fn(async (_sessionId: string) => false), log: vi.fn(), warn: vi.fn() }));
 vi.mock('../src/main/config.js', async (original) => {
   const actual = await original<typeof import('../src/main/config.js')>();
   const base = actual.defaultConfig();
@@ -16,7 +16,7 @@ vi.mock('../src/main/logger.js', async (original) => ({
 vi.mock('../src/main/session/recorder.js', async (original) => ({
   ...await original<typeof import('../src/main/session/recorder.js')>(),
   freshCallOrigin: (_tool: string, _at: number, request: string | null) => request?.startsWith('req-') ? request.slice(4) : null,
-  recordToolCall: async () => null
+  recordToolCall: async (call: { content: Array<{ text?: string }> }) => { state.recorded.push(call); return null; }
 }));
 vi.mock('../src/main/session/correlation.js', async (original) => ({
   ...await original<typeof import('../src/main/session/correlation.js')>(),
@@ -127,4 +127,21 @@ it('masks a progress note sent to ChatGPT by the same decision, and keeps it unm
   state.shield = false;
   await run();
   expect(sent.at(-1)).toContain(KEY);
+});
+
+it('masks the full recording copy even when the clipped preview held nothing to mask', async () => {
+  state.recorded.length = 0;
+  await dispatch('exec', {}, null, 'req-chat-a', 'core', async () => {
+    currentCall()!.recordingContent = [{ type: 'text', text: output }];
+    return ok('output clipped; first line: cat .env');
+  });
+  const recorded = state.recorded.at(-1)!.content.map(part => part.text ?? '').join('');
+  expect(recorded).not.toContain(KEY);
+  expect(recorded).toContain('OPENAI_API_KEY=[OpenAI key hidden]');
+  state.projectOff.mockResolvedValue(true);
+  await dispatch('exec', {}, null, 'req-chat-a', 'core', async () => {
+    currentCall()!.recordingContent = [{ type: 'text', text: output }];
+    return ok('output clipped');
+  });
+  expect(state.recorded.at(-1)!.content.map(part => part.text ?? '').join('')).toContain(KEY);
 });

@@ -484,7 +484,7 @@ guesses from randomness, and examples/references (`${VAR}`, `<your key>`, `chang
 Markers are neutral (`[OpenAI key hidden]`, `[value hidden]`). `kernel.ts::shieldOutput` applies
 it once to the outer result's text and structured copy, before inbox, notices or user input are
 appended; nested code-mode children keep the real value locally. A clipped code-mode recording
-copy is masked the same way, so history shows what ChatGPT received. Progress notifications
+copy is masked by the same decision on its own, even when the preview held nothing to mask. Progress notifications
 (`notifications/progress`, including code-mode `notify`) go to ChatGPT too and are masked by the
 same per-call decision (`shieldOn`); the script itself keeps real values. Files and terminals keep
 their bytes. `config.ui.secretsShield` (missing = on) turns it off everywhere; a project's
