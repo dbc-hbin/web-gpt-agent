@@ -1454,7 +1454,7 @@ export function deferSilenceInput(id: string, conversationId: string, turnId: st
 function withoutSilenceClaim(row: InputEntry, preserveBoundary = false): InputEntry {
   if (row.recovery) return { ...row, state: 'cancelled', error: 'Automatic Continue cancelled by new activity.' };
   return { ...row, state: 'queued', owner: null, silenceBoundary: preserveBoundary ? row.silenceBoundary : undefined, completedTurnId: undefined,
-    ...(manualInput(row) ? { transportIntent: 'tool' } : {}),
+    ...(manualInput(row) && !row.edit ? { transportIntent: 'tool' } : {}),
     companionInputId: undefined, offeredAt: undefined, sendAuthorizedAt: undefined, requiresAuthorization: undefined, deliveryText: undefined, error: undefined };
 }
 /** New work revokes an unspent ticket. Authorized sends retain custody until their exact receipt/failure. */
@@ -1814,6 +1814,9 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
       if (entry.directTurn && entry.state === 'queued' && session.activeTurnId !== entry.directTurn.id) return entry;
       // A fresh-turn continue goes through the composer only: in a tool result it ends no turn.
       if (entry.purpose === 'rotation') return entry;
+      // An edit exists only as ChatGPT's own editor action: in a tool result it would be a new
+      // message beside the question it was meant to replace.
+      if (entry.edit) return entry;
       // ChatGPT may reuse one request id for the whole server turn. Receipt follows
       // the actual invocation start, never a change in that grouping id.
       const received = toolInputReceipt(entry, sessionId, conversationId, startedAt);

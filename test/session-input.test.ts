@@ -1946,4 +1946,13 @@ describe('edit and resubmit', () => {
     expect(await acknowledgeBrowserInput(entry.id, claim!.owner!, 'conversation-a', edited)).toBe(true);
     expect(editReplacement(edited)).toBe(later);
   });
+
+  it('never hands an edit to a tool result, even once a turn is running', async () => {
+    const entry = await enqueueInput(input({ sessionId, text: 'Fix the login bug', edit: { messageId: later } }));
+    binding.activeTurnId = 'running-turn';
+    try {
+      expect(await offerToolInput(sessionId, 'conversation-a', 'req-edit', Date.now())).toEqual([]);
+      expect((await listInputs()).find(row => row.id === entry.id)?.state).toBe('queued');
+    } finally { binding.activeTurnId = null; }
+  });
 });
