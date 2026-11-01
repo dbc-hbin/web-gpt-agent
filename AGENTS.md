@@ -2095,7 +2095,14 @@ unchanged rows, provider identity/HTML/time enrichment and same-item label revis
 An adopted document's first Fiber transcript is a history baseline; subsequent new work is
 compared using the existing retained snapshot and stable message identities. Canonical `seq`
 remains a delivery cursor; `contentSeq`/origin tracks actual work. Explicit historical backfill
-has no new work stamp. Recent-work reads cannot let a late old-row revision hide newer work.
+has no new work stamp. A non-final assistant note tagged with a turn the recorder has seen end, and not
+reopened, stays in history without a work stamp even when reported as just appeared (ChatGPT can
+draw a finished turn's pre-tool progress note only when it collapses that turn's steps). The
+recorder logs the first such report once. `readCompletedFinal` and the finish-turn work stamp
+apply the same rule from the stored owner and turn index, so older saved notes, notes of turns
+before a restart and notes re-reported without a turn id settle too. A final, a note of another
+newer turn, a turn the same request reopened, or a fresh note reopening a thinking-failed turn
+still count as work. Recent-work reads cannot let a late old-row revision hide newer work.
 An existing user message reserialized after reload keeps its work stamp unless the recorder
 observed it as newly authored. Its text and history cursor still update. A different user
 message identity remains new work. Historical text changes cannot cancel a pending Continue
