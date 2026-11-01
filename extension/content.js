@@ -711,6 +711,8 @@
    * never runs: the whole resumed turn's work fell into Unattributed activity.
    */
   const USER_SEND_RECEIPT_MS = 30_000;
+  /** A worker page reports its Send for this long; the app takes a late start back for fifteen minutes. */
+  const WORKER_RECEIPT_WAIT_MS = 10 * 60_000;
   let userSendReceipt = null;
   const pageViewChecks = new Set(); // Existing readiness waits also observe accepted MAIN-world snapshots.
   const sendText = (value) => String(value || '').replace(/\s+/g, '');
@@ -10703,13 +10705,26 @@
     // whole point of the report: for a worker it is what binds the slot to this chat and
     // starts it, and for a resume it is what the session is moved onto. Bounded by the same
     // clock the app is running, so this page never outlives the command it is working on.
-    for (let tries = 0; tries < 80; tries++) {
+    // A worker keeps looking for its new chat for up to WORKER_RECEIPT_WAIT_MS: a hidden tab on a
+    // starved machine can draw it minutes late, and the app takes that late start back (#1086).
+    const reportBy = Date.now() + WORKER_RECEIPT_WAIT_MS;
+    for (let tries = 0; tries < 80 || (boot.type === 'worker' && alive && !attempt?.cancelled &&
+        sendingBootstrap() && Date.now() < reportBy); tries++) {
       await sleep(500);
       const found = boot.type === 'resume' ? bootstrapConversation() : CLF_DOM.conversationId();
       if (found) {
         if (boot.type === 'resume') rememberResumeGoalPending(found, boot.id);
         publishBootstrapSelection(found);
-        const acknowledged = await ask({ type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID });
+        const report = { type: 'ack', id: boot.id, status: 'sent', conversationId: found, agent, client: RUN_ID };
+        let acknowledged = await ask(report);
+        // No answer means the extension's worker did not take it (stopped or restarting), not a
+        // refusal: nothing reached its durable outbox, so the report is sent again. A duplicate is
+        // harmless; both the outbox and the app keep one answer per command.
+        for (let wait = 2_000; !acknowledged && boot.type === 'worker' && alive && !attempt?.cancelled &&
+            Date.now() < reportBy; wait = Math.min(wait * 2, 30_000)) {
+          await sleep(wait);
+          acknowledged = await ask(report);
+        }
         await clearAcknowledgedBootstrap(acknowledged);
         return;
       }

@@ -2614,6 +2614,18 @@ it does not consume the two-attempt terminal failure budget. Only a document-own
 consume that budget. An unclaimed wait neither resets earlier owned failures nor permits automatic
 replay of an ambiguous owned send. The three-minute delivery deadline and native readiness checks
 remain unchanged.
+**Late worker starts.** A worker command that expires after a page claimed it, with no
+page-reported failure, is a late-start candidate for `LATE_START_WINDOW_MS` (15 minutes, in memory,
+at most 32): on a memory-starved machine a page's reports reached the app 20-90 s after it sent
+(upstream #1644/#1086). A `sent` ACK with a conversation from the page that claimed it is then
+settled once by `agents.ts::adoptLateWorker`, durable before it is answered. The same failed worker
+rejoins its family (live, or parked and reactivated) when its chat and a slot are free; its inbox
+is restored and the prime gets `[worker-N started late]` (timeline title "worker-N started late").
+Otherwise a free chat goes on the retired-worker fence and the prime gets `[worker-N started late,
+outside the run]` with the reason. A retried ACK replays the stored receipt; any other late ACK is
+still `no_such_command`. The page side looks for a worker's new chat id for up to
+`WORKER_RECEIPT_WAIT_MS` (10 minutes) within its exact send lifetime, and re-sends the ACK with
+2-30 s backoff while the extension gives no answer; a resume keeps its original 40 s bound.
 Historical worker failures remain visible in status and history, but only live workers produce
 the transient waiting caption. A current canonical final
 uses the same completion reader as Continue/Goal and releases the worker before silence,

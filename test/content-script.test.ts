@@ -14297,6 +14297,44 @@ describe('the fresh chat the app opened', () => {
     ]);
   });
 
+  // Upstream #1644 (#1086): on a starved machine the new chat appeared after the page's 40 s wait,
+  // and its one ACK went to an extension worker that was restarting. The page keeps reporting.
+  it('reports a worker Send whose chat appears late, again when the extension gave no answer', async () => {
+    const workerChat = '24242424-3333-4444-5555-666666666666';
+    let acks = 0;
+    let clicked = false;
+    let reported = false;
+    live = await harness(
+      'https://chatgpt.com/?clf=cmd-late',
+      {
+        redeem: () => ({ ok: true, command: { id: 'cmd-late', type: 'worker', text: 'Audit the renderer.', agent: 'worker-1' } }),
+        // The first report reaches no extension worker; the next one is answered.
+        ack: () => (++acks === 1 ? null : { ok: true })
+      },
+      (document) => {
+        document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+          clicked = true;
+          userTurn(document, 'late-worker-row', 'Audit the renderer.', { sent: false });
+        });
+      }
+    );
+    const startedAt = live.window.Date.now();
+    // ChatGPT draws the new chat only after more than the old 40 s ceiling.
+    for (let round = 0; round < 2000 && !reported; round++) {
+      await settle(10);
+      if (clicked && live.window.Date.now() - startedAt > 60_000 && !live.dom.window.location.pathname.startsWith('/c/')) {
+        live.dom.reconfigure({ url: `https://chatgpt.com/c/${workerChat}` });
+      }
+      if (live.sent.filter((message) => message.type === 'ack').length >= 2) reported = true;
+    }
+    expect(clicked).toBe(true);
+    const reports = live.sent.filter((message) => message.type === 'ack');
+    expect(reports).toEqual([
+      expect.objectContaining({ id: 'cmd-late', status: 'sent', conversationId: workerChat, agent: 'worker-1' }),
+      expect.objectContaining({ id: 'cmd-late', status: 'sent', conversationId: workerChat, agent: 'worker-1' })
+    ]);
+  });
+
   /**
    * The worker label is the bootstrapped conversation's, not the tab's. A New chat opened in a
    * worker's tab is the user's own chat: reported as worker-3 with the worker's command id, the
@@ -14934,6 +14972,9 @@ describe('the fresh chat the app opened', () => {
       await live.hook.runCommand();
       await settle(200);
     }
+    // This fixture's Send never draws a new chat id, so a worker page looks for it through its
+    // whole WORKER_RECEIPT_WAIT_MS before its unnamed report. The harness's sleeps are instant.
+    await settle(40_000);
 
     // The marked fresh tab belongs to this exact command, so ChatGPT's restored New Chat draft
     // is stale page state rather than user work in an existing conversation. A second startup
