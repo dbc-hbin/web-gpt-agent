@@ -1450,5 +1450,7 @@
   "Changes from comparison base": "Cambios desde la base de comparación",
   "Committed changes only; local work is excluded": "Solo cambios confirmados; se excluye el trabajo local",
   "Toggle Review side panel": "Mostrar u ocultar el panel lateral Revisión",
-  "Review · {0}": "Revisión · {0}"
+  "Review · {0}": "Revisión · {0}",
+  "Conflict": "Conflicto",
+  "Conflicts": "Conflictos"
 }

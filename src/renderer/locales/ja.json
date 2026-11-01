@@ -1486,5 +1486,7 @@
   "Changes from comparison base": "比較基点からの変更",
   "Committed changes only; local work is excluded": "コミット済みの変更のみ。ローカルの作業は含みません",
   "Toggle Review side panel": "レビューのサイドパネルを切り替え",
-  "Review · {0}": "レビュー · {0}"
+  "Review · {0}": "レビュー · {0}",
+  "Conflict": "競合",
+  "Conflicts": "競合"
 }

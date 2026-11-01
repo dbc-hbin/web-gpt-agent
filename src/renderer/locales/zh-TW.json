@@ -1484,5 +1484,7 @@
   "Changes from comparison base": "相對於比較基點的變更",
   "Committed changes only; local work is excluded": "僅顯示已提交的變更；不包含本機工作",
   "Toggle Review side panel": "切換檢閱側邊面板",
-  "Review · {0}": "檢閱 · {0}"
+  "Review · {0}": "檢閱 · {0}",
+  "Conflict": "衝突",
+  "Conflicts": "衝突"
 }

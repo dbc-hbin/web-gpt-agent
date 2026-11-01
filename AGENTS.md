@@ -3052,7 +3052,9 @@ passes only a LocalProject UUID and project-relative path through fixed IPC; mai
 approved project/root and Git metadata before reading status or a diff. Git inspection is strictly
 read-only: it strips inherited Git repository/index redirects, uses optional-lock-free bounded
 subprocesses and exposes no stage, commit, reset, checkout or push authority. Review projects
-`M/A/D/R/U`, ancestor-folder markers in the Files tree and bounded unified diffs
+`M/A/D/R/U`, plus `C` for every unmerged index state (`DD/AU/UD/UA/DU/AA/UU`) so an
+unfinished merge is never shown as an ordinary edit (a conflicted file missing from the worktree
+diffs as empty), ancestor-folder markers in the Files tree and bounded unified diffs
 (`createProjectDiffViewer`, `@codemirror/merge`). Review is a second `createFilePanel({ reviewOnly })`
 instance in the same right work slot as Files, Sub-agents and Work, with its own header toggle
 (`reviewPanelToggle`); opening one pane hides the others. The Files toolbar's Changes button opens

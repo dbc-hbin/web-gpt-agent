@@ -1450,5 +1450,7 @@
   "Changes from comparison base": "相对于比较基点的更改",
   "Committed changes only; local work is excluded": "仅显示已提交的更改；不包括本地工作",
   "Toggle Review side panel": "切换审阅侧边栏",
-  "Review · {0}": "审阅 · {0}"
+  "Review · {0}": "审阅 · {0}",
+  "Conflict": "冲突",
+  "Conflicts": "冲突"
 }

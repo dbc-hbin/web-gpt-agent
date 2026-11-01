@@ -623,6 +623,7 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function gitStatusLabel(status: ProjectGitStatus): string {
+    if (status === 'C') return t('Conflict');
     if (status === 'U') return t('Untracked');
     if (status === 'A') return t('Added');
     if (status === 'D') return t('Deleted');
@@ -663,6 +664,8 @@ export function createFilePanel(options: FilePanelOptions) {
   }
 
   function folderGitStatus(statuses: ReadonlySet<ProjectGitStatus>): ProjectGitStatus {
+    // A folder holding a conflict says so, whatever else changed in it.
+    if (statuses.has('C')) return 'C';
     return statuses.size === 1 ? [...statuses][0]! : 'M';
   }
 
@@ -685,9 +688,9 @@ export function createFilePanel(options: FilePanelOptions) {
       const status = gitChange?.status ?? folderGitStatus(descendants!.statuses);
       const marker = el('span', `file-tree-git-status is-${status.toLowerCase()}${descendants ? ' is-directory' : ''}`, status);
       marker.setAttribute('role', 'img');
-      const label = gitChange ? gitStatusLabel(gitChange.status) : folderGitLabel(descendants!.count);
-      marker.title = label;
-      marker.setAttribute('aria-label', label);
+      const label = () => gitChange ? gitStatusLabel(gitChange.status) : folderGitLabel(descendants!.count);
+      ui(marker, 'title', label);
+      ui(marker, 'aria-label', label);
       row.append(marker);
     }
     if (entry.kind === 'file' && entry.bytes !== null) row.append(el('span', 'file-tree-size', humanBytes(entry.bytes)));
@@ -726,8 +729,9 @@ export function createFilePanel(options: FilePanelOptions) {
     if (gitSnapshot?.state === 'ready' && gitSnapshot.changes.length) {
       const status = folderGitStatus(new Set(gitSnapshot.changes.map(change => change.status)));
       const marker = el('span', `file-tree-git-status is-${status.toLowerCase()} is-directory`, status);
-      const label = folderGitLabel(gitSnapshot.changes.length);
-      marker.setAttribute('role', 'img'); marker.setAttribute('aria-label', label); marker.title = label;
+      const count = gitSnapshot.changes.length;
+      marker.setAttribute('role', 'img');
+      ui(marker, 'aria-label', () => folderGitLabel(count)); ui(marker, 'title', () => folderGitLabel(count));
       root.append(marker);
     }
     root.title = project.path;
@@ -1091,15 +1095,16 @@ export function createFilePanel(options: FilePanelOptions) {
       changesList.append(clean);
       return;
     }
-    const groups: Array<[ProjectGitStatus, string]> = [
-      ['M', t('Modified')], ['A', t('Added')], ['D', t('Deleted')],
-      ['R', t('Renamed')], ['U', t('Untracked')]
+    // Group titles and row labels are bound copy, so a language change repaints them in place.
+    const groups: Array<[ProjectGitStatus, () => string]> = [
+      ['C', () => t('Conflicts')], ['M', () => t('Modified')], ['A', () => t('Added')], ['D', () => t('Deleted')],
+      ['R', () => t('Renamed')], ['U', () => t('Untracked')]
     ];
     for (const [status, label] of groups) {
       const entries = gitSnapshot.changes.filter(change => change.status === status);
       if (!entries.length) continue;
       const section = el('section', 'file-change-group');
-      section.append(el('h3', 'file-change-group-title', `${label} (${entries.length})`));
+      section.append(el('h3', 'file-change-group-title', () => `${label()} (${entries.length})`));
       for (const change of entries) {
         const row = el('button', `file-change-row${gitDiffPath === change.path ? ' is-selected' : ''}`) as HTMLButtonElement;
         row.type = 'button';
@@ -1114,8 +1119,9 @@ export function createFilePanel(options: FilePanelOptions) {
         names.append(el('span', 'file-change-path', change.path));
         const stats = changeStats(change);
         row.append(statusMark, names, stats);
-        row.title = `${gitStatusLabel(change.status)} · ${change.previousPath ? `${change.previousPath} → ` : ''}${change.path} · ${stats.textContent ?? ''}`;
-        row.setAttribute('aria-label', row.title);
+        const rowLabel = () => `${gitStatusLabel(change.status)} · ${change.previousPath ? `${change.previousPath} → ` : ''}${change.path} · ${stats.textContent ?? ''}`;
+        ui(row, 'title', rowLabel);
+        ui(row, 'aria-label', rowLabel);
         row.addEventListener('click', () => void openGitDiff(change));
         section.append(row);
       }
