@@ -143,6 +143,19 @@ export interface UiPrefs {
   backgroundChats?: boolean;
   /** Opt-in browser automation for changed connector tool schemas. */
   autoRefreshPlugins?: boolean;
+  /**
+   * #1402: after this many minutes of one turn, the next tool result starts a fresh turn with an
+   * automatic continue (0 = off). Missing means 30.
+   */
+  rotateTurnMinutes?: number;
+  /**
+   * Where ChatGPT offers no Send for a fresh-turn continue at a tool result (it shows only Stop
+   * there), stop the turn right after a result instead and send the continue as an ordinary
+   * message once the stop shows. Missing means on.
+   */
+  rotateStopFallback?: boolean;
+  /** The default-on stop fallback was applied to this config once. */
+  rotateStopFallbackAdopted?: boolean;
   /** Actual app-owned tabs to retain; active work and drafts stay protected. Omitted uses workers + 2. */
   tabsToKeepOpen?: number;
   finishTool?: boolean;

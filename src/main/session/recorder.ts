@@ -1470,7 +1470,8 @@ async function fileToolCall(
         // The one thing an unattributed call still carries: the server turn it belongs to.
         input.requestId ?? null,
         reopenedTurnId,
-        filed
+        filed,
+        input.tool
       );
     } catch (err) {
       logWarn(`call attribution listener failed: ${(err as Error).message}`);
@@ -1605,7 +1606,8 @@ let attributionListener:
       completedFinalAt: number | null,
       requestId: string | null,
       reopenedTurnId: string | null,
-      filedSession: SessionSummary | null
+      filedSession: SessionSummary | null,
+      tool: string
     ) => void)
   | null = null;
 
@@ -1621,7 +1623,8 @@ export function setCallAttributionListener(
         requestId: string | null,
         /** The turn this call reopened, when it proved the page's completed end false. */
         reopenedTurnId: string | null,
-        filedSession: SessionSummary | null
+        filedSession: SessionSummary | null,
+        tool: string
       ) => void)
     | null
 ): void {

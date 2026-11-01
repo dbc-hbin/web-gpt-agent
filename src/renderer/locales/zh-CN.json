@@ -1406,5 +1406,14 @@
   "Secrets are not hidden: this is off in Settings for every chat": "不会隐藏机密：已在设置中对所有聊天关闭",
   "Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them": "此项目的工具结果会向 ChatGPT 隐藏机密；点击停止隐藏",
   "Secrets are not hidden in this project's tool results; click to hide them": "此项目的工具结果不会隐藏机密；点击开始隐藏",
-  "Hide secrets from ChatGPT in {0}": "在 {0} 中向 ChatGPT 隐藏机密"
+  "Hide secrets from ChatGPT in {0}": "在 {0} 中向 ChatGPT 隐藏机密",
+  "Start a fresh turn after": "开始新一轮的时间",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "长时间的工作会在工具结果之后通过自动“继续”在新一轮中接着进行。较短的轮次更不容易中断。Goal 和 Loop 聊天中也会使用；Pro 模型和子代理自己的聊天中不会使用。",
+  "20 minutes": "20 分钟",
+  "30 minutes": "30 分钟",
+  "45 minutes": "45 分钟",
+  "60 minutes": "60 分钟",
+  "{0} min": "{0} 分钟",
+  "Stop and continue when ChatGPT offers no Send": "ChatGPT 不提供发送时停止并继续",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "有些聊天在工具结果处只显示停止，因此新一轮的“继续”无法在那里发送。一轮中出现两次后，应用会在结果之后立即停止该轮，并在显示已停止后发送“继续”。Goal 和 Loop 保持开启，期间到达的步骤不会运行。"
 }

@@ -3350,7 +3350,7 @@ const CHAT_INPUTS = [
   'chatBrowser',
   'goalIncludeToolCalls',
   'planBackend',
-  'finishTool', 'finishLeadMinutes', 'workerModel', 'workerReasoning', 'backgroundChats', 'browserOnly', 'autoRefreshPlugins',
+  'finishTool', 'finishLeadMinutes', 'rotateTurnMinutes', 'rotateStopFallback', 'workerModel', 'workerReasoning', 'backgroundChats', 'browserOnly', 'autoRefreshPlugins',
   'goalBackend',
   'loopBackend',
   'helperModel', 'helperReasoning',
@@ -3460,6 +3460,9 @@ function scheduleReload(): void {
 
 /** Retired automatic drafts belong to their creation time, never the live composer queue. */
 function historicalAutomaticInput(entry: InputEntry): boolean {
+  // A dropped fresh-turn continue (#1402), cancelled or failed: the app files it again by itself,
+  // and failed ones kept at the end of the chat read as its newest messages long after.
+  if (entry.purpose === 'rotation') return (entry.state === 'cancelled' || entry.state === 'failed') && !!entry.error;
   return (!!entry.recovery || (!!entry.finishOwner && !entry.finishOwner.userRequested)) &&
     entry.state === 'cancelled' && !!entry.error;
 }
@@ -3563,7 +3566,7 @@ function paintPendingInputs(): void {
   // A pre-acceptance or failed-materialization row belongs only to its exact draft.
   // A fresh New Chat never inherits another opening.
   const unbound = (entry: InputEntry) => selectedId === null && pendingNewInput?.id === entry.id && pendingNewInput.generation === selectionGeneration && !entry.deliveredSessionId && entry.purpose !== 'decision' && ['queued', 'browser'].includes(entry.state);
-  const notice = (entry: InputEntry) => belongsToSelection(entry) && entry.purpose !== 'decision' &&
+  const notice = (entry: InputEntry) => belongsToSelection(entry) && entry.purpose !== 'decision' && entry.purpose !== 'rotation' &&
     ['failed', 'cancelled'].includes(entry.state) && !!entry.error && !dismissedInputNotices.has(entry.id);
   const anchored = (entry: InputEntry) => detailFor === selectedId && (events.some(event =>
     event.kind === 'user_message' && (event.inputId === entry.id ||

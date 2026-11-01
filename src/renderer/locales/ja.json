@@ -1442,5 +1442,14 @@
   "Secrets are not hidden: this is off in Settings for every chat": "シークレットは隠されません：設定ですべてのチャットに対してオフになっています",
   "Secrets are hidden from ChatGPT in this project's tool results; click to stop hiding them": "このプロジェクトのツール結果ではシークレットを ChatGPT から隠しています。クリックすると隠すのをやめます",
   "Secrets are not hidden in this project's tool results; click to hide them": "このプロジェクトのツール結果ではシークレットを隠していません。クリックすると隠します",
-  "Hide secrets from ChatGPT in {0}": "{0} でシークレットを ChatGPT から隠す"
+  "Hide secrets from ChatGPT in {0}": "{0} でシークレットを ChatGPT から隠す",
+  "Start a fresh turn after": "新しいターンを始めるまで",
+  "Long work continues in a new turn with an automatic Continue, right after a tool result. Shorter turns break less often. Also in Goal and Loop chats; not with Pro models or in sub-agents’ own chats.": "長い作業は、ツール結果の直後に自動の「続行」で新しいターンに引き継がれます。短いターンほど途切れにくくなります。Goal と Loop のチャットでも使われます。Pro モデルやサブエージェント自身のチャットでは使われません。",
+  "20 minutes": "20分",
+  "30 minutes": "30分",
+  "45 minutes": "45分",
+  "60 minutes": "60分",
+  "{0} min": "{0}分",
+  "Stop and continue when ChatGPT offers no Send": "ChatGPT に送信ボタンがないときは停止して続行",
+  "Some chats show only Stop at a tool result, so the fresh turn's Continue can't be sent there. After that happens twice in a turn, the app stops the turn right after a result and sends the Continue once the stop shows. Goal and Loop stay on, and a step that arrives meanwhile is not run.": "ツール結果の時点で停止ボタンしか表示されないチャットでは、新しいターンの「続行」を送れません。1つのターンでそれが2回起きると、アプリは結果の直後にターンを停止し、停止が表示されたら「続行」を送ります。Goal と Loop はオンのままで、その間に届いたステップは実行されません。"
 }

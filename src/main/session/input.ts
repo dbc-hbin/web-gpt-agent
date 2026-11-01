@@ -23,7 +23,7 @@ import { finishInstruction } from '../../shared/finish.js';
 import { attachmentSchema, validateInputAttachments, normalizeInputAttachments } from './input-attachments.js';
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
-import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
+import { recoveryMessage, recoveryBusyMs, rotationMessage } from '../../shared/recovery.js';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -68,7 +68,12 @@ const entrySchema = inputArgs.extend({
   deliveryText: z.string().min(1).max(240000).optional(),
   /** One checkpoint shares this browser send and its receipt with the user's correction. */
   companionInputId: z.string().uuid().optional(),
-  purpose: z.enum(['user', 'decision']).optional(),
+  /** `rotation`: the app's automatic continue that starts a fresh turn in a long one (#1402). */
+  purpose: z.enum(['user', 'decision', 'rotation']).optional(),
+  /** A fresh-turn continue sent as an ordinary message after the app stopped the turn (`ui.rotateStopFallback`). */
+  afterStop: z.literal(true).optional(),
+  /** The exact turn an automatic fresh-turn continue was filed for. */
+  queuedTurn: z.object({ conversationId: z.string().min(1).max(256), turnId: z.string().min(1).max(256) }).optional(),
   /** Durable origin of an app-generated work message. Writing style never proves this;
    * the row that owns the delivery does, and it survives restart with its exact bytes. */
   generatedBy: z.object({ kind: z.literal('work-report'), workId: z.string().uuid().nullable(),
@@ -108,6 +113,13 @@ const entrySchema = inputArgs.extend({
 });
 export type InputEntry = z.infer<typeof entrySchema>;
 const STATE = 'session-input';
+/** extension/content.js reports this, word for word, when ChatGPT offered no Send for a fresh-turn continue. */
+export const ROTATION_DECLINED = 'Fresh-turn continue declined: no Send while ChatGPT works.';
+/**
+ * Continues the page declined, for the call held for each to answer at once. Kept here, not as the
+ * row's error: a cancelled continue with an error is shown in the chat as a failed message.
+ */
+const declinedRotations = new Set<string>();
 const TOOL_INPUT_TEXT_BYTES = 128000;
 export const TOOL_INPUT_HEADER = '\n--- New instructions from the user ---\n';
 export interface ToolInputBatch {
@@ -151,7 +163,7 @@ export async function inputMessageOrigin(sessionId: string, messageId: string | 
   catch { return 'unknown'; }
 }
 /** One delivery policy for composer presentation, admission and the final send fence. */
-export async function sessionInputPolicy(sessionId: string, observedActivity?: InputActivity): Promise<{ queueAtFinish: boolean; canInject: boolean; injectionTurnId: string | null; directTurn: InputEntry['directTurn'] | null; browserAllowed: boolean; settled: boolean }> {
+export async function sessionInputPolicy(sessionId: string, observedActivity?: InputActivity): Promise<{ queueAtFinish: boolean; canInject: boolean; injectionTurnId: string | null; directTurn: InputEntry['directTurn'] | null; browserAllowed: boolean; settled: boolean; runningTurn?: InputEntry['directTurn'] | null }> {
   const [end] = await readRecentEvents(sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
   const session = await getSession(sessionId);
   if (!session?.conversationId || isChatBlocked(session.conversationId)) return { queueAtFinish: false, canInject: false, injectionTurnId: null, directTurn: null, browserAllowed: false, settled: false };
@@ -161,12 +173,17 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
   // A previous turn's MCP history must not disable ordinary-chat steering. The
   // existing start and tool timestamps cover committed work; in-flight custody
   // also covers the first call before its durable recording has landed.
-  const directTurn = !stopped && activity.exact && end?.kind === 'turn_start' &&
+  // The same running non-Pro turn without the tool-free fence. Only the app's fresh-turn continue
+  // (`purpose: 'rotation'`, #1402) uses it: ChatGPT's composer takes a message while a call runs
+  // and folds it into the turn. A person's Send directly keeps the tool-free fence below.
+  const runningTurn = !stopped && activity.exact && end?.kind === 'turn_start' &&
     !!end.turnId && end.turnId === session.activeTurnId && !!selection?.model &&
     activity.model !== 'pro' && activity.model !== 'unknown' &&
-    !isProModel(selection.model, selection.reasoningEffort) &&
-    (session.lastToolCallAt ?? -1) < end.time && inFlightToolCalls(session.conversationId) === 0
+    !isProModel(selection.model, selection.reasoningEffort)
     ? { id: end.turnId, startedAt: end.time } : null;
+  const directTurn = runningTurn && end?.kind === 'turn_start' &&
+    (session.lastToolCallAt ?? -1) < end.time && inFlightToolCalls(session.conversationId) === 0
+    ? runningTurn : null;
   const canInject = !stopped && activity.exact && !directTurn;
   // The bridge's retained exact MCP grant can outlive a native UI end. Project
   // that same turn for image custody, never invent an active recorder turn.
@@ -183,7 +200,7 @@ export async function sessionInputPolicy(sessionId: string, observedActivity?: I
     (end.outcome === 'failed' && end.reason === 'thinking_failed'))) ||
     (!astra && !!completed && !activity.possible && !activity.exact);
   const executing = inFlightToolCalls(session.conversationId) > 0;
-  return { canInject, injectionTurnId, directTurn, queueAtFinish: astra && canInject && getConfig().ui.finishTool === true,
+  return { canInject, injectionTurnId, directTurn, runningTurn, queueAtFinish: astra && canInject && getConfig().ui.finishTool === true,
     browserAllowed: !session.activeTurnId && !activity.possible && !activity.exact && !executing && (!astra || terminal),
     // Completion already reconciles trailing same-request calls. A separate time
     // comparison would leave the composer unsettled after the activity clock stopped.
@@ -225,9 +242,11 @@ async function browserInputAllowed(entry: InputEntry): Promise<boolean> {
   if (entry.completedTurnId && await eligibleStageEnd(entry) !== entry.completedTurnId) return false;
   if (entry.directTurn) {
     const session = await getSession(entry.sessionId);
-    if (!session || session.conversationId !== entry.conversationId ||
-        (session.lastToolCallAt ?? -1) >= entry.directTurn.startedAt || inFlightToolCalls(session.conversationId) > 0) return false;
-    if (session.activeTurnId) return policy.directTurn?.id === entry.directTurn.id;
+    // A fresh-turn continue goes in while the call it is due at still runs (rotation-hold.ts).
+    const rotation = entry.purpose === 'rotation';
+    if (!session || session.conversationId !== entry.conversationId || (!rotation &&
+        ((session.lastToolCallAt ?? -1) >= entry.directTurn.startedAt || inFlightToolCalls(session.conversationId) > 0))) return false;
+    if (session.activeTurnId) return (rotation ? policy.runningTurn : policy.directTurn)?.id === entry.directTurn.id;
     const [end] = await readRecentEvents(entry.sessionId, 1, { kinds: ['turn_start', 'turn_end'] });
     return policy.browserAllowed && end?.kind === 'turn_end' && end.turnId === entry.directTurn.id;
   }
@@ -249,7 +268,7 @@ export function hasEligibleToolInput(sessionId: string, finishBoundary = false):
     if (current.some(row => row.sessionId === sessionId && row.state === 'browser')) return false;
     const head = current.find(row => row.sessionId === sessionId && queuedFollowup(row) && ['queued', 'tool'].includes(row.state));
     for (const row of current) {
-      if (row.sessionId !== sessionId || row.dueAt > Date.now()) continue;
+      if (row.sessionId !== sessionId || row.dueAt > Date.now() || row.purpose === 'rotation') continue;
       if (row.attachments?.length && row.attachmentDelivery !== 'tool' && row.delivery !== 'tool') continue;
       if (row.mode === 'after-turn' || (row.mode === 'finish' && !finishBoundary)) continue;
       if (row.mode === 'finish' && row !== head) continue;
@@ -657,6 +676,85 @@ async function materializeOpening(entry: InputEntry): Promise<void> {
     throw new Error('Reserved opening session belongs to another ChatGPT conversation');
   if (entry.projectId && session.projectId !== entry.projectId) await assignSessionProject(session.id, entry.projectId);
 }
+/**
+ * Files the app's automatic continue into a long running turn (#1402).
+ *
+ * Turns past about 35 minutes almost always broke (stream lost, delivery timeout); Stop and
+ * "continue" by hand never did. A native send into the running turn is exactly that: ChatGPT ends
+ * the turn as interrupted and continues in a fresh one, and a command in flight keeps its result
+ * (measured upstream 2026-10-09). The row is a direct message for that turn, marked `rotation`:
+ * it is no one's typed message, so a page that cannot take it drops it rather than keeping it for
+ * after the turn, and a message of the user's own replaces it before it is handed out. Filed only
+ * for that exact running turn, never beside another pending message, never for Pro or a blocked chat.
+ */
+export function fileRotationInput(sessionId: string, turnId: string): Promise<InputEntry | null> {
+  return serial(async () => {
+    const current = await load();
+    if (current.some(row => row.sessionId === sessionId && !terminal(row))) return null;
+    const session = await getSession(sessionId);
+    if (!session?.conversationId || session.activeTurnId !== turnId || isChatBlocked(session.conversationId)) return null;
+    const policy = await sessionInputPolicy(sessionId);
+    if (policy.runningTurn?.id !== turnId) return null;
+    const now = Date.now();
+    const entry: InputEntry = { id: randomUUID(), sessionId, text: rotationMessage(), mode: 'auto', dueAt: now, model: null, reasoningEffort: null,
+      authoredSource: 'none', purpose: 'rotation', directTurn: policy.runningTurn, transportIntent: 'browser',
+      queuedTurn: { conversationId: session.conversationId, turnId }, state: 'queued', owner: null, createdAt: now,
+      conversationId: session.conversationId };
+    await commit(append(current, entry));
+    return { ...entry };
+  });
+}
+
+/**
+ * The fresh-turn continue for a turn the app stopped (`ui.rotateStopFallback`): an ordinary message,
+ * sent once ChatGPT shows the stop and nothing runs. Nothing else of the person's may be waiting.
+ */
+export function fileRotationContinueAfterStop(sessionId: string, turnId: string): Promise<InputEntry | null> {
+  return serial(async () => {
+    const current = await load();
+    if (current.some(row => row.sessionId === sessionId && !terminal(row))) return null;
+    const session = await getSession(sessionId);
+    if (!session?.conversationId || session.activeTurnId || isChatBlocked(session.conversationId)) return null;
+    const now = Date.now();
+    const entry: InputEntry = { id: randomUUID(), sessionId, text: rotationMessage(), mode: 'auto', dueAt: now, model: null, reasoningEffort: null,
+      authoredSource: 'none', purpose: 'rotation', afterStop: true, transportIntent: 'browser',
+      queuedTurn: { conversationId: session.conversationId, turnId }, state: 'queued', owner: null, createdAt: now,
+      conversationId: session.conversationId };
+    await commit(append(current, entry));
+    return { ...entry };
+  });
+}
+
+/**
+ * Where a fresh-turn continue (#1402) stands, for the tool call held for it (#1662): not yet sent,
+ * being sent (Send is authorized), declined by the page for want of Send, or settled either way.
+ */
+export async function rotationDelivery(id: string): Promise<'pending' | 'sending' | 'declined' | 'settled'> {
+  const row = (await load()).find(entry => entry.id === id);
+  if (!row || row.purpose !== 'rotation') return 'settled';
+  if (row.state === 'cancelled' && declinedRotations.has(id)) return 'declined';
+  if (row.state === 'queued' || (row.state === 'browser' && row.sendAuthorizedAt === undefined)) return 'pending';
+  return row.state === 'browser' ? 'sending' : 'settled';
+}
+
+/**
+ * Withdraws a fresh-turn continue that has not been sent, once the call it was held for has to
+ * answer. Sent after that answer it would land in the gap where ChatGPT queues it behind the
+ * reply. Nobody's message, so it leaves no notice; the turn is tried again at a later call.
+ * Says where it was: still `queued` (no page picked it up) or claimed by a `browser` page that
+ * had not reached Send; null when there was nothing left to withdraw.
+ */
+export function withdrawUnsentRotation(id: string): Promise<'queued' | 'browser' | null> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id && entry.purpose === 'rotation' &&
+      (entry.state === 'queued' || (entry.state === 'browser' && entry.sendAuthorizedAt === undefined)));
+    if (!row) return null;
+    await commit(current.map(entry => entry === row ? { ...entry, state: 'cancelled' as const } : entry));
+    return row.state === 'queued' ? 'queued' : 'browser';
+  });
+}
+
 export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwner'], generatedBy?: InputEntry['generatedBy'], workInput?: InputEntry['workInput']): Promise<InputEntry> {
   return serial(async () => {
     const input = inputArgs.parse(raw);
@@ -748,7 +846,8 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // User input supersedes only automatic work that has never been handed out.
     // Offered tool receipts retain their identity until a later request proves receipt.
     const prioritized = !finishOwner ? current.map(row => row.sessionId === entry.sessionId &&
-      ((row.finishOwner && row.state === 'queued') || (row.recovery && !terminal(row) && row.sendAuthorizedAt === undefined))
+      ((row.finishOwner && row.state === 'queued') || (row.recovery && !terminal(row) && row.sendAuthorizedAt === undefined) ||
+        (row.purpose === 'rotation' && !terminal(row) && row.sendAuthorizedAt === undefined))
       ? { ...row, state: 'cancelled' as const, error: 'Replaced by your new instruction before delivery.' } : row) : current;
     let next = append(prioritized, entry, input.mode === 'auto' && !finishOwner && policy?.canInject === true);
     // A finish plan belongs to an existing session now. Publish every editable
@@ -1329,9 +1428,9 @@ async function completedStageBoundary(entry: InputEntry, current: InputEntry[]):
       row.dueAt <= Date.now() && ['queued', 'browser', 'tool'].includes(row.state))) return null;
   return turnId;
 }
-export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
+export function pendingBrowserInputs(): Promise<Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner' }>> {
   return serial(async () => {
-    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
+    const result: Array<{ id: string; conversationId: string | null; recovery?: { questionId: string; stop: boolean }; silenceTurnId?: string; directTurn?: InputEntry['directTurn']; rotation?: true; supersededConversationId?: string; lifetime?: 'temporary-planner' }> = [];
     const current = await load();
     for (const entry of ordered(current)) {
       if (companionOf(current, entry)) continue;
@@ -1348,6 +1447,7 @@ export function pendingBrowserInputs(): Promise<Array<{ id: string; conversation
           ...(entry.recovery ? { recovery: { questionId: entry.recovery.questionId, stop: entry.silenceBoundary?.nativeBusy === true && entry.recovery.phase === 'ready' } } : {}),
           ...(silenceTurnId ? { silenceTurnId } : {}),
           ...(entry.directTurn ? { directTurn: entry.directTurn } : {}),
+          ...(entry.purpose === 'rotation' && entry.directTurn ? { rotation: true as const } : {}),
           ...(entry.state === 'queued' && entry.purpose !== 'decision' && entry.sessionId && entry.conversationId && entry.conversationId !== conversationId
             ? { supersededConversationId: entry.conversationId } : {}),
           ...(entry.lifetime ? { lifetime: entry.lifetime } : {}) });
@@ -1555,6 +1655,8 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
       if (entry.attachments?.length && entry.attachmentDelivery !== 'tool' && entry.delivery !== 'tool') return entry;
       if (entry.delivery === 'tool' && entry.toolTurnId !== activeToolTurn) return entry;
       if (entry.directTurn && entry.state === 'queued' && session.activeTurnId !== entry.directTurn.id) return entry;
+      // A fresh-turn continue goes through the composer only: in a tool result it ends no turn.
+      if (entry.purpose === 'rotation') return entry;
       // ChatGPT may reuse one request id for the whole server turn. Receipt follows
       // the actual invocation start, never a change in that grouping id.
       const received = toolInputReceipt(entry, sessionId, conversationId, startedAt);
@@ -1603,7 +1705,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
   });
 }
 
-export function resetInputForTests(): void { entries = null; chain = Promise.resolve(); initialRestored = false; restorePromise = null; initialLoadPromise = null; offered.clear(); decisionWaiters.clear(); }
+export function resetInputForTests(): void { declinedRotations.clear(); entries = null; chain = Promise.resolve(); initialRestored = false; restorePromise = null; initialLoadPromise = null; offered.clear(); decisionWaiters.clear(); }
 
 export async function pausedBrowserHelpers(): Promise<Array<{ id: string; sourceSessionId: string }>> {
   return (await listInputs()).filter(row => row.purpose === 'decision' && row.state === 'cancelled' && !row.conversationId && row.decisionSourceSessionId)
@@ -1629,6 +1731,15 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
     const current = await load();
     const entry = current.find((row) => row.id === id && row.owner === owner && row.state === 'browser');
     if (!entry || companionOf(current, entry)) return false;
+    // ChatGPT showed Stop and offered no Send for a fresh-turn continue; nothing was sent. The call
+    // held for it answers now, and a later tool result may try again (turn-rotation.ts).
+    if (entry.purpose === 'rotation' && entry.sendAuthorizedAt === undefined && error === ROTATION_DECLINED) {
+      logInfo(`input ${entry.id}: ChatGPT offered no Send for the fresh-turn continue; a later tool result tries again`);
+      await commit(current.map(row => row === entry ? { ...row, state: 'cancelled', owner: null } : row));
+      declinedRotations.add(entry.id);
+      if (declinedRotations.size > 200) declinedRotations.delete(declinedRotations.values().next().value!);
+      return true;
+    }
     if (entry.recovery && entry.requiresAuthorization === true && entry.sendAuthorizedAt === undefined) {
       await commit(current.map(row => row === entry ? releaseRecoveryClaim(row) : row));
       return true;

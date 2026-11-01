@@ -836,6 +836,30 @@ it('saves the ChatGPT browser choice from its settings control and restores it o
   expect(browser.value).toBe('chrome');
 });
 
+// #1402: long turns continue in a fresh one, every 30 minutes unless changed or off. A value the
+// list does not offer gets its own option, so saving another setting cannot turn fresh turns Off.
+it('starts a fresh turn after 30 minutes unless changed, keeps an unlisted value, and saves Off', async () => {
+  const mounted = await mountChat();
+  const w = mounted.window;
+  const rotate = w.document.getElementById('rotateTurnMinutes') as HTMLSelectElement;
+  const fallback = w.document.getElementById('rotateStopFallback') as HTMLInputElement;
+  expect(rotate.value).toBe('30');
+  expect(fallback.checked).toBe(true);
+  expect([...rotate.options].map(option => option.value)).toEqual(['0', '20', '30', '45', '60']);
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, rotateTurnMinutes: 1 } } });
+  expect(rotate.value).toBe('1');
+  const browser = w.document.getElementById('chatBrowser') as HTMLSelectElement;
+  browser.value = 'edge';
+  browser.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(1));
+  expect(mounted.calls[0].ui).toMatchObject({ rotateTurnMinutes: 1, rotateStopFallback: true });
+  rotate.value = '0';
+  rotate.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls.at(-1)?.ui.rotateTurnMinutes).toBe(0));
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, ui: { ...mounted.state.config.ui, rotateTurnMinutes: 0 } } });
+  expect(fallback.disabled).toBe(true);
+});
+
 it('preserves focused Desktop permission controls across supported-host state pushes', async () => {
   const mounted = await mountChat({
     platform: { family: 'windows', name: 'Windows', desktopAutomation: true }

@@ -90,6 +90,8 @@ import {
 } from '../session/recorder.js';
 import { requestCorrelation } from '../session/correlation.js';
 import { BLOCKED_CHAT_REFUSAL, anyChatBlocked, isChatBlocked } from '../session/blocked-chats.js';
+import { ROTATION_FENCE_REFUSAL, rotationFenced } from '../rotation-fence.js';
+import { openCallHold } from '../rotation-hold.js';
 import { anyContinuationOpen, compactingConversation } from '../session/continuation.js';
 import { DEFAULT_MAX_OUTPUT_TOKENS } from '../codex/unified-exec-constants.js';
 import { conversationAttachment } from '../session/store.js';
@@ -761,6 +763,9 @@ async function dispatchTracked(
           )
         : endedWorker
         ? Promise.resolve(fail(endedWorker))
+        // A turn being stopped to continue in a fresh one: nothing runs until the stop shows.
+        : rotationFenced(context.caller.conversationId)
+        ? Promise.resolve(fail(ROTATION_FENCE_REFUSAL))
         : nested && surface !== 'plugins' && (name === 'exec' || name === 'exec_read' || name === 'session_finish' || isFinish)
         ? Promise.resolve(fail('DIRECT_CALL_REQUIRED: call this lifecycle tool directly, outside exec. No action was taken.'))
         : managedToolGate
@@ -884,6 +889,9 @@ async function dispatchTracked(
   // are measured separately because a row cannot contain the time of its own later commit.
   const durationMs = recorderStartedAt - startedAt;
   markTiming('delivery');
+  // #1662: a call recorded while its answer is still held lets a due fresh-turn continue go in
+  // while ChatGPT still sees the call running; the answer waits for it below, bounded.
+  const closeHold = !nested && context.caller.conversationId ? openCallHold(context.caller.conversationId) : null;
   // A handler may return a bounded wire preview while retaining its original explicit output for
   // the session recorder. App-authored delivery blocks are not in that original, so append them
   // once; never copy the full recording-only content into the MCP response or structured content.
@@ -913,7 +921,7 @@ async function dispatchTracked(
   // broken history never breaks the tool itself. Only the degraded/unidentified path remains
   // fire-and-forget because it may still spend a grace window waiting for page evidence.
   if (context.caller.conversationId) {
-    await recording;
+    try { await recording; } finally { await closeHold?.(); }
   } else {
     void recording.then(() => logInfo(`mcp recording surface=${surface} recorder_async_ms=${Date.now() - recorderStartedAt}`));
     holdWhileSettling(context, recording);

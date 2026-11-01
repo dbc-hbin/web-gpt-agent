@@ -776,6 +776,64 @@ describe('desktop input delivery and helper ownership', () => {
     expect(live.sent.filter(message => message.ack)).toHaveLength(change === 'accepted' ? 1 : 0);
     if (change === 'draft') expect(composerText(live.document)).toBe('My own draft');
   });
+  // #1402/#1662: the app's fresh-turn continue goes into the running turn while ChatGPT works, with
+  // ChatGPT's own Send, and never stops the turn: a Stop while a call runs made the model run it again.
+  // A first turn's question may be missing from the page; the page's own turn id names the turn.
+  it.each([true, false])('sends a fresh-turn continue into the running turn without stopping it (question shown: %s)', async shown => {
+    let directTurn: { id: string; startedAt: number };
+    live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => {
+        if (message.authorize || message.ack || message.fail) return { ok: true, data: { ok: true } };
+        return { ok: true, data: { input: claimed({ directTurn, purpose: 'rotation' }) } };
+      }
+    });
+    startGenerating(live.document);
+    live.hook.observe(); await live.hook.flush();
+    const start = emitted(live.sent, 'turn_start').at(-1)!;
+    directTurn = { id: start.event.turnId as string, startedAt: start.event.time as number };
+    if (!shown) {
+      for (const row of live.document.querySelectorAll('[data-message-author-role="user"]')) row.closest('[data-testid^="conversation-turn"]')?.remove() ?? row.remove();
+      live.hook.observe(); await live.hook.flush();
+    }
+    const stops = vi.fn();
+    const stop = live.document.querySelector('[data-testid="stop-button"]')!;
+    Object.defineProperty(stop, 'getClientRects', { value: () => [{ width: 32, height: 32 }] });
+    stop.addEventListener('click', stops);
+    const sends = watchSend(live.document);
+    live.document.querySelector('[data-testid="send-button"]')!.addEventListener('click', () => {
+      userTurn(live!.document, 'rotation-continue', text, { sent: false });
+      live!.document.querySelector('#prompt-textarea')!.textContent = '';
+    });
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, directTurn, rotation: true }),
+      JSON.stringify(live.sent.filter(message => message.type === 'desktop_input'))).toEqual({ ok: true });
+    expect(stops).not.toHaveBeenCalled();
+    expect(sends()).toBe(1);
+    expect(live.sent.filter(message => message.ack)).toHaveLength(1);
+  });
+  // Where ChatGPT shows only Stop it offers no Send: the page declines at once, in the app's words,
+  // so the call held for the continue answers now and a later tool result tries again.
+  it('declines a fresh-turn continue at once when ChatGPT offers only Stop', async () => {
+    const { ROTATION_DECLINED } = await import('../src/main/session/input.js');
+    let directTurn: { id: string; startedAt: number };
+    live = await nonProHarness(`https://chatgpt.com/c/${chatA}`, {
+      desktop_input: message => {
+        if (message.authorize || message.ack || message.fail) return { ok: true, data: { ok: true } };
+        return { ok: true, data: { input: claimed({ directTurn, purpose: 'rotation' }) } };
+      }
+    });
+    startGenerating(live.document);
+    live.hook.observe(); await live.hook.flush();
+    const start = emitted(live.sent, 'turn_start').at(-1)!;
+    directTurn = { id: start.event.turnId as string, startedAt: start.event.time as number };
+    live.document.querySelector('[data-testid="send-button"]')?.remove();
+    const stops = vi.fn();
+    live.document.querySelector('[data-testid="stop-button"]')!.addEventListener('click', stops);
+    expect(await live.runtimeMessage({ type: 'clf-desktop-input', id: inputId, conversationId: chatA, directTurn, rotation: true })).toEqual({ ok: false });
+    expect(stops).not.toHaveBeenCalled();
+    expect(live.sent.filter(message => message.ack || message.authorize)).toHaveLength(0);
+    expect(live.sent.filter(message => message.fail)).toContainEqual(expect.objectContaining({ error: ROTATION_DECLINED }));
+    expect(live.document.querySelector('#prompt-textarea')!.textContent!.trim()).toBe('');
+  });
   it.each([false, true])('retains a reused-document send boundary when canonical Fiber text arrives before activity identity (promoted submit: %s)', async promotedSubmit => {
     const submitted = 'Keep [literal] #tags in the receipt.';
     const escaped = String.raw`Keep \[literal\] \#tags in the receipt\.`;
