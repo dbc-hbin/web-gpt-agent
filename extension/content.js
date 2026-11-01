@@ -3089,7 +3089,7 @@
    * of the command the user thinks the row represents. That number is useful forensic data
    * and stays in the session record, but presenting it as a completion badge is misleading.
    * Keep concrete output metrics (line deltas, hit counts, exit failures) and suppress only
-   * the green success-duration shape in the extension. See TODO T-129.
+   * the green success-duration shape in the extension: that shape alone never says the command finished.
    */
   function displayMetric(summary) {
     const metric = summary && typeof summary.metric === 'string' ? summary.metric.trim() : '';
