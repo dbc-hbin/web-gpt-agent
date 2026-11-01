@@ -1,4 +1,4 @@
-import type { SessionEvent } from '../shared/session.js';
+import { isWorkerAgent, type SessionEvent } from '../shared/session.js';
 import type { TurnFileChange } from '../main/session/turn-changes.js';
 import { el, icon, run } from './dom.js';
 import { t, ui } from './i18n.js';
@@ -13,12 +13,15 @@ import { positionOf } from '../shared/chronology.js';
  * rows stay the step-by-step record.
  */
 
-const WORKER = /^worker-\d+$/;
+/** One of the chat's own successful calls in this turn that recorded edits; a worker's are not. */
+export function ownTurnEdit(event: SessionEvent, turnId: string): event is Extract<SessionEvent, { kind: 'tool_call' }> {
+  return event.kind === 'tool_call' && event.turnId === turnId && !isWorkerAgent(event.agent) &&
+    event.call.outcome === 'ok' && (event.call.changes?.length ?? 0) > 0;
+}
 
 /** How many of the chat's own calls in this turn recorded a successful edit, as loaded; a worker's do not count. */
 export function turnEditCount(events: readonly SessionEvent[], turnId: string): number {
-  return events.filter(event => event.kind === 'tool_call' && event.turnId === turnId && !(event.agent && WORKER.test(event.agent)) &&
-    event.call.outcome === 'ok' && (event.call.changes?.length ?? 0) > 0).length;
+  return events.filter(event => ownTurnEdit(event, turnId)).length;
 }
 
 /** The message id of a turn's last final answer as loaded: the one the card sits under. */

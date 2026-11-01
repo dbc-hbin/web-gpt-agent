@@ -7,7 +7,7 @@ import { marked, Marked } from 'marked';
 import { safeExternalLink } from '../shared/external-link.js';
 import { createAgentPanel } from './agent-panel.js';
 import { createFilePanel } from './file-panel.js';
-import { firstTurnStart, renderTurnChanges, turnAnswerMessage, turnEditCount, turnFinished, turnFrom } from './turn-changes.js';
+import { firstTurnStart, ownTurnEdit, renderTurnChanges, turnAnswerMessage, turnEditCount, turnFinished, turnFrom } from './turn-changes.js';
 import { createWorkPanel } from './work-panel.js';
 import { renderAgentPlan } from './agent-plan.js';
 import { userPromptText } from '../shared/user-prompt.js';
@@ -1101,8 +1101,7 @@ function olderHistoryPending(): boolean {
  * does); without one, the panel's working-tree Changes.
  */
 async function openTurnInReview(projectId: string, sessionId: string, turnId: string): Promise<void> {
-  const call = [...events].reverse().find((event): event is Extract<SessionEvent, { kind: 'tool_call' }> => event.kind === 'tool_call' &&
-    event.turnId === turnId && !(event.agent && /^worker-\d+$/.test(event.agent)) && event.call.outcome === 'ok' &&
+  const call = [...events].reverse().find((event): event is Extract<SessionEvent, { kind: 'tool_call' }> => ownTurnEdit(event, turnId) &&
     (event.call.changes ?? []).some(change => change.reviewAssetId))?.call;
   const indices = call ? (call.changes ?? []).flatMap((change, index) => change.reviewAssetId ? [index] : []).slice(0, 8) : [];
   if (!call || !indices.length) { await reviewPanel?.show(); return; }
