@@ -1118,6 +1118,19 @@
 
   const sleep = (ms) => new Promise((resolve) => later(resolve, ms));
 
+  const SIGNED_OUT = 'ChatGPT is not signed in in this browser. Sign in to ChatGPT there, then send again.';
+  /** ChatGPT's own answer that no account is signed in on this page; false when unknown. */
+  async function chatGptSignedOut() {
+    try {
+      if (typeof fetch !== 'function') return false;
+      const response = await fetch('/api/auth/session', { credentials: 'include', cache: 'no-store',
+        signal: typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(4000) : undefined });
+      if (!response?.ok) return false;
+      const session = await response.json();
+      return !!session && typeof session === 'object' && !Array.isArray(session) && !session.accessToken && !session.user;
+    } catch { return false; }
+  }
+
   const utf8Bytes = (value) => {
     const text = typeof value === 'string' ? value : String(value ?? '');
     if (typeof TextEncoder === 'function') return new TextEncoder().encode(text).byteLength;
@@ -1278,6 +1291,9 @@
     // here made a long service-worker outage look like a complete transcript even though item
     // 401 had already erased item 1 before the durable journal ever saw it.
     while (queue.length > 400 || queueBytes > MAX_PAGE_QUEUE_BYTES) {
+      // Diagnostic request traces go first and leave no gap: they are not history.
+      const trace = queue.findIndex((entry) => entry.event?.kind === 'request_trace' && !queueGapKeys.has(entry));
+      if (trace >= 0) { removeQueueEntry(trace); continue; }
       const index = queue.findIndex((entry) => !queueGapKeys.has(entry));
       if (index < 0) break;
       const dropped = removeQueueEntry(index);
@@ -8848,7 +8864,7 @@
         const fresh = await refreshFiber(null, true);
         if (!current()) return true;
         return fresh && received();
-      }, TOOL_SETTLE_MS);
+      }, TOOL_SETTLE_MS, RECEIPT_QUICK_MS);
       if (!current()) return 'This chat changed while compaction was waiting for tool results.';
       if (!ready) return 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
     }
@@ -9903,6 +9919,8 @@
    * headroom without making a genuinely stuck local call wait indefinitely.
    */
   const TOOL_SETTLE_MS = 30_000;
+  /** The first stretch of the native-receipt wait, checked quickly; most receipts land within seconds. */
+  const RECEIPT_QUICK_MS = 10_000;
   /** How many silent answers about pending calls to sit through before refusing. */
   const SETTLE_UNKNOWN_TRIES = 3;
 
@@ -9922,9 +9940,14 @@
     return Number.isFinite(count) && count >= 0 ? count : null;
   }
 
-  /** Polls a condition. Resolves true when it holds, false when the budget runs out. */
-  async function waitUntil(test, budgetMs) {
-    const until = Date.now() + budgetMs;
+  /**
+   * Polls a condition. Resolves true when it holds, false when the budget runs out.
+   * Checks every 250 ms; a wait given `slowAfterMs` checks every 2 s after that, since each
+   * check reads the page and quarter-second checks weigh most on slow machines.
+   */
+  async function waitUntil(test, budgetMs, slowAfterMs = Infinity) {
+    const started = Date.now();
+    const until = started + budgetMs;
     for (;;) {
       let held = false;
       try {
@@ -9934,7 +9957,7 @@
       }
       if (held) return true;
       if (Date.now() >= until) return false;
-      await sleep(250);
+      await sleep(Date.now() - started >= slowAfterMs ? 2000 : 250);
     }
   }
 
@@ -10286,6 +10309,51 @@
    */
   let commandJournalGate = false;
 
+  /** The chat whose history ChatGPT last limited on this page, and when; see closeAnnouncements. */
+  let historyLimitSeen = null;
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) && CLF_DOM.conversationId() === claimed)
+      historyLimitSeen = { conversationId: claimed, at: Date.now() };
+  });
+  /**
+   * Closes ChatGPT announcements over this page (CLF_DOM.dismissAnnouncements) and tells the app which.
+   * Not on a chat whose history ChatGPT limited in the last 10 minutes: its access-limit notice is a
+   * dialog like any other, recognized by wording in only some languages, and must stay for the person.
+   */
+  /**
+   * One typed reason this page cannot take a message: `access_limited` (ChatGPT's notice, or a
+   * dialog over the composer on a chat whose history was limited in the last 10 minutes) or
+   * `announcement` (any other dialog over the composer). Read from state other owners already keep; nothing here waits or polls.
+   */
+  function currentPageUnusable() {
+    const drawn = CLF_DOM.pageUnusable();
+    const chat = CLF_DOM.conversationId();
+    // During a history limit a dialog over the composer is taken for its notice, as closeAnnouncements does.
+    const limited = historyLimitSeen && historyLimitSeen.conversationId === chat && Date.now() - historyLimitSeen.at < 10 * 60_000;
+    return limited && drawn !== null ? 'access_limited' : drawn;
+  }
+  /** A held input says once per chat and reason why the page held it (the app logs it). */
+  let pageUnusableNoted = '';
+  function notePageUnusable() {
+    const reason = currentPageUnusable(), chat = CLF_DOM.conversationId();
+    const key = reason ? `${chat}|${reason}` : '';
+    if (key === pageUnusableNoted) return;
+    pageUnusableNoted = key;
+    if (reason) void ask({ type: 'page_note', note: 'page-unusable', reason, conversationId: chat }).catch(() => undefined);
+  }
+  async function closeAnnouncements(stillCurrent = () => true) {
+    const chat = CLF_DOM.conversationId();
+    if (historyLimitSeen && historyLimitSeen.conversationId === chat && Date.now() - historyLimitSeen.at < 10 * 60_000) return [];
+    const closed = await CLF_DOM.dismissAnnouncements(stillCurrent).catch(() => []);
+    // Reported for the chat it was closed on; a page that moved on meanwhile says nothing.
+    if (stillCurrent() && CLF_DOM.conversationId() === chat) {
+      for (const heading of closed) void ask({ type: 'page_note', note: 'announcement-closed', heading, conversationId: chat }).catch(() => undefined);
+    }
+    return closed;
+  }
+
   /**
    * Waits for ChatGPT to expose a connected composer without putting bootstrap delivery
    * behind a chain of timer samples.
@@ -10516,11 +10584,21 @@
     // The composer is the readiness signal. Page-level `readyState` says whether every
     // resource finished loading, not whether this editing host is usable, and waiting on it
     // is what turned a fresh resume tab into a blank tab for a minute on a throttled page.
-    const readyComposer = await waitForComposer();
-    if (!readyComposer) return void (await fail('ChatGPT never exposed a usable composer for bootstrap'));
+    // A ChatGPT announcement over the fresh page hides the message box behind its modal.
+    if (!CLF_DOM.composerVisible()) await closeAnnouncements(stillOnTarget);
+    let readyComposer = await waitForComposer();
+    // One that opened after the page loaded gets the same treatment, once.
+    if (!readyComposer && (await closeAnnouncements(stillOnTarget)).length) readyComposer = await waitForComposer(5_000);
+    if (!readyComposer) {
+      const unusable = currentPageUnusable();
+      return void (await fail(`ChatGPT never exposed a usable composer for bootstrap${unusable ? ` (page_unusable: ${unusable})` : ''}`));
+    }
     if (await failIfRetargeted()) return;
 
-    if ((boot.model || boot.reasoningEffort) && !(await CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget))) {
+    // An announcement that opened over the picker refuses the choice; closing it earns one more try.
+    const chooseModel = () => CLF_DOM.selectModelSettings(boot.model, boot.reasoningEffort, stillOnTarget);
+    if ((boot.model || boot.reasoningEffort) && !(await chooseModel()) &&
+        !((await closeAnnouncements(stillOnTarget)).length && stillOnTarget() && await chooseModel())) {
       return void (await fail('The requested model or reasoning is unavailable or could not be confirmed in ChatGPT'));
     }
     const selectionConfirmedAt = Date.now();
@@ -10537,6 +10615,8 @@
         ...(boot.reasoningEffort ? { reasoningEffort: boot.reasoningEffort } : {}), time: selectionConfirmedAt });
     };
     if (await failIfRetargeted()) return;
+    // A worker brief, Resume handoff or helper prompt never goes into an anonymous signed-out chat.
+    if (await chatGptSignedOut()) return void (await fail(SIGNED_OUT));
     let insertionFailure = '';
     if (!CLF_DOM.insertPrompt(boot.text, true, reason => { insertionFailure = reason; })) {
       return void (await fail(`ChatGPT refused the inserted text${insertionFailure ? ` (${insertionFailure})` : ''}`));
@@ -10903,11 +10983,35 @@
     // New chats can receive their stream id before /c/<id>. The existing observer
     // drains a bounded set when that exact route appears; navigation retires it.
     for (const requestId of requestIds) {
-      if (requestOwnersConfirmed.get(requestId) === claimed || pendingStreamOrigins.has(requestId) || pendingStreamOrigins.size >= 16) continue;
+      if (requestOwnersConfirmed.get(requestId) === claimed || pendingStreamOrigins.has(requestId)) continue;
+      // Sixteen at most. The newest is the turn running now; an old one the app could not place
+      // yet gives way instead of the current turn's id being dropped.
+      if (pendingStreamOrigins.size >= 16) pendingStreamOrigins.delete(pendingStreamOrigins.keys().next().value);
       pendingStreamOrigins.set(requestId, { conversationId: claimed, observedAt, epoch, deadline: Date.now() + 15 * 60_000 });
     }
     flushStreamRequestOrigins();
   }
+  // Diagnostics: request ids this chat's stream named in fields attribution does not trust, with
+  // the field's path, so the app's log says where an id it could not place did appear.
+  const requestTracesReported = new Set();
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-request-trace') return;
+    if (temporaryPlannerPage()) return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!claimed || CLF_DOM.conversationId() !== claimed) return;
+    const traces = [];
+    for (const entry of (Array.isArray(event.data.traces) ? event.data.traces : []).slice(0, 16)) {
+      const requestId = cap(entry?.requestId, 100), path = cap(entry?.path, 200);
+      if (!requestId || !path || requestTracesReported.has(requestId) || !/^[A-Za-z0-9_./:>*\[\]-]{1,200}$/.test(path) ||
+          !/^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(requestId)) continue;
+      traces.push({ requestId, path });
+    }
+    // Expendable: while the queue fills (the extension's worker away), history comes first.
+    if (!traces.length || queue.length >= 300) return;
+    if (requestTracesReported.size > 2000) requestTracesReported.clear();
+    for (const trace of traces) requestTracesReported.add(trace.requestId);
+    emit({ kind: 'request_trace', traces });
+  });
   window.addEventListener('message', (event) => {
     if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-request-origin') return;
     const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
@@ -11136,6 +11240,8 @@
       // Settings/plan dialogs retain the editor behind aria-hidden/inert. Claiming
       // that editor turns ordinary page unavailability into a false model failure.
       // Keep the input queued until this same document exposes its composer again.
+      // An announcement is not a dialog the person is using: close it so the message is not held behind it.
+      if (!CLF_DOM.composerVisible()) await closeAnnouncements(onTarget);
       const composer = await waitPageView(() => (message.directTurn || !CLF_DOM.generating()) && CLF_DOM.composerVisible() && CLF_DOM.composer(),
         () => onTarget() && (message.directTurn || silencePickup || !generating) && pendingTools === 0, 15000);
       if (!composer && onTarget() && CLF_DOM.generating() && await confirmedProviderTerminal() && onTarget() && CLF_DOM.generating()) {
@@ -11145,7 +11251,10 @@
         await flush();
         return false; // No claim, insertion or Send: queued input survives recovery.
       }
-      if (!composer || !onTarget() || (!message.directTurn && ((!silencePickup && generating) || CLF_DOM.generating())) || !CLF_DOM.composerVisible()) return false;
+      if (!composer || !onTarget() || (!message.directTurn && ((!silencePickup && generating) || CLF_DOM.generating())) || !CLF_DOM.composerVisible()) {
+        if (onTarget()) notePageUnusable();
+        return false;
+      }
       const reply = await ask({ type: 'desktop_input', id: message.id, conversationId: target, requiresAuthorization: true });
       const input = reply?.data?.input;
       if (input?.silenceBoundary || input?.completedTurnId) { claimedSilence = input; sourceQuiet = true; }
@@ -11192,6 +11301,10 @@
       // This exact claimed bootstrap owns replacement text; existing chats and
       // attachment drafts remain protected. Re-evaluate after model selection,
       // since React can hydrate that autosaved text while the picker is open.
+      // A signed-out ChatGPT still offers a composer and answers in an anonymous chat that is never
+      // saved, so the app's message would leave the account and never get a receipt. Only ChatGPT's
+      // own "no account" answer stops it; an unreadable session is not evidence.
+      if (await chatGptSignedOut()) return fail(SIGNED_OUT);
       if ((!ownsFreshPage() && (composer.textContent || '').trim()) || CLF_DOM.hasComposerAttachments()) return fail('ChatGPT already contains an unsent draft. Send or clear that draft in Chrome before trying again.');
       if (message.directTurn) {
         // The offer only wakes this document. The just-committed outbox claim
@@ -11242,6 +11355,8 @@
       if (!onTarget() || !draft.current() || sendText(CLF_DOM.composer()?.textContent) !== sendText(input.text)) return fail('The composer changed; your draft was preserved');
       const previousUserId = CLF_DOM.messages().filter(row => row.role === 'user').at(-1)?.id;
       const submittedText = sendText(CLF_DOM.composer()?.textContent);
+      // The app's answer to this page's one authorization request, once asked.
+      let authorization = null;
       if (input.purpose === 'decision') {
         decision = { id: input.id, owner: input.owner, messageId: null, text: input.text, temporary, onTarget: sendingTarget, conversationId: null, epoch: forEpoch, response: '', publishing: false };
         desktopDecision = decision;
@@ -11265,7 +11380,8 @@
         const authority = await reportAuthorized();
         if (authority.ok !== true) { void fail(authority.error); return false; }
         if (!sendCurrent() || !onTarget() || !draft.current()) return false;
-        const authorized = await ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, authorize: true });
+        authorization = ask({ type: 'desktop_input', id: input.id, owner: input.owner, conversationId: target, authorize: true });
+        const authorized = await authorization;
         if (!sendCurrent() || authorized?.data?.ok !== true || !onTarget() || !draft.current()) return false;
         if (input.recovery && !await recoveryPageUnfinished(() => sendCurrent() && onTarget() && draft.current())) return false;
         sendAttempted = true;
@@ -11278,7 +11394,22 @@
         // may replace it before this async operation resumes; do not rediscover it.
         receipt = { conversation, user: { id: user.id } };
         return true;
-      }))) return false;
+      }))) {
+        // Authorized, yet never clicked: ChatGPT drew the editor again while the app answered, as a
+        // fresh tab does when it moves to its project route. Nothing went out, but the claim reads as
+        // a send that may have, so the message would never be sent at all. With this exact text taken
+        // back out of the composer the app sends it again. Continue and after-turn pickups keep their
+        // own withdrawal. The app's answer comes first, so a report never reaches it ahead of its own
+        // record, and an explicit no needs none. No user row is compared: a fresh tab draws earlier
+        // questions after Send began, and withdraw() takes back only the exact untouched text.
+        const answer = authorization ? await Promise.resolve(authorization).catch(() => null) : null;
+        if (authorization && answer?.data?.ok !== false && !sendAttempted && !receipt && !input.recovery && !claimedSilence && onTarget()) {
+          let withdrawn = false;
+          try { withdrawn = draft.withdraw(); } catch { /* Text not proven ours stays where it is. */ }
+          if (withdrawn) return fail('Native Send was withdrawn before its click.');
+        }
+        return false;
+      }
       if (!receipt || !sendingTarget()) return false;
       // Native Send listeners refresh the receipt; pin only that witnessed object.
       const witnessedSendReceipt = userSendReceipt;
@@ -11602,6 +11733,7 @@
           // app-owned activity now appears only in the canonical chronological stream.
           painted: false,
           bridge: { connected: status.connected === true, paired: status.paired === true },
+          pageUnusable: currentPageUnusable(),
           ...observed
         });
         return false;

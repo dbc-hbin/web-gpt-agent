@@ -437,11 +437,23 @@ async function persistJournalNow() {
   }
 }
 
+/** The write queued behind the one in flight; it has not taken its snapshot yet. */
+let queuedJournalWrite = null;
+
 function persistJournal() {
   // storage.session.set is asynchronous and whole-snapshot writes may complete out of order.
   // Serialize them so an older snapshot can never land after a newer one while both callers
   // were already told their observations were durable.
-  const write = journalWriteQueue.then(() => persistJournalNow());
+  //
+  // Each write stores the whole journal (up to 4 MiB) and takes its snapshot when it starts, so
+  // callers arriving while one write is in flight share the next one: it holds all of their
+  // observations, and each caller's reply still waits for a write containing its own.
+  if (queuedJournalWrite) return queuedJournalWrite;
+  const write = journalWriteQueue.then(() => {
+    queuedJournalWrite = null;
+    return persistJournalNow();
+  });
+  queuedJournalWrite = write;
   journalWriteQueue = write.then(
     () => undefined,
     () => undefined
@@ -3048,6 +3060,21 @@ const HANDLERS = {
     if (body.length > 24000) return { ok: false };
     return call('/usage', { method: 'POST', body });
   },
+  /** A ChatGPT announcement the page closed (CLF_DOM.dismissAnnouncements), for one app log line. */
+  async page_note(message) {
+    if (message?.note === 'page-unusable') {
+      if (!PAGE_UNUSABLE.has(message.reason)) return { ok: false };
+      void call('/page-note', { method: 'POST',
+        body: JSON.stringify({ note: 'page-unusable', reason: message.reason, conversationId: cleanConversationId(message.conversationId) }) }).catch(() => undefined);
+      return { ok: true };
+    }
+    if (message?.note !== 'announcement-closed') return { ok: false };
+    const heading = typeof message.heading === 'string' ? message.heading.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+    // Best effort, and never in the tab's queue: a claim or receipt behind it must not wait on a log line.
+    void call('/page-note', { method: 'POST',
+      body: JSON.stringify({ note: 'announcement-closed', heading, conversationId: cleanConversationId(message.conversationId) }) }).catch(() => undefined);
+    return { ok: true };
+  },
   async desktop_input(message, sender, source) {
     if (!ownsDocument(source)) return { ok: false, error: 'stale_document' };
     const id = String(message.id || '');
@@ -3299,6 +3326,10 @@ const HANDLERS = {
       pendingAll: journal.length,
       pendingCloses: closeOutbox.length,
       pendingCommandAcks: commandAckOutbox.length,
+      // One typed reason the shown chat cannot take a message: Chrome's error page (no recorder can
+      // answer there) or what the page itself reports (announcement, access_limited).
+      pageUnusable: tab !== null && errorPageReloads.has(tab) && page === null ? 'error_page'
+        : PAGE_UNUSABLE.has(page?.pageUnusable) ? page.pageUnusable : null,
       delivery
     };
   },
@@ -3782,11 +3813,17 @@ async function companionDiagnosticSnapshot(found) {
         : null
     },
     preferences: { overwrite: preferences[RENDER_STREAM_KEY] !== false, durations: preferences[SHOW_TIMES_KEY] === true },
-    tab: await HANDLERS.tabStatus()
+    tab: await HANDLERS.tabStatus(),
+    errorPageReloads: await loadErrorPageReloads().then(() => ({ count: errorPageReloadCount, lastAt: lastErrorPageReloadAt,
+      ...(errorPageSkip ? { skipped: errorPageSkip } : {}) }))
   };
 }
 
-function publishCompanionDiagnostics() {
+// A change that must reach the app (an error-page reload) while a report is already under way:
+// that report may have taken its snapshot before the change, so one more follows it.
+let companionDiagnosticsDirty = false;
+function publishCompanionDiagnostics(changed = false) {
+  if (companionDiagnosticsFlight && changed) companionDiagnosticsDirty = true;
   if (companionDiagnosticsFlight || !token || disconnected) return companionDiagnosticsFlight;
   const intent = connectionEpoch, credential = token, endpoint = port;
   const work = (async () => {
@@ -3797,6 +3834,7 @@ function publishCompanionDiagnostics() {
     await call('/diagnostics', { method: 'POST', body: JSON.stringify(snapshot) });
   })().catch(() => undefined).finally(() => {
     if (companionDiagnosticsFlight === work) companionDiagnosticsFlight = null;
+    if (companionDiagnosticsDirty) { companionDiagnosticsDirty = false; void publishCompanionDiagnostics(); }
   });
   companionDiagnosticsFlight = work;
   return work;
@@ -4089,6 +4127,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'stop_redeem',
     'stop_ack',
     'desktop_input',
+    'page_note',
     'model_catalog',
     'plugin_refresh',
     'usage_observation',
@@ -4577,6 +4616,70 @@ function recoverDeferredRevivals() {
   return tracked;
 }
 
+// A chat tab that loaded while offline shows Chrome's own error page, where nothing can be injected.
+// Chrome reloads such a page by itself only in a visible tab, and the app's chat tabs usually are not.
+// It holds no draft and no answer, so once the browser is online again it is reloaded, at most every
+// 1, 2, 4 … 15 minutes per tab. The backoff and the counter live in session storage: Chrome stops the
+// worker between passes, and a fresh worker must neither reload at once again nor report old reloads as new.
+const ERROR_PAGE_RELOADS_KEY = 'errorPageReloads';
+/** The typed reasons a chat page cannot take a message (`page_unusable`). */
+const PAGE_UNUSABLE = new Set(['announcement', 'error_page', 'access_limited']);
+const errorPageReloads = new Map();
+// For the app's log (via the diagnostics snapshot): how many, and when the last one was.
+let errorPageReloadCount = 0, lastErrorPageReloadAt = 0, errorPageReloadsLoaded = null;
+// The last reload skipped, and why, for the app's log; a new key reports once more.
+let errorPageSkip = null, errorPageSkipKey = '';
+/** True once the saved backoff is read. A failed read is retried by the next call, never taken for none. */
+function loadErrorPageReloads() {
+  errorPageReloadsLoaded ??= chrome.storage.session.get(ERROR_PAGE_RELOADS_KEY).then(stored => {
+    const saved = stored?.[ERROR_PAGE_RELOADS_KEY];
+    if (!saved || typeof saved !== 'object') return;
+    for (const entry of Array.isArray(saved.tabs) ? saved.tabs.slice(-64) : []) {
+      const [id, state] = Array.isArray(entry) ? entry : [];
+      if (Number.isInteger(id) && Number.isFinite(state?.tries) && Number.isFinite(state?.nextAt) && !errorPageReloads.has(id))
+        errorPageReloads.set(id, { tries: state.tries, nextAt: state.nextAt });
+    }
+    if (Number.isFinite(saved.count)) errorPageReloadCount = Math.max(errorPageReloadCount, saved.count);
+    if (Number.isFinite(saved.lastAt)) lastErrorPageReloadAt = Math.max(lastErrorPageReloadAt, saved.lastAt);
+  }).then(() => true, () => { errorPageReloadsLoaded = null; return false; });
+  return errorPageReloadsLoaded;
+}
+function noteErrorPageSkip(id, reason, nextAt = 0) {
+  const key = `${id}:${reason}:${nextAt}`;
+  if (key === errorPageSkipKey) return;
+  errorPageSkipKey = key;
+  errorPageSkip = { reason, at: Date.now(), ...(nextAt ? { nextAt } : {}) };
+  void publishCompanionDiagnostics(true);
+}
+function saveErrorPageReloads() {
+  return chrome.storage.session.set({ [ERROR_PAGE_RELOADS_KEY]: { tabs: [...errorPageReloads], count: errorPageReloadCount, lastAt: lastErrorPageReloadAt } })
+    .catch(() => undefined);
+}
+async function forgetErrorPage(id) {
+  if (!await loadErrorPageReloads()) return;
+  if (errorPageReloads.delete(id)) await saveErrorPageReloads();
+}
+async function reloadErrorPage(id) {
+  // The tab is unusable whether or not it is reloaded now; the repair log line names why.
+  void call('/page-note', { method: 'POST', body: JSON.stringify({ note: 'page-unusable', reason: 'error_page',
+    conversationId: cleanConversationId(tabConversations[String(id)]) }) }).catch(() => undefined);
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return noteErrorPageSkip(id, 'offline');
+  // Unread is not "never reloaded": reloading now could skip the backoff, and saving would overwrite it.
+  if (!await loadErrorPageReloads()) return noteErrorPageSkip(id, 'unreadable');
+  const now = Date.now(), prior = errorPageReloads.get(id);
+  if (prior && now < prior.nextAt) return noteErrorPageSkip(id, 'backoff', prior.nextAt);
+  const tries = (prior?.tries ?? 0) + 1;
+  errorPageReloads.delete(id);
+  errorPageReloads.set(id, { tries, nextAt: now + Math.min(15 * 60_000, 60_000 * 2 ** (tries - 1)) });
+  if (errorPageReloads.size > 64) errorPageReloads.delete(errorPageReloads.keys().next().value);
+  try {
+    await chrome.tabs.reload(id);
+    errorPageReloadCount += 1; lastErrorPageReloadAt = now;
+    await saveErrorPageReloads();
+    void publishCompanionDiagnostics(true);
+  } catch { await saveErrorPageReloads(); /* The tab went away; nothing to reload. */ }
+}
+
 async function restoreChatgptTab(id, current = () => true, documentId = null) {
   if (!current()) return false;
   const target = { tabId: id, ...(documentId ? { documentIds: [documentId] } : {}) };
@@ -4594,6 +4697,7 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
       } catch {
         // The tab can navigate between the ping and repair. Static injection covers it.
       }
+      await forgetErrorPage(id);
       return true;
     }
   } catch {
@@ -4614,10 +4718,13 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
     await chrome.scripting.executeScript({ target: restoredTarget, files: ['chatgpt-dom.js', 'content.js'] });
     if (!current()) return false;
     await chrome.scripting.insertCSS({ target: restoredTarget, files: ['overlay.css'] });
+    await forgetErrorPage(id);
     // Successful injection means this exact tab is recovering. Its document registration will
     // re-run revival routing; opening a second tab during that handoff recreates the race.
     return current();
-  } catch {
+  } catch (error) {
+    // Chrome's offline error page takes no injection; once online it is reloaded, backing off.
+    if (/showing error page/i.test(String(error?.message ?? ''))) await reloadErrorPage(id);
     // Injection failure does not transfer ownership to a replacement tab.
     return false;
   }

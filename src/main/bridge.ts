@@ -44,7 +44,7 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
-import type { BridgeStatus, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
+import type { BridgeStatus, PageUnusable, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
 import { recoveryBusyMs } from '../shared/recovery.js';
 import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffort, normalizedToolOutcome, toolCallSummary, unescapeMarkdown,
   type ReasoningEffort, type SessionEvent, type SessionOrigin, type StoredText, type ToolCallRecord } from '../shared/session.js';
@@ -101,6 +101,7 @@ import {
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
+import { noteRequestTraces, type RequestTrace } from './session/request-trace.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -585,6 +586,14 @@ const listeners = new Set<() => void>();
 let extensionVersion: string | null = null;
 let versionWarned = false;
 let latestCompanionDiagnostics: CompanionDiagnostics | null = null;
+/** When each page note was last logged, by chat and heading (see `/page-note`). */
+const pageNotesLogged = new Map<string, number>();
+/** The last `page_unusable` reason logged per chat, and when (see `/page-note`). */
+const pageUnusableLogged = new Map<string, { reason: PageUnusable; at: number }>();
+const PAGE_UNUSABLE_REASONS: readonly PageUnusable[] = ['announcement', 'error_page', 'access_limited'];
+function isPageUnusable(value: unknown): value is PageUnusable {
+  return PAGE_UNUSABLE_REASONS.includes(value as PageUnusable);
+}
 let companionDiagnosticsRevision = 0;
 const companionDiagnosticsWaiters = new Set<() => void>();
 
@@ -670,6 +679,7 @@ function diagnosticTab(value: unknown): CompanionTabDiagnostics | null {
     pendingAll: diagnosticNumber(tab.pendingAll, 1_000_000),
     pendingCloses: diagnosticNumber(tab.pendingCloses, 1_000_000),
     pendingCommandAcks: diagnosticNumber(tab.pendingCommandAcks, 1_000_000),
+    pageUnusable: isPageUnusable(tab.pageUnusable) ? tab.pageUnusable : null,
     delivery: {
       at: diagnosticNumber(delivery?.at),
       ok: delivery?.ok === true ? true : delivery?.ok === false ? false : null,
@@ -713,9 +723,35 @@ function sanitiseCompanionDiagnostics(value: unknown): CompanionDiagnostics | nu
   };
 }
 
+/** The last error-page reload the app has logged (the extension's clock), its count and last skip. */
+let errorPageReloadsLogged: { at: number; count: number; skippedAt?: number } = { at: 0, count: 0 };
+const ERROR_PAGE_SKIPS: Record<string, (nextIn: number) => string> = {
+  offline: () => 'not reloaded while the browser is offline',
+  backoff: nextIn => `the next reload is in ${nextIn} s (it backs off after each reload)`,
+  unreadable: () => 'not reloaded, because the extension could not read when it last reloaded it'
+};
 function recordCompanionDiagnostics(value: unknown): void {
   const next = sanitiseCompanionDiagnostics(value);
   if (!next) return;
+  // A chat tab that loaded offline and sat on Chrome's error page was reloaded by the extension.
+  const reloads = diagnosticObject(diagnosticObject(value)?.errorPageReloads);
+  const reloadedAt = diagnosticNumber(reloads?.lastAt), reloadCount = Math.round(diagnosticNumber(reloads?.count, 100_000));
+  const logged = errorPageReloadsLogged;
+  if (reloadedAt > logged.at && reloadCount > 0) {
+    // A browser restart clears the extension's session storage, and its count starts again.
+    const fresh = reloadCount >= logged.count ? reloadCount - logged.count : reloadCount;
+    logInfo(`browser: reloaded ${Math.max(1, fresh)} ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)`);
+    errorPageReloadsLogged = { ...logged, at: reloadedAt, count: reloadCount };
+  }
+  // A reload the extension skipped, and why: once per skip it reports.
+  const skipped = diagnosticObject(reloads?.skipped);
+  const skippedAt = diagnosticNumber(skipped?.at), reason = String(skipped?.reason ?? '');
+  const skipLine = Object.hasOwn(ERROR_PAGE_SKIPS, reason) ? ERROR_PAGE_SKIPS[reason] : undefined;
+  if (skipLine && skippedAt > (errorPageReloadsLogged.skippedAt ?? 0)) {
+    const nextIn = Math.max(0, Math.ceil((diagnosticNumber(skipped?.nextAt) - skippedAt) / 1000));
+    logInfo(`browser: a ChatGPT tab is on Chrome's error page; ${skipLine(nextIn)}`);
+    errorPageReloadsLogged = { ...errorPageReloadsLogged, skippedAt };
+  }
   latestCompanionDiagnostics = next;
   companionDiagnosticsRevision += 1;
   for (const waiter of companionDiagnosticsWaiters) waiter();
@@ -1064,7 +1100,9 @@ const OBSERVATION_KINDS = new Set([
   'chat_error',
   // Not stored as transcript content. These request records populate the exact
   // requestId -> conversationId correlation registry.
-  'tool_evidence'
+  'tool_evidence',
+  // Where a chat's stream named request ids (session/request-trace.ts); diagnostics only.
+  'request_trace'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
 const MAX_OBSERVATIONS = 200;
@@ -1228,6 +1266,18 @@ function parseObservations(input: unknown): ChatObservation[] {
       kind: kind as ChatObservation['kind'],
       time: time > now + 60_000 || time < earliestChatGpt ? now : time
     };
+    if (kind === 'request_trace') {
+      const traces: RequestTrace[] = [];
+      for (const rawTrace of Array.isArray(item['traces']) ? item['traces'].slice(0, 16) : []) {
+        const trace = rawTrace && typeof rawTrace === 'object' ? rawTrace as Record<string, unknown> : null;
+        const requestId = typeof trace?.['requestId'] === 'string' ? trace['requestId'] : '';
+        const path = typeof trace?.['path'] === 'string' ? trace['path'] : '';
+        if (/^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(requestId) && /^[A-Za-z0-9_./:>*[\]-]{1,200}$/.test(path)) traces.push({ requestId, path });
+      }
+      observation.traces = traces;
+      out.push(observation);
+      continue;
+    }
     if (item['authoredTime'] === true) observation.authoredTime = true;
     if ((kind === 'assistant_message' || kind === 'user_message') && typeof item['authoredAt'] === 'number' &&
         Number.isFinite(item['authoredAt']) && item['authoredAt'] >= earliestChatGpt && item['authoredAt'] <= now + 60_000) {
@@ -2610,6 +2660,45 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch { return json(res, 400, { error: 'invalid_usage' }, origin); }
   }
 
+  // A ChatGPT announcement a page closed before it could use its message box. Only the dialog's
+  // heading, ChatGPT's own words, is logged; once a minute per chat and heading.
+  if (route === '/page-note' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (body?.['note'] === 'page-unusable') {
+      const reason = body['reason'];
+      if (!isPageUnusable(reason)) return json(res, 400, { error: 'bad_request' }, origin);
+      const chat = conversationId(body['conversationId']);
+      const key = chat ?? '';
+      const now = Date.now(), last = pageUnusableLogged.get(key);
+      // One line when a chat's reason changes, and again at most every ten minutes while it holds.
+      if (!last || last.reason !== reason || now - last.at >= 10 * 60_000) {
+        pageUnusableLogged.set(key, { reason, at: now });
+        if (pageUnusableLogged.size > 200) pageUnusableLogged.delete(pageUnusableLogged.keys().next().value!);
+        logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} cannot take a message: page_unusable: ${reason}`);
+      }
+      return json(res, 200, { ok: true }, origin);
+    }
+    if (body?.['note'] !== 'announcement-closed') return json(res, 400, { error: 'bad_request' }, origin);
+    const heading = typeof body['heading'] === 'string'
+      ? body['heading'].replace(/[\u0000-\u001f\u007f"]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+    const chat = conversationId(body['conversationId']);
+    const key = `${chat ?? ''}|${heading}`;
+    const now = Date.now();
+    if (now - (pageNotesLogged.get(key) ?? 0) >= 60_000) {
+      pageNotesLogged.set(key, now);
+      if (pageNotesLogged.size > 200) pageNotesLogged.delete(pageNotesLogged.keys().next().value!);
+      logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} closed ChatGPT's announcement` +
+        `${heading ? ` "${heading}"` : ''} that covered it, by Escape`);
+    }
+    return json(res, 200, { ok: true }, origin);
+  }
+
   /**
    * One authenticated page of a bound work-controller conversation's active branch.
    *
@@ -2864,7 +2953,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // This reports attachment only. The recorder below owns actual work and replay deduplication.
     const revived = noteAgentAlive(id, 'page');
     if (revived?.report) await recordAgentMessage(revived.report, 'sent', id);
-    const observations = parseObservations(body['events']);
+    const parsed = parseObservations(body['events']);
+    const traces = parsed.flatMap(item => item.kind === 'request_trace' ? item.traces ?? [] : []);
+    if (traces.length) noteRequestTraces(id, traces);
+    const observations = parsed.filter(item => item.kind !== 'request_trace');
+    if (!observations.length && parsed.length) return json(res, 200, { ok: true, stored: 0 }, origin);
     observationWritesInFlight += 1;
     let committed: { sessionId: string | null; stored: number; wake: boolean } | undefined;
     try {
@@ -9716,6 +9809,9 @@ export async function restoreCommands(): Promise<void> {
 /** Test seam. */
 export function resetBridgeForTests(): void {
   clearCompanionDiagnostics();
+  pageNotesLogged.clear();
+  pageUnusableLogged.clear();
+  errorPageReloadsLogged = { at: 0, count: 0 };
   for (const command of commands) if (command.timer) clearTimeout(command.timer);
   if (browserPresenceTimer) clearTimeout(browserPresenceTimer);
   browserPresenceTimer = null;

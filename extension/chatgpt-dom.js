@@ -650,7 +650,8 @@ var CLF_DOM = (() => {
 
   /** A pre-Send draft lease lasts only for this operation and these exact DOM nodes. */
   function captureComposerDraft(value, stillCurrent = () => true) {
-    const box = composer(), host = composerBox() || composerActions()?.host;
+    let box = composer(), host = composerBox() || composerActions()?.host;
+    let withdrawRebound = false;
     // Native rich-text normalization moves line breaks into paragraph structure.
     // Keep the same text comparison used by send receipts; editor identity and
     // trusted edits still revoke the lease even when a user only changes spacing.
@@ -689,6 +690,27 @@ var CLF_DOM = (() => {
           timer = setTimeout(finish, 1500); check();
         });
         return same() && !hasComposerAttachments() && clearPromptExact(value);
+      },
+      /**
+       * Take back text this lease inserted when Send was never clicked. Unlike clear(), this does
+       * not require the operation predicate to remain current: losing it is why the page stops. It
+       * still requires the exact untouched app-owned text and no attachments, and follows at most
+       * one React composer remount before deleting anything.
+       */
+      withdraw() {
+        if (touched || files.length || hasComposerAttachments()) return false;
+        let current = composer();
+        if (!current?.isConnected || compact(current.textContent) !== insertedText) return false;
+        if (current !== box) {
+          if (withdrawRebound) return false;
+          const nextHost = composerBox() || composerActions()?.host;
+          for (const name of events) host?.removeEventListener(name, changed, true);
+          box = current; host = nextHost; withdrawRebound = true;
+          for (const name of events) host?.addEventListener(name, changed, true);
+        }
+        current = composer();
+        if (touched || current !== box || !box?.isConnected || compact(box.textContent) !== insertedText || hasComposerAttachments()) return false;
+        return clearPromptExact(value);
       },
       dispose() { for (const name of events) host?.removeEventListener(name, changed, true); }
     };
@@ -2233,16 +2255,19 @@ var CLF_DOM = (() => {
         const data = event.data;
         if (event.source !== window || event.origin !== location.origin || data?.source !== 'clf-picker-reply' || data.nonce !== nonce || data.v !== 1) return;
         const state = data.picker;
-        const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._ -]+$/u.test(value) && value.trim() === value && value.trim();
+        const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._: -]+$/u.test(value) && value.trim() === value && value.trim();
         const valid = state && typeof state.version === 'string' && Number.isInteger(state.currentBucket) &&
-          Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 20 &&
+          Array.isArray(state.versions) && state.versions.length > 0 && state.versions.length <= 48 &&
           state.versions.every(v => groupId(v.id) && typeof v.label === 'string' && v.label.length > 0 && v.label.length <= 80) &&
-          Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 12 &&
+          Array.isArray(state.choices) && state.choices.length > 0 && state.choices.length <= 48 &&
           state.choices.every(c => Number.isInteger(c.bucket) && typeof c.id === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(c.id) && typeof c.label === 'string' && c.label.length > 0 && c.label.length <= 80 &&
             groupId(c.familyId) && typeof c.familyLabel === 'string' && c.familyLabel.length > 0 && c.familyLabel.length <= 80 &&
             ['none','minimal','low','medium','high','xhigh','max','ultra','pro'].includes(c.effort) && typeof c.available === 'boolean') &&
           new Set(state.versions.map(v => v.id)).size === state.versions.length && new Set(state.choices.map(c => c.bucket)).size === state.choices.length &&
           state.versions.some(v => v.id === state.version) && state.choices.some(c => c.bucket === state.currentBucket);
+        // The slider's order is only a navigation aid: one that does not hold every readable lane is dropped, not trusted.
+        if (valid && state.lanes !== undefined && !(Array.isArray(state.lanes) && state.lanes.length <= 48 && state.lanes.every(Number.isInteger) &&
+          new Set(state.lanes).size === state.lanes.length && state.choices.every(c => state.lanes.includes(c.bucket)))) delete state.lanes;
         finish(valid ? state : null);
       };
       const timer = setTimeout(() => finish(null), 1500);
@@ -2365,14 +2390,26 @@ var CLF_DOM = (() => {
       },
       async bucket(bucket) {
         let current = await state();
-        for (let count = 0; current && count < 12; count++) {
+        const press = direction => {
+          const controls = [...(picker()?.querySelectorAll('[role="menuitem"][aria-keyshortcuts]') || [])].filter(node => shown(node) && node.getAttribute('aria-keyshortcuts').includes('ArrowRight'));
+          return controls.length === 1 && key(controls[0], direction);
+        };
+        for (let count = 0; current && count < 48; count++) {
           if (current.currentBucket === bucket) return current;
-          const from = current.choices.findIndex(c => c.bucket === current.currentBucket), to = current.choices.findIndex(c => c.bucket === bucket);
+          // The slider moves through every native lane, also those the reader skipped.
+          const order = current.lanes ?? current.choices.map(c => c.bucket);
+          const from = order.indexOf(current.currentBucket), to = order.indexOf(bucket);
           if (from < 0 || to < 0) return null;
-          const expected = current.choices[from + (to > from ? 1 : -1)].bucket;
-          const controls = [...picker().querySelectorAll('[role="menuitem"][aria-keyshortcuts]')].filter(node => shown(node) && node.getAttribute('aria-keyshortcuts').includes('ArrowRight'));
-          if (controls.length !== 1 || !key(controls[0], to > from ? 'ArrowRight' : 'ArrowLeft')) return null;
-          const version = current.version;
+          const step = to > from ? 1 : -1, direction = step > 0 ? 'ArrowRight' : 'ArrowLeft';
+          let at = from + step;
+          if (!press(direction)) return null;
+          // On a lane it cannot read the picker reads as nothing: that proves the move, and the
+          // next key goes on toward a lane it can read. Nothing is selected on the way.
+          while (at !== to && !current.choices.some(c => c.bucket === order[at])) {
+            if (!await wait(async () => !await readPickerState()) || !press(direction)) return null;
+            at += step;
+          }
+          const version = current.version, expected = order[at];
           current = await state(next => next.version === version && next.currentBucket === expected);
         }
         return null;
@@ -2548,6 +2585,52 @@ var CLF_DOM = (() => {
     });
   }
 
+  /**
+   * ChatGPT's own announcements over a page (upstream #1939: "Premium seats just got better" over
+   * a fresh chat stopped Compact & Resume and a worker's model choice). Closed here: a visible
+   * dialog this extension did not open, that is not the access-limit notice `errors()` reads, the
+   * model picker or the Temporary Chat introduction, and that has nothing to type into, so a
+   * Settings dialog or a form is never touched. Closed only by Escape, the way a person dismisses
+   * it: no button in it is pressed, so nothing is chosen. Returns the headings it closed.
+   */
+  function announcementDialogs() {
+    const notices = new Set(errors().map(error => error.node));
+    return safe(() => [...document.querySelectorAll('[role="dialog"]')].filter(node =>
+      !node.closest(`${OWN_SURFACES}, [data-clf-menu], [class*="clf-"]`) && !node.closest('[hidden],[inert],[aria-hidden="true"]') &&
+      node.getClientRects().length > 0 && node.getAttribute('data-state') !== 'closed' && !notices.has(node) &&
+      !node.querySelector(PICKER) &&
+      ![...node.querySelectorAll('h1,h2,[role="heading"]')].some(heading => text(heading, 100) === 'Temporary Chat') &&
+      !node.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea, select, ' +
+        '[contenteditable="true"], [contenteditable=""], [role="textbox"], [role="combobox"], [role="searchbox"]')), []);
+  }
+  /**
+   * Why ChatGPT's page cannot take a message right now, from what is drawn: its access-limit notice
+   * (`errors()` blocking) or an announcement over a hidden composer. Null when the composer is usable
+   * or the cause is something else. Classification only; the callers own any action.
+   */
+  function pageUnusable() {
+    return safe(() => {
+      if (errors().some(error => error.blocking === true)) return 'access_limited';
+      if (!composerVisible() && announcementDialogs().length) return 'announcement';
+      return null;
+    }, null);
+  }
+  async function dismissAnnouncements(stillCurrent = () => true, waitMs = 1500) {
+    const closed = [];
+    for (const dialog of announcementDialogs()) {
+      if (!stillCurrent()) break;
+      const heading = ((dialog.querySelector('h1,h2,h3,[role="heading"]')?.textContent || dialog.getAttribute('aria-label') || '')
+        .replace(/\s+/g, ' ').trim()).slice(0, 80);
+      dialog.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true, cancelable: true }));
+      const until = Date.now() + waitMs;
+      while (dialog.isConnected && dialog.getClientRects().length > 0 && Date.now() < until) {
+        await new Promise(resolve => setTimeout(resolve, 50));
+      }
+      if (!dialog.isConnected || dialog.getClientRects().length === 0) closed.push(heading);
+    }
+    return closed;
+  }
+
   async function newChatControl(stillCurrent = () => true) {
     const shown = node => node && !node.closest(OWN_SURFACES) && !node.closest('[hidden],[aria-hidden="true"],[inert]') && node.getClientRects().length > 0;
     // @ehkogh/#318 shell: a translated sidebar button; MAIN stamps its typed owner per route.
@@ -2650,6 +2733,8 @@ var CLF_DOM = (() => {
     thoughtActivityRows,
     toolLabel,
     errors,
+    dismissAnnouncements,
+    pageUnusable,
     composer,
     composerSubmitReady,
     composerBox,

@@ -14,7 +14,7 @@ import { getSession, findSessionByConversation, createSession, deleteSession, re
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
 import { wakeBrowserWork } from '../browser-wake.js';
-import { logInfo } from '../logger.js';
+import { logInfo, logWarn } from '../logger.js';
 import { noteChatOrigin } from './recorder.js';
 import { isAstraModel, isProModel } from '../../shared/chat-models.js';
 import { inFlightToolCalls } from '../mcp/call-context.js';
@@ -24,6 +24,12 @@ import { attachmentSchema, validateInputAttachments, normalizeInputAttachments }
 import { MAX_CHATGPT_MESSAGE_CHARS } from '../../shared/user-prompt.js';
 import type { PromptLimits } from './prompt.js';
 import { recoveryMessage, recoveryBusyMs } from '../../shared/recovery.js';
+/**
+ * The page asked for authorization but never clicked and took its exact text back out of the
+ * composer. The same code in extension/content.js.
+ */
+const SEND_WITHDRAWN = 'Native Send was withdrawn before its click.';
+const WITHDRAWN_FAILED = 'Not sent: ChatGPT did not accept the message.';
 
 export const inputArgs = z.object({
   projectId: z.string().uuid().nullable().optional(),
@@ -88,6 +94,8 @@ const entrySchema = inputArgs.extend({
   /** Tool-result corrections remain inside their original generation in history. */
   toolTurnId: z.string().min(1).max(256).optional(),
   sendAuthorizedAt: z.number().optional(),
+  /** Times a Send the page withdrew before clicking was requeued. */
+  notTakenRetries: z.number().int().nonnegative().optional(),
   requiresAuthorization: z.boolean().optional(),
   cancelledByUser: z.literal(true).optional(),
   error: z.string().max(200).optional(),
@@ -1629,6 +1637,27 @@ export function failBrowserInput(id: string, owner: string, error: string): Prom
     const current = await load();
     const entry = current.find((row) => row.id === id && row.owner === owner && row.state === 'browser');
     if (!entry || companionOf(current, entry)) return false;
+    // The page asked for authorization but never clicked (ChatGPT drew its editor again while the
+    // app answered) and took its exact text back out of the composer: nothing went out, so one
+    // requeue sends it again. A claim this app never authorized was never sendable.
+    if (error === SEND_WITHDRAWN) {
+      if (entry.sendAuthorizedAt === undefined) {
+        logInfo(`input ${entry.id}: ignored the page's withdrawn-Send report: this app never authorized that Send`);
+        return false;
+      }
+      const retry = (entry.notTakenRetries ?? 0) === 0 && manualInput(entry) && !entry.recovery && !entry.opening &&
+        entry.purpose !== 'decision' && !entry.lifetime;
+      logWarn(`input ${entry.id}: the page withdrew the authorized Send before clicking it; ${retry ? 'queued once more' : 'reported as not sent'}`);
+      await commit(current.map(row => sameDelivery(entry, row) ? retry
+        ? { ...row, state: 'queued', owner: null, offeredAt: undefined, sendAuthorizedAt: undefined, requiresAuthorization: undefined,
+          deliveryText: undefined, error: undefined, notTakenRetries: (row.notTakenRetries ?? 0) + 1 }
+        : { ...row, state: 'failed', error: WITHDRAWN_FAILED } : row));
+      if (!retry) {
+        decisionWaiters.get(id)?.reject(new Error('goal_browser_send_failed: ' + WITHDRAWN_FAILED));
+        decisionWaiters.delete(id);
+      }
+      return true;
+    }
     if (entry.recovery && entry.requiresAuthorization === true && entry.sendAuthorizedAt === undefined) {
       await commit(current.map(row => row === entry ? releaseRecoveryClaim(row) : row));
       return true;

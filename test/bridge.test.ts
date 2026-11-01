@@ -497,6 +497,33 @@ describe('direct browser control over the paired bridge', () => {
 });
 
 describe('who is allowed to talk to it', () => {
+  // Upstream #1911: a chat tab the extension reloaded off Chrome's error page says so in the app's log, once.
+  it('logs the extension\'s error-page reloads and skipped reloads once each', async () => {
+    await pair();
+    const before = getLog().length;
+    const report = (errorPageReloads: Record<string, unknown>) => request('POST', '/diagnostics', { body: { capturedAt: Date.now(),
+      status: { connected: true, paired: true }, preferences: { overwrite: true, durations: false }, errorPageReloads } });
+    const lines = () => getLog().slice(before).map(entry => entry.message).filter(line => line.includes("Chrome's error page"));
+    await report({ count: 0, lastAt: 0 });
+    await report({ count: 1, lastAt: 5_000 });
+    await report({ count: 1, lastAt: 5_000 });
+    await report({ count: 3, lastAt: 9_000 });
+    expect(lines()).toEqual([
+      "browser: reloaded 1 ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)",
+      "browser: reloaded 2 ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)"]);
+    const skipped = (value: Record<string, unknown>) => report({ count: 3, lastAt: 9_000, skipped: value });
+    await skipped({ reason: 'offline', at: 30_000 });
+    await skipped({ reason: 'offline', at: 30_000 });
+    await skipped({ reason: 'backoff', at: 31_000, nextAt: 151_000 });
+    await skipped({ reason: 'unreadable', at: 32_000 });
+    await skipped({ reason: 'whatever', at: 33_000 });
+    await skipped({ reason: 'constructor', at: 34_000 });
+    expect(lines().slice(2)).toEqual([
+      "browser: a ChatGPT tab is on Chrome's error page; not reloaded while the browser is offline",
+      "browser: a ChatGPT tab is on Chrome's error page; the next reload is in 120 s (it backs off after each reload)",
+      "browser: a ChatGPT tab is on Chrome's error page; not reloaded, because the extension could not read when it last reloaded it"]);
+  });
+
   it('bounds authenticated companion diagnostics and clears them with the bridge lifecycle', async () => {
     const body = { capturedAt: Date.now(), status: { connected: true, paired: true, appVersion: 'v'.repeat(200) },
       preferences: { overwrite: true, durations: false }, transcript: 'must not be forwarded',
@@ -1393,6 +1420,66 @@ describe('work continuity over the bridge', () => {
 // ------------------------------------------------------------------ events
 
 describe('observations', () => {
+  it('logs one typed page_unusable reason per chat when it changes, and refuses an unknown one', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      await pair();
+      const chat = 'f0f00003-1111-4111-8111-11111111111b';
+      const before = getLog().length;
+      const lines = () => getLog().slice(before).map(entry => entry.message).filter(line => line.includes('page_unusable'));
+      const note = (reason: unknown) => request('POST', '/page-note', { body: { note: 'page-unusable', reason, conversationId: chat } });
+      expect((await note('announcement')).body).toEqual({ ok: true });
+      await note('announcement');
+      await note('access_limited');
+      expect((await note('offline')).status).toBe(400);
+      vi.setSystemTime(Date.now() + 10 * 60_000);
+      await note('access_limited');
+      expect(lines()).toEqual([
+        `bridge: the page of ${chat} cannot take a message: page_unusable: announcement`,
+        `bridge: the page of ${chat} cannot take a message: page_unusable: access_limited`,
+        `bridge: the page of ${chat} cannot take a message: page_unusable: access_limited`]);
+    } finally { vi.useRealTimers(); }
+  });
+  it('logs where the page saw a request id it could not place, and stores no transcript for it', async () => {
+    // Upstream #1908.
+    await pair();
+    const { requestTraceNote, resetRequestTracesForTests } = await import('../src/main/session/request-trace.js');
+    resetRequestTracesForTests();
+    const before = getLog().length;
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000c1d3', placed = '7482f9cb-689d-4ad0-aa6a-b7196a699840';
+    expect(requestTraceNote(placed)).toBe('');
+    await request('POST', '/events', { body: { conversationId, events: [{ kind: 'request_trace', time: Date.now(), traces: [
+      { requestId: placed, path: '/message:v.metadata.request_id' }, { requestId: 'not an id', path: 'x' }, { requestId: '11111111-2222-4333-8444-555555555555', path: 'bad path!' }
+    ] }] } });
+    expect(getLog().slice(before).map(entry => entry.message).filter(line => line.includes(placed))).toEqual([
+      `request attribution: ${placed} had no page evidence in time; the stream of ${conversationId} names it at /message:v.metadata.request_id`]);
+    expect(requestTraceNote(placed)).toBe(`; the stream of ${conversationId} named it at /message:v.metadata.request_id`);
+    expect(requestTraceNote('11111111-2222-4333-8444-555555555555')).toBe('');
+    expect(await findSessionByConversation(conversationId)).toBeNull();
+    // Upstream #1913: each chat says once per run that its page's tracing works, and its limit.
+    expect(getLog().slice(before).map(entry => entry.message).filter(line => line.includes('tracing works')))
+      .toEqual([`request attribution: the page of ${conversationId} reports the ids in its streams (tracing works, up to 16 new ids per message)`]);
+  });
+  it('logs a ChatGPT announcement a page closed, once a minute per chat and heading, and refuses any other note', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      await pair();
+      const chat = 'f0f00003-1111-4111-8111-11111111111a';
+      const lines = () => getLog().filter(entry => entry.message.includes("closed ChatGPT's announcement")).map(entry => entry.message);
+      const before = lines().length;
+      const note = (body: unknown) => request('POST', '/page-note', { body });
+      expect((await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat })).body).toEqual({ ok: true });
+      expect((await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat })).body).toEqual({ ok: true });
+      expect(lines().slice(before)).toEqual([`bridge: the page of ${chat} closed ChatGPT's announcement "Premium seats just got better" that covered it, by Escape`]);
+      vi.setSystemTime(Date.now() + 60_000);
+      await note({ note: 'announcement-closed', heading: 'Premium seats just got better', conversationId: chat });
+      // No quotes or control characters from the page reach the log line.
+      await note({ note: 'announcement-closed', heading: 'A "new"\nfeature', conversationId: null });
+      expect(lines().slice(before)).toHaveLength(3);
+      expect(lines().at(-1)).toBe('bridge: a ChatGPT page closed ChatGPT\'s announcement "A new feature" that covered it, by Escape');
+      expect((await note({ note: 'something-else' })).status).toBe(400);
+    } finally { vi.useRealTimers(); }
+  });
   it('persists bounded native reactions on the exact canonical user message and preserves sparse replays', async () => {
     await pair();
     const conversationId = 'f0f00003-1111-4111-8111-111111111119';

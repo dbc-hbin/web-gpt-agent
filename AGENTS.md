@@ -1049,7 +1049,40 @@ or fresh-chat ownership. New-chat reuse requires a visible composer before elect
 native preparation; unavailable surfaces are skipped so the first send can open one clean chat.
 A failed native preparation can grant the existing pre-send fallback, before marking readiness.
 Before claiming an input it waits for a visible composer; a mounted
-editor hidden behind a dialog leaves the input queued in its elected tab. It confirms
+editor hidden behind a dialog leaves the input queued in its elected tab. ChatGPT announcements
+over a page are the exception: `CLF_DOM.dismissAnnouncements` gives a visible `[role="dialog"]`
+the extension did not open, that is not an access-limit notice `errors()` reads, the model picker
+or the Temporary Chat introduction, and has nothing to type into (no text input, textarea, select,
+contenteditable, textbox, combobox or searchbox), one synthetic Escape; no button in it is pressed.
+Bootstrap runs it before waiting for the composer, again once if no composer appeared, and once
+before retrying a refused model choice; queued input runs it before its visible-composer wait.
+None of this runs while the composer is visible, nor for 10 minutes on a chat whose history the
+page saw limited (`cos-history-rate-limit`; the access-limit notice is a dialog too, recognized by
+wording in only some languages). Each closed dialog is reported, only while the page is still on
+the chat it was closed on, as the owned message `page_note` `{ note: 'announcement-closed', heading,
+conversationId }`; the worker answers at once and posts `POST /page-note` outside the tab's queue,
+which logs ChatGPT's heading (≤ 80 characters, no quotes or control characters) at most once a
+minute per chat and heading. A dialog with a field (Settings, Rename, a form) keeps holding input.
+One typed `page_unusable` reason names why a page cannot take a message: `announcement` (a dialog
+`dismissAnnouncements` would close is over the hidden composer), `access_limited` (the blocking
+access-limit notice `errors()` reads, or a dialog over the composer on a chat whose history was
+limited in the last 10 minutes) or `error_page` (recorder restoration hit Chrome's error page).
+`CLF_DOM.pageUnusable()` classifies what is drawn; it adds no poller or timer. A queued input that
+stays held, a bootstrap that found no composer (in its failure text), `clf-page-status`, and the
+diagnostics snapshot's `tab.pageUnusable` carry it; the held input and the error-page restoration
+post `page_note` `{ note: 'page-unusable', reason }` → `POST /page-note`, which logs
+`page_unusable: <reason>` once per chat when the reason changes and at most every 10 minutes while
+it holds. Backoff and repair decisions stay with their existing owners.
+Bootstrap (before insertion) and queued input (before its draft check) read ChatGPT's own
+`/api/auth/session`; an answer with neither `user` nor `accessToken` (signed out) fails the delivery
+with "ChatGPT is not signed in in this browser", because a signed-out ChatGPT answers in an anonymous
+chat that is never saved. An unreadable session is not evidence and sends as before.
+When the app authorized a Send but the page never clicked it (ChatGPT redrew the editor while the
+app answered), the page takes back only its exact untouched text (`draft.withdraw()`, following at
+most one composer remount) and reports `Native Send was withdrawn before its click.`; the app
+requeues an authorized manual input once (`notTakenRetries`), then fails it as not sent. Recovery,
+after-turn pickups, decisions, openings and helpers never requeue, and the report is ignored for a
+claim the app never authorized. It confirms
 model/effort, inserts the full text, uploads native files,
 rechecks composer and attachment nodes, crosses app authorization, then **rechecks again after
 every await before Send**. Native stable user-message and conversation identity establish
@@ -1759,6 +1792,26 @@ messages. Two transport slots, one batch per conversation and fair batch electio
 hot/stalled chat blocking another. Command ACK custody precedes later observations from that
 route. Reconnection restores eligible documents before creating new work; browser restart is
 a different lifetime from MV3 suspension (§2).
+Request-id traces (diagnostics only): usage.js also walks every frame of a chat's response stream
+(HTTP and socket) for id-named fields holding a request-id-shaped value that is neither the chat's
+id nor an origin it already published, and posts `cos-request-trace` with each id's field path
+(`<delta p>:<key path>`, never content; 8 per frame, 64 per response, read on after the 16 published
+origins). content.js forwards them once per id as `request_trace` (`traces: [{ requestId, path }]`),
+only for the chat the tab shows, takes none while its queue holds 300 or more entries, and drops
+queued traces first, without a gap marker, when it must evict. The bridge never stores them as
+transcript; `session/request-trace.ts` keeps 256 and adds "the stream of <chat> named it at
+<path>" to the "no page evidence" warning, or logs one line when the trace arrives after a call ran
+out of time. Attribution never uses them. The page also traces whole request-id-shaped tokens inside
+arrays and longer strings (path `…text`, no content; an array keeps its path only under an id-named
+key such as `request_ids`; 16 new ids per message), event streams from any other same-origin
+`/backend-api/` route (prefix `<route with ids as *>>`, other characters as `_`; at most two readers,
+4 MB and 64 traces each, cancelled on page hide; chat from the frame or the page's `/c/<id>` route),
+and every socket message (prefix `socket>`, 256 ids per socket, then again). The app logs once per
+chat and run that the page's tracing works; with these limits a missing trace makes "the page never
+saw it" likely, not certain.
+Journal writes are serialized whole snapshots taken when each write starts; observations that
+arrive while one write is in flight share the single next write, and each reply waits for a
+write containing its own observations.
 `deliverJournalBatch` gives both the initial `/events` request and its 413 split retry sixty
 seconds for durable acceptance. Timeout preserves the observations for later retry; it does
 not acknowledge them or change the ordinary ten-second request budget. The HTTP server's
@@ -1862,7 +1915,13 @@ An ambiguous name/Instant selection or a mixed Latest option retains the executi
 The shell's `max` Extra High step records as `xhigh` unless that model also offers `xhigh`; a sole power
 on an exact `gpt-…-pro` slug records its request effort as `pro`. The composer's GPT-5.5
 exclusion depends on these classic `GPT-` labels.
-Ambiguous triggers and unrecognized state remain unknown. MAIN helper replacement removes the
+Ambiguous triggers and unrecognized state remain unknown. Both readers (and `readPickerState`,
+which re-checks their answer) accept up to 48 versions and 48 lanes, and version/option ids may
+contain a colon (`gpt-6-pro:`). A version or lane they cannot read is skipped, not a reason to
+refuse the whole picker, because ChatGPT's unified Chat/Work picker lists every model of the account
+in an existing chat; the selected lane must still read exactly. The snapshot carries the slider's
+native lane order (`lanes`, unreadable lanes included), so moving between readable lanes presses
+one arrow key per native lane and passes an unreadable one without selecting it. MAIN helper replacement removes the
 previous listener across protocol versions, because the picker/plugin reply protocols are shared.
 The matched recorder/MAIN helper version is 18. Shell exchanges are read only under the native
 main/thread anchors. Their `entry.turn.items` supply actual user/assistant ids, public text and
@@ -3126,6 +3185,14 @@ connection/document epochs fence delayed results. The bridge cache is presentati
 clears on disconnect/stop/reset. Request discovery, receipt, exact ownership and recorded tool
 activity remain distinct evidence. Optional embedded-host presentation does not enable or
 implement an embedded browser.
+Its `errorPageReloads` (`{ count, lastAt, skipped? }`) reports chat tabs reloaded off Chrome's error
+page: a chat tab that loaded while offline, where injection fails with "showing error page". Recorder
+restoration (`restoreChatgptTab`) reloads such a tab only while `navigator.onLine`, backing off 1, 2,
+4 … 15 minutes per tab (state in `chrome.storage.session` key `errorPageReloads`, 64 tabs, so a
+restarted worker keeps the backoff and the count; an unreadable saved state reloads nothing; a tab
+whose recorder answers or takes injection is forgotten), and publishes a snapshot after each reload
+or skip, one more if a report was already under way. The bridge logs one line per new `lastAt` and
+per new skip (`offline`, `backoff`, `unreadable`) and stores nothing else.
 
 `tunnel/*` owns pinned-client discovery, child lifetime, health metrics and confirmed outages;
 `diagnostics.ts` tests the chain hop by hop. Transient health evidence must not produce repeated

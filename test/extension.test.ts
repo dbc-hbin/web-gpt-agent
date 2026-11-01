@@ -818,14 +818,36 @@ it.each(['still-frozen', 'woke', 'navigated', 'new-document'] as const)(
   });
 
 describe('accepted helper tab cleanup', () => {
+  // Upstream #1911: a change while a report is under way gets one more report after it.
+  it('sends one more report when something changed while a report was under way', async () => {
+    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics('),
+      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics(')));
+    const releases: Array<() => void> = [];
+    const snapshot = vi.fn(() => new Promise(resolve => { releases.push(() => resolve({ capturedAt: releases.length })); }));
+    const call = vi.fn(async () => ({ ok: true }));
+    const context = vm.createContext({ token: 'fixture-token', disconnected: false, connectionEpoch: 1, port: 8765,
+      companionDiagnosticsFlight: null, companionDiagnosticsDirty: false, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
+    const publish = vm.runInContext(`${source}\npublishCompanionDiagnostics`, context);
+    const first = publish();
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
+    publish(true);
+    publish(true);
+    releases[0]!();
+    await first;
+    await vi.waitFor(() => expect(snapshot).toHaveBeenCalledTimes(2));
+    releases[1]!();
+    await vi.waitFor(() => expect(call).toHaveBeenCalledTimes(2));
+    expect(snapshot).toHaveBeenCalledTimes(2);
+  });
+
   it('shares pending diagnostic reads and discards a result after disconnect', async () => {
-    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics()'),
-      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics()')));
+    const source = backgroundSource.slice(backgroundSource.indexOf('function publishCompanionDiagnostics('),
+      backgroundSource.indexOf('\nchrome.runtime.onMessage.addListener', backgroundSource.indexOf('function publishCompanionDiagnostics(')));
     let complete!: (value: unknown) => void;
     const snapshot = vi.fn(() => new Promise(resolve => { complete = resolve; }));
     const call = vi.fn(async () => ({ ok: true }));
     const context = vm.createContext({ token: 'fixture-token', disconnected: false, connectionEpoch: 1, port: 8765,
-      companionDiagnosticsFlight: null, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
+      companionDiagnosticsFlight: null, companionDiagnosticsDirty: false, discover: async () => ({ port: 8765 }), companionDiagnosticSnapshot: snapshot, call });
     const publish = vm.runInContext(`${source}\npublishCompanionDiagnostics`, context);
     const first = publish();
     const second = publish();
@@ -2120,7 +2142,8 @@ describe('extension command delivery', () => {
     });
     const insertCSS = vi.fn();
     const restore: (id: number) => Promise<boolean> = vm.runInNewContext(`${code}\nrestoreChatgptTab`, {
-      PAGE_RECORDER_VERSION: 18, tabReply: async () => null, chrome: { scripting: { executeScript, insertCSS } }
+      PAGE_RECORDER_VERSION: 18, tabReply: async () => null, chrome: { scripting: { executeScript, insertCSS } },
+      forgetErrorPage: async () => {}, reloadErrorPage: async () => {}
     });
     expect(await restore(41)).toBe(scenario === 'stable');
     expect(orphanRecorder).toBe(false);
@@ -3217,6 +3240,43 @@ describe('extension observation journal', () => {
 
     for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
     expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B']);
+  });
+
+  // Upstream #1666: every events message rewrote the whole journal (up to 4 MiB), one write after
+  // another. Messages that arrive while a write is in flight share the next write: it takes its
+  // snapshot when it starts, so it holds all of them, and each reply still waits for it.
+  it('stores observations that arrive during a slow journal write together in one following write', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const journalWrites: string[][] = [];
+    const firstWriteStarted = Promise.withResolvers<void>();
+    const releaseFirstWrite = Promise.withResolvers<void>();
+    const set = session.set.bind(session);
+    session.set = async (values: Record<string, unknown>) => {
+      if (Array.isArray(values.journal)) {
+        journalWrites.push((values.journal as Array<{ event: { text: string } }>).map((entry) => entry.event.text));
+        if (journalWrites.length === 1) {
+          firstWriteStarted.resolve();
+          await releaseFirstWrite.promise;
+        }
+      }
+      return set(values);
+    };
+    const worker = loadWorker({ local, session });
+    const send = (text: string, time: number) => worker.send(
+      { type: 'events', entries: [{ conversationId: null, event: { kind: 'user_message', time, text } }] }, time);
+    const first = send('A', 1);
+    await firstWriteStarted.promise;
+    const later = ['B', 'C', 'D', 'E'].map((text, index) => send(text, index + 2));
+    // The later handlers only await already-settled storage reads, so one macrotask turn lets each
+    // reach persistJournal while the first write is still held.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseFirstWrite.resolve();
+    const replies = await Promise.all([first, ...later]);
+
+    for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
+    expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B', 'C', 'D', 'E']);
+    expect(journalWrites).toEqual([['A'], ['A', 'B', 'C', 'D', 'E']]);
   });
 
   it('serializes live tab snapshots so a slow older write cannot forget a newer tab owner', async () => {

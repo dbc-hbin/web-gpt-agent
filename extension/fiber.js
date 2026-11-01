@@ -2058,6 +2058,10 @@
     }
     return model ? { id: model, effort } : null;
   }
+  /** How many versions and choices a picker may list: every model of an account, with room. */
+  const PICKER_MAX_VERSIONS = 48, PICKER_MAX_CHOICES = 48;
+  /** The slider's own lane order, unreadable lanes included: each one still takes an arrow key. */
+  const nativeLanes = lanes => lanes.length <= PICKER_MAX_CHOICES && lanes.every(Number.isInteger) && new Set(lanes).size === lanes.length ? { lanes } : {};
   function readPickerSnapshot(node) {
     let fiber = node && fiberOf(node);
     for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
@@ -2067,15 +2071,18 @@
       const props = owner?.composerIntelligencePickerState ? owner : owner?.dropdownContent?.props;
       const state = props?.composerIntelligencePickerState, data = props?.modelsData;
       if (!state || !Array.isArray(data?.versions)) continue;
-      if (data.versions.length > 20 || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > 12) return null;
+      if (data.versions.length > PICKER_MAX_VERSIONS || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > PICKER_MAX_CHOICES) return null;
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
       // Native version groups may have spaces; execution slugs retain their strict contract.
-      const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._ -]+$/u.test(value) && value.trim() === value && value.trim() ? value : null;
+      const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._: -]+$/u.test(value) && value.trim() === value && value.trim() ? value : null;
       const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
       const effortOf = choice => choice.category?.modelLane === 'pro' ? 'pro'
         : ['auto', 'instant'].includes(choice.category?.modelLane) ? 'none'
         : choice.thinkingEffort === 'max' && choice.modelConfig?.isWorkModeModel === true ? 'max'
         : ({ min: 'low', standard: 'medium', extended: 'high', max: 'xhigh', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', ultra: 'ultra' })[choice.thinkingEffort] || null;
+      const lanes = nativeLanes(state.bucketSelections.map(choice => choice?.bucket));
+      // An entry it cannot read is left out, not a reason to drop the whole picker; the selected
+      // one must still read, below, and nothing is ever guessed.
       const choices = state.bucketSelections.map(choice => {
         const name = label(choice.category?.shortLabel);
         // Native navigation groups may contain spaces or localized names. Those
@@ -2086,16 +2093,17 @@
           label: name && (/^\d/.test(name) ? `GPT-${name}` : name), effort: effortOf(choice),
           familyId, familyLabel: label(family?.displayTextForIntelligence) || label(choice.modelConfig?.title) || (name && (/^\d/.test(name) ? `GPT-${name}` : name)),
           available: choice.availability?.status === 'available' && !props.modelSwitcherDenialsBySlug?.[choice.modelSlug] };
-      });
-      const versions = data.versions.filter(version => version.enabled === true).map(version => ({ id: groupId(version.id), label: label(version.displayTextForIntelligence) }));
-      if (!versions.length || versions.some(v => !v.id || !v.label) || choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
+      }).filter(c => Number.isInteger(c.bucket) && c.id && c.label && c.effort);
+      const versions = data.versions.filter(version => version.enabled === true).map(version => ({ id: groupId(version.id), label: label(version.displayTextForIntelligence) }))
+        .filter(v => v.id && v.label);
+      if (!versions.length || !choices.length ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length) return null;
       const version = groupId(state.selectedVersionEntry?.id), currentBucket = state.currentBucket;
       if (!versions.some(v => v.id === version) || !choices.some(c => c.bucket === currentBucket)) return null;
       const selected = state.currentSelection;
       const chosen = choices.find(c => c.bucket === currentBucket);
       if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
-      return { version, currentBucket, versions, choices };
+      return { version, currentBucket, versions, choices, ...lanes };
     }
     return null;
   }
@@ -2107,9 +2115,11 @@
       const p = fiber.memoizedProps;
       if (!Array.isArray(p?.powerSelections)) continue;
       const selected = p.selectedPowerSelection ?? p.selectedLabelCandidate, options = p.modelListConfig?.options;
-      if (!selected || !Array.isArray(options) || options.length > 20 || p.powerSelections.length > 12) return null;
+      // ChatGPT's unified Chat/Work picker lists every model of the account in an existing chat.
+      if (!selected || !Array.isArray(options) || options.length > PICKER_MAX_VERSIONS || p.powerSelections.length > PICKER_MAX_CHOICES) return null;
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
-      const group = value => typeof value === 'string' && /^[\p{L}\p{N}._ -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
+      // Option ids can carry a colon ("gpt-6-pro:"); they are identities here, never execution slugs.
+      const group = value => typeof value === 'string' && /^[\p{L}\p{N}._: -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
       const label = value => typeof value === 'string' && value.trim() && value.length <= 80 ? value.trim() : null;
       const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
       const powerEffort = c => {
@@ -2126,7 +2136,10 @@
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
-      const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
+      // An option or lane it cannot read is left out, not a reason to drop the whole picker:
+      // the selected one must still read, below, and nothing is ever guessed.
+      const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }))
+        .filter(v => v.id && v.label);
       // Exact version id/name joins its powers. October's Latest now names GPT-6; use its
       // observed Instant slug as the stable family, not the replaceable "latest" alias.
       // Mixed Latest and ambiguous names retain each execution slug.
@@ -2141,13 +2154,13 @@
         label: named(c?.modelLabel), familyId: family(c?.modelLabel)?.id || id(c?.model),
         familyLabel: family(c?.modelLabel)?.label || named(c?.modelLabel), effort: powerEffort(c),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
-          (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
-      if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
-          choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
+          (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }))
+        .filter(c => Number.isInteger(c.bucket) && c.id && c.label && c.effort);
+      if (!version || !versions.length || !choices.length ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
       const matches = choices.filter(c => c.id === id(selected.model) && c.effort === powerEffort(selected));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
-      return { version, currentBucket: matches[0].bucket, versions, choices };
+      return { version, currentBucket: matches[0].bucket, versions, choices, ...nativeLanes(p.powerSelections.map(c => c?.powerSettingIndex)) };
     }
     return null;
   }
