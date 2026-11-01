@@ -1863,7 +1863,13 @@ An ambiguous name/Instant selection or a mixed Latest option retains the executi
 The shell's `max` Extra High step records as `xhigh` unless that model also offers `xhigh`; a sole power
 on an exact `gpt-…-pro` slug records its request effort as `pro`. The composer's GPT-5.5
 exclusion depends on these classic `GPT-` labels.
-Ambiguous triggers and unrecognized state remain unknown. MAIN helper replacement removes the
+Ambiguous triggers and unrecognized state remain unknown. Both readers (and `readPickerState`,
+which re-checks their answer) accept up to 48 versions and 48 lanes, and version/option ids may
+contain a colon (`gpt-6-pro:`). A version or lane they cannot read is skipped, not a reason to
+refuse the whole picker, because ChatGPT's unified Chat/Work picker lists every model of the account
+in an existing chat; the selected lane must still read exactly. The snapshot carries the slider's
+native lane order (`lanes`, unreadable lanes included), so moving between readable lanes presses
+one arrow key per native lane and passes an unreadable one without selecting it. MAIN helper replacement removes the
 previous listener across protocol versions, because the picker/plugin reply protocols are shared.
 The matched recorder/MAIN helper version is 18. Shell exchanges are read only under the native
 main/thread anchors. Their `entry.turn.items` supply actual user/assistant ids, public text and
