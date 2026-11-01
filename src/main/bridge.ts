@@ -6463,6 +6463,17 @@ async function goalInputPriority(conversationId: string, sessionId: string, turn
   return priority;
 }
 
+/**
+ * Whether `turnId` is a turn of this chat that has ended while a newer one has started since.
+ * Ordered by the recorder's `origin`, never by clock: two turns can share a millisecond, and a
+ * clock adjustment can put a newer turn earlier.
+ */
+function supersededTurn(summary: SessionSummary | null | undefined, turnId: string | undefined): boolean {
+  const reported = turnId ? summary?.timelineTurns?.[turnId] : undefined;
+  return !!reported && reported.endTime !== undefined && summary?.activeTurnId !== turnId &&
+    Object.values(summary?.timelineTurns ?? {}).some(turn => turn.origin > reported.origin);
+}
+
 /** Both UIs describe the same existing reply and work deadlines, without another clock owner. */
 async function goalWaitFor(conversationId: string, sessionId: string, now = Date.now()): Promise<import('../shared/goal.js').GoalWait | null> {
   const pending = goalPendingReplyFor(conversationId);
@@ -7415,6 +7426,15 @@ async function noteRecoveryObservations(
       continue;
     }
     if (item.recoverable !== true) continue;
+    // A page kept (not reloaded) through recovery can retain an ended turn's stall clock and
+    // report it after a newer turn ran: that report is stale and recovering would only
+    // interrupt a chat that already moved on.
+    const staleReport = (summary: SessionSummary | null | undefined): boolean => {
+      if (!supersededTurn(summary, item.turnId)) return false;
+      logInfo(`bridge: ignored an error report for ${conversationId}: its turn ${item.turnId} ended before a newer turn`);
+      return true;
+    };
+    if (staleReport(recorded)) continue;
     // Auto-compaction owns this chat's recovery clock until its ticket commits or is cancelled.
     // A native error inside a handoff is not permission for the ordinary two-minute response
     // watchdog to cut across the compaction's own pickup schedule. The failure is still the page
@@ -7429,6 +7449,8 @@ async function noteRecoveryObservations(
       break;
     }
     const source = sessionId ? await assistantRepairSource(sessionId) : null;
+    // The reads above yield; recheck the report against the session as it is now.
+    if (sessionId && item.turnId && staleReport(await getSession(sessionId))) continue;
     const episode = `assistant-error:${source?.key ?? 'page'}:${(item.text ?? '').slice(0, 240)}`;
     // How many turns this chat will have finished once the broken turn is over. The turn that
     // just failed is still open here - its own end is the very next one to arrive - so counting

@@ -2291,6 +2291,10 @@ A claimed attempt is never reissued on missing acknowledgement. Progress stays a
 the original source turn. A recoverable transport banner does not end a natively generating
 turn; exact Thinking failed uses the activity-based two/five-minute silence rule. Exact native final evidence
 supersedes a stale transport banner and retains ordinary Goal/Loop eligibility.
+A recoverable `chat_error` naming a turn that already ended while a newer turn exists (by recorder
+`origin`, not clock) is stale: a page kept through recovery can retain the old turn's stall clock.
+It is logged and ignored, checked again after the yielding repair-source read. A report for the
+current or a still-open turn, a turn with no newer successor, or one without a turn id is unchanged.
 
 Automatic response recovery follows the shared decision and conditional busy wait above.
 Authored queue delivery retains its own input eligibility under §11 and takes precedence over
