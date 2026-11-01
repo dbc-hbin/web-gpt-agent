@@ -3346,6 +3346,10 @@
             ? entry.createTime
             : null,
         rawText,
+        // A question's place in ChatGPT's message tree (Edit & resubmit).
+        ...(entry.role === 'user' && typeof entry.parentId === 'string' &&
+          (entry.parentId === 'root' || /^[A-Za-z0-9:_-]{8,190}$/.test(entry.parentId))
+          ? { parentId: entry.parentId, parentExact: entry.parentExact === true } : {}),
         ...(attachments.length ? { attachments } : {}),
         renderedHtml,
         sectionIndex:
@@ -4387,7 +4391,10 @@
         const message = item.value;
         if (message.role === 'user') {
           if (!message.createTime && !message.attachments?.length && renderedUserTexts.get(message.messageId) === message.rawText) continue;
-          const key = occurrenceKey(message.messageId, message.rawText + (message.attachments?.length ? JSON.stringify(message.attachments) : ''));
+          // The tree place is part of the occurrence: ChatGPT shows its versions control only once a
+          // second version exists, so an edit re-emits the question it replaced.
+          const key = occurrenceKey(message.messageId, message.rawText + (message.attachments?.length ? JSON.stringify(message.attachments) : '') +
+            (message.parentId ? `\u0000${message.parentId}:${message.parentExact === true}` : ''));
           if (message.createTime) {
             if (userAuthoredTimesReported.get(key) === message.createTime) continue;
             userAuthoredTimesReported.set(key, message.createTime);
@@ -4401,6 +4408,7 @@
             messageId: message.messageId,
             text: message.rawText,
             ...(message.attachments?.length ? { attachments: message.attachments } : {}),
+            ...(message.parentId ? { parentId: message.parentId, parentExact: message.parentExact === true } : {}),
             ...(message.createTime ? { time: message.createTime, authoredTime: true, authoredAt: message.createTime } : {})
           });
           continue;
