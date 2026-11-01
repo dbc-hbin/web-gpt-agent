@@ -15227,6 +15227,26 @@ describe('the context meter and automatic compaction', () => {
     expect(live.sent.some(message => message.type === 'compact' && (message.sourceDispatch || message.sourceLost))).toBe(false);
   });
 
+  it('checks less often once a native receipt wait has run for ten seconds', async () => {
+    // Upstream #1702: every check reads the page; after the first ten seconds check every 2 s.
+    let checks = 0;
+    live = await harness(undefined, {
+      activity: () => { checks++; return withContext(205_000, settings({ auto: true }), { pendingTools: 0 }); },
+      compact: () => ({ ok: true, data: { token: 'paced-token', prompt: 'Write the brief.', ...automaticTicket('not-attempted') } })
+    });
+    startGenerating(live.document);
+    const section = assistantTurn(live.document, 'paced-source', []);
+    compactionFiber(section, () => [compactionCall(false)]);
+    await settle();
+    checks = 0;
+    await live.hook.startCompact(true);
+    expect(startedCompactions(live)).toEqual([]);
+    // 40 quarter-second checks in the first ten seconds, then ten 2-second checks: about 50,
+    // where a 250 ms pace for the whole 30 s budget makes about 120.
+    expect(checks).toBeGreaterThan(40);
+    expect(checks).toBeLessThan(80);
+  });
+
   it('does not stop a newer question while an automatic source waits for native receipt', async () => {
     live = await harness(undefined, {
       activity: () => withContext(205_000, settings({ auto: true }), { pendingTools: 0 }),

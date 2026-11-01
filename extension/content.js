@@ -8848,7 +8848,7 @@
         const fresh = await refreshFiber(null, true);
         if (!current()) return true;
         return fresh && received();
-      }, TOOL_SETTLE_MS);
+      }, TOOL_SETTLE_MS, RECEIPT_QUICK_MS);
       if (!current()) return 'This chat changed while compaction was waiting for tool results.';
       if (!ready) return 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
     }
@@ -9903,6 +9903,8 @@
    * headroom without making a genuinely stuck local call wait indefinitely.
    */
   const TOOL_SETTLE_MS = 30_000;
+  /** The first stretch of the native-receipt wait, checked quickly; most receipts land within seconds. */
+  const RECEIPT_QUICK_MS = 10_000;
   /** How many silent answers about pending calls to sit through before refusing. */
   const SETTLE_UNKNOWN_TRIES = 3;
 
@@ -9922,9 +9924,14 @@
     return Number.isFinite(count) && count >= 0 ? count : null;
   }
 
-  /** Polls a condition. Resolves true when it holds, false when the budget runs out. */
-  async function waitUntil(test, budgetMs) {
-    const until = Date.now() + budgetMs;
+  /**
+   * Polls a condition. Resolves true when it holds, false when the budget runs out.
+   * Checks every 250 ms; a wait given `slowAfterMs` checks every 2 s after that, since each
+   * check reads the page and quarter-second checks weigh most on slow machines.
+   */
+  async function waitUntil(test, budgetMs, slowAfterMs = Infinity) {
+    const started = Date.now();
+    const until = started + budgetMs;
     for (;;) {
       let held = false;
       try {
@@ -9934,7 +9941,7 @@
       }
       if (held) return true;
       if (Date.now() >= until) return false;
-      await sleep(250);
+      await sleep(Date.now() - started >= slowAfterMs ? 2000 : 250);
     }
   }
 
