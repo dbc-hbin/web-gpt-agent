@@ -234,11 +234,30 @@ export async function trackMcpRequest<T>(fn: () => Promise<T>): Promise<T> {
  */
 export async function trackInFlight<T>(context: CallContext, fn: () => Promise<T>): Promise<T> {
   running.add(context);
+  prunePublished();
+  unpublished.add(context);
   try {
     return await fn();
   } finally {
     running.delete(context);
   }
+}
+
+/**
+ * Calls still running, or returned but whose result the transport has not finished sending.
+ * The fresh-turn Stop fallback waits for this to reach zero: a Stop that lands while a call runs
+ * or its answer is still on the way can make the model run that call again (#1662).
+ */
+const unpublished = new Set<CallContext>();
+function prunePublished(): void {
+  for (const call of unpublished) {
+    const publication = call.publication;
+    if (!running.has(call) && (!publication || publication.completedAt !== null || publication.failed)) unpublished.delete(call);
+  }
+}
+export function unpublishedToolCalls(conversationId: string): number {
+  prunePublished();
+  return countFor(unpublished, conversationId);
 }
 
 export function currentCall(): CallContext | null {

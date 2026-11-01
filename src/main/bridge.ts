@@ -47,6 +47,7 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
+import { setTimeout as delay } from 'node:timers/promises';
 import type { BridgeStatus, PageUnusable, CompanionDiagnostics, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
 import { recoveryBusyMs } from '../shared/recovery.js';
 import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffort, normalizedToolOutcome, toolCallSummary, unescapeMarkdown,
@@ -123,7 +124,7 @@ import {
   readHydratedActivityCall,
   sessionDurableModifiedAt
 } from './session/store.js';
-import { inFlightMcpRequests, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
+import { inFlightMcpRequests, runningToolCalls, unpublishedToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { briefShortfall, handoffPlanNotice, resumeBootstrapText } from './session/handoff.js';
 import {
@@ -2170,6 +2171,8 @@ async function stopUserAnchor(sessionId: string, turnId: string): Promise<string
 }
 /** After a call is recorded, how long until its answer has gone out and the fallback's Stop may follow. */
 const ROTATION_STOP_DELAY_MS = 500;
+/** How long the fallback waits for the chat's other calls to be answered before it gives the turn back. */
+const ROTATION_STOP_DRAIN_MS = 60_000;
 
 /**
  * Stop is a request against one exact live turn, never a predicted final boundary. `rotation`: the
@@ -8862,21 +8865,36 @@ function considerCallRotation(conversationId: string, sessionId: string, sourceT
     // still find it and file the continue.
     const fenceSaved = armRotationFence(conversationId, sourceTurnId);
     logInfo(`turn rotation: ${conversationId} — ChatGPT offered no Send for the continue; stopping turn ${sourceTurnId} after this result to continue in a fresh one`);
-    const timer = setTimeout(() => {
-      void fenceSaved.then(saved => {
-        if (!saved) {
-          void clearRotationFence(conversationId);
-          logWarn(`turn rotation: ${conversationId} — not stopping turn ${sourceTurnId}: its fence could not be saved, so a restart could lose the continue`);
+    void (async () => {
+      // The Stop goes out only once no call of this chat is still running or still on its way
+      // back: a Stop that lands meanwhile can make the model run that call again. The fence
+      // stays armed throughout, so no new call starts. Bounded: one that never drains leaves the
+      // turn alone.
+      const drainBy = Date.now() + ROTATION_STOP_DRAIN_MS;
+      let logged = false;
+      while (unpublishedToolCalls(conversationId) > 0) {
+        if (rotationFenceTurn(conversationId) !== sourceTurnId) return;
+        if (Date.now() >= drainBy) {
+          await clearRotationFence(conversationId);
+          logWarn(`turn rotation: ${conversationId} — not stopping turn ${sourceTurnId}: a call of this chat was still running or being answered after ${Math.round(ROTATION_STOP_DRAIN_MS / 1000)} s`);
           return;
         }
-        if (rotationFenceTurn(conversationId) !== sourceTurnId) return;
-        return stopSessionTurn(sessionId, sourceTurnId, { rotation: true });
-      }).catch(error => {
+        if (!logged) logInfo(`turn rotation: ${conversationId} — waiting for this chat's running calls to be answered before stopping turn ${sourceTurnId}`);
+        logged = true;
+        await delay(100, undefined, { ref: false });
+      }
+      await delay(ROTATION_STOP_DELAY_MS, undefined, { ref: false });
+      if (!await fenceSaved) {
         void clearRotationFence(conversationId);
-        logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
-      });
-    }, ROTATION_STOP_DELAY_MS);
-    timer.unref?.();
+        logWarn(`turn rotation: ${conversationId} — not stopping turn ${sourceTurnId}: its fence could not be saved, so a restart could lose the continue`);
+        return;
+      }
+      if (rotationFenceTurn(conversationId) !== sourceTurnId) return;
+      await stopSessionTurn(sessionId, sourceTurnId, { rotation: true });
+    })().catch(error => {
+      void clearRotationFence(conversationId);
+      logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
+    });
     return;
   }
   let filedId: string | null = null;

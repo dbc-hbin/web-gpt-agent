@@ -42,6 +42,7 @@ const { recordToolCall, resetRecorderForTests } = await import('../src/main/sess
 const { listInputs, resetInputForTests } = await import('../src/main/session/input.js');
 const { resetTurnRotationForTests } = await import('../src/main/turn-rotation.js');
 const { openCallHold, resetCallHoldsForTests } = await import('../src/main/rotation-hold.js');
+const { trackInFlight } = await import('../src/main/mcp/call-context.js');
 const logger = await import('../src/main/logger.js');
 const { setGoalSwitchNow, resetGoalStateForTests } = await import('../src/main/goal.js');
 const { makeTempDir, removeTempDir } = await import('./helpers.js');
@@ -543,6 +544,39 @@ describe('stop fallback for fresh turns', () => {
       await restoreCommands();
       expect(rotationFenced(chat)).toBe(false);
     } finally { spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
+  });
+
+  // The fallback Stop must not land while another call of the same chat still runs or its answer
+  // is still on its way: that Stop can make the model run the call again (#1662).
+  it("waits for the chat's other running call to be answered before it stops the turn", async () => {
+    const config = defaultConfig();
+    await saveConfig({ ...config, sessions: { ...config.sessions, record: true }, ui: { ...config.ui, rotateStopFallback: true } });
+    setRotationHoldForTests(5_000);
+    const clock = { now: Date.now() };
+    const spy = vi.spyOn(Date, 'now').mockImplementation(() => clock.now);
+    const publication = { completedAt: null as number | null, failed: false };
+    const other = Promise.withResolvers<void>();
+    try {
+      const chat = 'f0f00003-1111-4111-8111-000000000421', turn = 'g-stopfb-0-21';
+      const sessionId = await turnFor(chat, turn, 31);
+      await declineTwice(chat, sessionId, clock);
+      const running = trackInFlight({ caller: { transportKey: null, requestId: null, conversationId: chat }, publication,
+        startedAt: clock.now, transportKey: null, agent: null, outcome: null, evidence: {} } as never, () => other.promise);
+      await (await heldCall(chat))();
+      await vi.waitFor(() => {
+        expect(getLog().some(entry => entry.message.includes(`${chat} — waiting for this chat's running calls to be answered`))).toBe(true);
+      }, { timeout: 10_000, interval: 20 });
+      expect((await request('GET', '/status')).body.stopTurns ?? []).toEqual([]);
+      expect(rotationFenced(chat)).toBe(true);
+      // The call returns, but its answer has not gone out yet: still no Stop.
+      other.resolve();
+      await running;
+      expect((await request('GET', '/status')).body.stopTurns ?? []).toEqual([]);
+      publication.completedAt = clock.now;
+      await vi.waitFor(async () => {
+        expect((await request('GET', '/status')).body.stopTurns).toEqual([expect.objectContaining({ conversationId: chat, turnId: turn })]);
+      }, { timeout: 10_000, interval: 50 });
+    } finally { other.resolve(); spy.mockRestore(); setRotationHoldForTests(15_000); await saveConfig({ ...config, sessions: { ...config.sessions, record: true } }); }
   });
 
   // CodeRabbit on #1954: a restart right after the person's Stop cleared the fence must not bring it
