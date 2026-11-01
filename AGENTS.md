@@ -2241,7 +2241,14 @@ The bridge keeps an in-memory `providerHistoryBackoffUntil` per chat. While it i
 every queued repair's `notBefore`, refuses `/repairs/claim`, and replaces future recovery notices
 with a read-only `provider-limit` countdown (a handed repair keeps its own row). It never creates
 recovery authority. A deferred Goal/compaction repair whose browser is gone gets one cold start
-from the existing silence timer once the hold ends. A restart clears the hold. The recorder writes an identical repeated history-limit notice once within 30
+from the existing silence timer once the hold ends. Repeated limits escalate: a limit seen after
+the previous hold ran out is a failed retry and holds at least 2, 4, 8, then 15 minutes; a limit
+inside a running hold or a replayed notice is the same episode; ChatGPT's longer Retry-After wins;
+a limit after 15 quiet minutes starts over. Each longer hold logs `history was limited again after
+its wait (retry N)`. The 2/5/10/15 pickup schedule is neither queued nor counted inside a hold: the
+pickup logs once per hold that it `waits for its history limit to end` and runs on the first
+maintenance pass after it, keeping its full gap to the next reload. A restart clears the hold and
+its escalation. The recorder writes an identical repeated history-limit notice once within 30
 minutes of the newest blocking error; its stored `retryAt` is the first deadline, not authority.
 
 | Trigger | Required meaning |
