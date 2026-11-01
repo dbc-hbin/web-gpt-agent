@@ -10,7 +10,7 @@ import { findCheckpoint, listCheckpoints } from './checkpoints/store.js';
 import { getConfig } from './config.js';
 import { rawPromises as fs } from './rawfs.js';
 import { projectFileTarget } from './project-files.js';
-import { isContained } from './sandbox.js';
+import { approvedRootContaining } from './sandbox.js';
 import { logInfo, logWarn } from './logger.js';
 
 const MAX_GIT_OUTPUT_BYTES = 4 * 1024 * 1024;
@@ -203,9 +203,15 @@ export async function repositoryContext(projectId: string): Promise<RepositoryCo
   const root = path.resolve(lines[0]!);
   const gitDir = path.resolve(project.real, lines[1]!);
   const commonDir = path.resolve(project.real, lines[2]!);
-  const approved = getConfig().roots.map(entry => path.resolve(entry.path));
-  if (![root, gitDir, commonDir].every(candidate => approved.some(parent => isContained(parent, candidate)))) {
-    throw new Error('The Git repository metadata is outside the approved folders');
+  // The same authority that admitted the project: all-files access reaches any native path, while
+  // approved-roots access requires the worktree and Git metadata inside a currently approved root.
+  const config = getConfig();
+  if (config.fileAccessMode !== 'all-files') {
+    for (const candidate of [root, gitDir, commonDir]) {
+      if (!(await approvedRootContaining(config.roots, candidate).catch(() => null))) {
+        throw new Error('The Git repository metadata is outside the approved folders');
+      }
+    }
   }
   const relative = path.relative(root, project.real);
   if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {

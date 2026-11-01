@@ -3322,7 +3322,9 @@ captures the existing ComposerDraftOwner before the await, so a later chat canno
 
 `src/main/project-git.ts` is the sole owner of the read-only Review projection. The renderer
 passes only a LocalProject UUID and project-relative path through fixed IPC; main re-resolves the
-approved project/root and Git metadata before reading status or a diff. Git inspection is strictly
+approved project/root and Git metadata before reading status or a diff (under the live file-access
+mode: Approved folders requires the worktree and Git metadata inside an approved root; All files
+does not). Git inspection is strictly
 read-only: it strips inherited Git repository/index redirects, uses optional-lock-free bounded
 subprocesses and exposes no stage, commit, reset, checkout or push authority. Review projects
 `M/A/D/R/U`, plus `C` for every unmerged index state (`DD/AU/UD/UA/DU/AA/UU`) so an
