@@ -626,6 +626,14 @@ only those bounded format fields per HTTP response, or per linked conversation/t
 stream. Missing predecessors, malformed/unknown encoding and retired streams discard that
 state. Identity still requires both ids in one complete root value; partial values, message
 text and cached answer branches never supply the join.
+The same fetch wrapper passively observes same-origin `GET /backend-api/conversation(s)/<uuid>`
+responses that return HTTP 429. It reads no body, request headers, cookies or credentials: only the
+exact conversation id and a bounded deadline are projected as `cos-history-rate-limit`
+(`{conversationId, retryAt, observedAt}`). `Retry-After` (seconds or HTTP date), then
+`x-oai-history-initial-retry-after`, set the deadline; a missing or unusable value gets a fixed
+60-second local cooldown that is not presented as a provider deadline. Content accepts the
+projection only for its current exact route and records one blocking, non-recoverable
+`chat_error` with `retryAt` per deadline (§14 history hold).
 A 64-pair document cache deduplicates both transports and replays IDs at content readiness.
 Content requires the matching route and document epoch, retaining one-shot stream proof through
 temporary ACK failures for at most 15 minutes using the existing observer/backoff. Missing stream
@@ -2227,6 +2235,15 @@ Goal pickup. Genuine new work in the same batch keeps its ordinary rearming auth
 accepted terminal boundary still retires its pending repair, including after handout. Ordinary
 chats retain their no-reload behavior for these blocking notices; no new grant comes from a dialog.
 
+**History 429 hold.** A blocking `chat_error` carrying `retryAt` comes only from an observed
+conversation-history HTTP 429 (§12 `usage.js`), a signal distinct from the access dialog above.
+The bridge keeps an in-memory `providerHistoryBackoffUntil` per chat. While it is live it delays
+every queued repair's `notBefore`, refuses `/repairs/claim`, and replaces future recovery notices
+with a read-only `provider-limit` countdown (a handed repair keeps its own row). It never creates
+recovery authority. A deferred Goal/compaction repair whose browser is gone gets one cold start
+from the existing silence timer once the hold ends. A restart clears the hold. The recorder writes an identical repeated history-limit notice once within 30
+minutes of the newest blocking error; its stored `retryAt` is the first deadline, not authority.
+
 | Trigger | Required meaning |
 | --- | --- |
 | Missing tab | Current non-retired binding plus still-owed/live work and recovery policy; ordinary chats need recorded tool work, workers use broker attachment state. |
@@ -2895,7 +2912,8 @@ status updates preserve the user's current disclosure state.
 
 The recovery row above Goal/Loop shows read-only countdowns from `bridge.ts::sessionControlsFor`:
 activity-based silence and confirmed reload listening, an outbox/Goal native-busy deferral, and each unresolved
-attribution incident's exact candidate deadline. `renderer/recovery.ts` updates only the seconds
+attribution incident's exact candidate deadline. A live history-429 hold projects a
+`provider-limit` row that says when retry is checked and never promises a reload. `renderer/recovery.ts` updates only the seconds
 using the existing visible-chat clock; zero says checking/pending, never sent/reloaded. Fresh
 work or attribution removes the relevant countdown, and native busy projects the same owner's
 extended deadline. Pro silence becomes visible after five minutes without work and counts

@@ -17,7 +17,8 @@ export function renderRecoveryCountdowns(host: HTMLElement, countdowns: readonly
           const next = countdown.next === 'continue' ? t('Automatic Continue') : countdown.next === 'queue' ? t('Queued message') : countdown.next === 'goal' ? t('Goal') : t('Loop');
           return t('{0} · next: {1}', [reason, next]);
         }
-        return countdown.kind === 'unattributed' ? t('Unattributed call') :
+        return countdown.kind === 'provider-limit' ? t('ChatGPT history temporarily rate-limited') :
+        countdown.kind === 'unattributed' ? t('Unattributed call') :
         countdown.kind === 'unattributed-wait' ? t('Unattributed activity · awaiting attribution') :
         countdown.kind === 'assistant-error' ? t('Interrupted response') :
         countdown.kind === 'tab-recovery' ? t('Browser tab recovery') :
@@ -25,7 +26,9 @@ export function renderRecoveryCountdowns(host: HTMLElement, countdowns: readonly
         countdown.kind === 'post-reload' ? t('Reloaded · waiting for activity') :
         countdown.kind === 'thinking-failed' ? t('Thinking failed · waiting for activity') : t('Turn still marked generating · extra wait');
       });
-      ui(row, 'title', () => countdown.kind === 'native-busy' || countdown.generating
+      ui(row, 'title', () => countdown.kind === 'provider-limit'
+        ? t('Automatic recovery is paused during the history rate-limit wait. Reloading earlier can prolong the limit.')
+        : countdown.kind === 'native-busy' || countdown.generating
         ? t('Delivery was deferred because the turn is still marked generating. This is the remaining extra wait, not a new reload timer. Fresh work or a final answer cancels recovery.')
         : countdown.next === 'continue'
         ? t('New activity, a final answer or your Stop cancels automatic Continue. Stop is used only if ChatGPT is still generating.')
@@ -49,7 +52,9 @@ export function renderRecoveryCountdowns(host: HTMLElement, countdowns: readonly
     timer.closest<HTMLElement>('.recovery-notice')!.hidden = (countdown.visibleAt ?? 0) > now;
     const seconds = Math.max(0, Math.ceil((countdown.deadline - now) / 1000));
     const time = `${Math.floor(seconds / 60)}:${String(seconds % 60).padStart(2, '0')}`;
-    const text = countdown.kind === 'pickup'
+    const text = countdown.kind === 'provider-limit'
+      ? seconds ? t('Retry check in {0}', [time]) : t('Retry window ended')
+      : countdown.kind === 'pickup'
       ? seconds ? t('Reload in {0}', [time]) : t('Reload pending…')
       : countdown.next === 'continue'
       ? seconds ? t('Continue in {0}', [time]) : t('Preparing Continue…')

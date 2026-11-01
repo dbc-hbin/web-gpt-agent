@@ -24,6 +24,13 @@
   const origins = new Map();
   const originReaders = new Set();
   const ORIGIN_LISTEN_MS = 15 * 60_000;
+  let latestHistoryLimit = null;
+  const MAX_HISTORY_RETRY_MS = 24 * 60 * 60_000;
+  // A 429 may not expose Retry-After at all (including due to response-header
+  // filtering). Back off conservatively instead of entering a reload storm.
+  const HEADERLESS_HISTORY_BACKOFF_MS = 60_000;
+  // ChatGPT has used both the singular and plural history detail routes.
+  const HISTORY_PATH = /^\/backend-api\/conversations?\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\/?$/i;
   function publishOrigin(conversationId, requestIds, observedAt) {
     const fresh = requestIds.filter(id => !origins.has(`${conversationId}:${id}`));
     if (!fresh.length) return;
@@ -255,6 +262,35 @@
     });
     window.WebSocket = observedWebSocket;
   }
+  function retryAfterAt(response, observedAt) {
+    for (const name of ['retry-after', 'x-oai-history-initial-retry-after']) {
+      const raw = response.headers?.get?.(name);
+      if (typeof raw !== 'string' || !raw.trim()) continue;
+      const value = raw.trim();
+      const retryAt = /^\d{1,6}$/.test(value) ? observedAt + Number(value) * 1000 : Date.parse(value);
+      if (Number.isFinite(retryAt) && retryAt > observedAt && retryAt - observedAt <= MAX_HISTORY_RETRY_MS) return retryAt;
+    }
+    return null;
+  }
+  /**
+   * Provider history throttling happens before the conversation DOM exists. Project only the
+   * exact conversation id plus a bounded retry deadline: no body, request headers, credentials
+   * or transcript bytes cross worlds. A missing header gets a fixed local cooldown, which is not
+   * presented as a provider-declared deadline.
+   */
+  function inspectHistoryLimit(response, observedAt, method) {
+    if (method !== 'GET' || response.status !== 429) return;
+    let url;
+    try { url = new URL(response.url); } catch { return; }
+    if (url.origin !== location.origin) return;
+    const match = HISTORY_PATH.exec(url.pathname);
+    if (!match) return;
+    const retryAt = retryAfterAt(response, observedAt) ?? observedAt + HEADERLESS_HISTORY_BACKOFF_MS;
+    const projected = { type: 'cos-history-rate-limit', conversationId: match[1], retryAt, observedAt };
+    if (!latestHistoryLimit || projected.retryAt > latestHistoryLimit.retryAt ||
+        projected.conversationId !== latestHistoryLimit.conversationId) latestHistoryLimit = projected;
+    post(projected, location.origin);
+  }
   const inspectedResponses = new WeakSet();
   const installFetchObserver = () => {
     if (window.fetch === observedFetch || typeof window.fetch !== 'function') return;
@@ -268,13 +304,15 @@
       void result.then((response) => {
         if (inspectedResponses.has(response)) return;
         inspectedResponses.add(response);
-        void inspect(response, observedAt, order).catch(() => {});
+        const responseAt = Date.now();
         let method = 'GET';
         try {
           const explicit = args[1] && typeof args[1].method === 'string' ? args[1].method : null;
           const inherited = args[0] && typeof args[0] === 'object' && typeof args[0].method === 'string' ? args[0].method : null;
           method = String(explicit || inherited || 'GET').toUpperCase();
         } catch { return; }
+        inspectHistoryLimit(response, responseAt, method);
+        void inspect(response, observedAt, order).catch(() => {});
         if (method === 'POST') void inspectRequestOrigins(response, observedAt).catch(() => {});
       }).catch(() => {});
       return result;
@@ -293,6 +331,7 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-usage-request') return;
     if (latest) post(latest, location.origin);
+    if (latestHistoryLimit && latestHistoryLimit.retryAt > Date.now()) post(latestHistoryLimit, location.origin);
     // Newest first: old evidence must not fill content's 16-ID pending capacity
     // before the current workflow can enter it during document startup.
     for (const { conversationId, requestId, observedAt } of [...origins.values()].slice(-16).reverse())
@@ -300,6 +339,6 @@
   });
   window.addEventListener('pagehide', () => {
     for (const reader of originReaders) void reader.cancel().catch(() => {});
-    origins.clear();
+    origins.clear(); latestHistoryLimit = null;
   });
 })();

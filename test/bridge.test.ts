@@ -8657,6 +8657,63 @@ describe('unattributed activity recovery', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  // Upstream d1170dfb/db04ea9e: an observed history 429 holds automatic recovery to its deadline.
+  it('holds automatic recovery until the history Retry-After deadline and exposes that wait', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limited')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      const retryAt = Date.now() + CHAT_SILENCE_MS + 60_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limited', recoverable: false, blocking: true,
+        retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+      const session = (await findSessionByConversation(PRIME))!;
+      expect((await sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'provider-limit', deadline: retryAt }]);
+
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      expect(await maintenance()).toBeNull();
+      // The queued silence repair owns the notice; the provider deadline extends it.
+      expect((await sessionControlsFor(session.id)).recovery).toEqual([{ kind: 'silence', deadline: retryAt }]);
+
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(await maintenance()).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('refuses a pre-existing repair handout while a newer history Retry-After is active', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const { setGoalSwitchNow } = await import('../src/main/goal.js');
+      await setGoalSwitchNow(PRIME, 'loop', true, true);
+      await events(PRIME, [
+        { kind: 'model_selection', time: Date.now(), model: 'GPT-5.6 Sol', reasoningEffort: 'high' },
+        openTurn('history-limit-race')
+      ]);
+      await attributed(PRIME, false, Date.now());
+      await vi.advanceTimersByTimeAsync(CHAT_SILENCE_MS + 1);
+      await sweepStaleSwarm(Date.now());
+      const handout = await maintenance();
+      expect(handout).toMatchObject({ conversationId: PRIME, reason: 'silence' });
+      const retryAt = Date.now() + 31_000;
+      await events(PRIME, [{
+        kind: 'chat_error', time: Date.now(), turnId: 'history-limit-race', recoverable: false, blocking: true,
+        retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }]);
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      await vi.advanceTimersByTimeAsync(31_001);
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
   it.each(['goal', 'loop'] as const)('preserves the existing %s silence deadline after a provider access limit', async mode => {
     vi.useFakeTimers();
     try {
@@ -12502,6 +12559,63 @@ describe('the goal loop over the bridge', () => {
       await vi.advanceTimersByTimeAsync(5 * 60_000);
       await sweepStaleSwarm(Date.now());
       expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('defers the queued Goal cold-browser startup until a history Retry-After expires', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = 'cafe0174-0000-4000-8000-000000000174';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-cold-limit' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'g-cold-limit' },
+        { kind: 'turn_end', time: Date.now(), turnId: 'g-cold-limit', outcome: 'completed' },
+        { kind: 'assistant_message', time: Date.now(), turnId: 'g-cold-limit', messageId: 'a-cold-limit', text: 'First part done.',
+          state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } });
+      expect(goalPendingReplyFor(chat)).not.toBeNull();
+      const retryAt = Date.now() + 3 * 60_000;
+      await request('POST', '/events', { body: { conversationId: chat, events: [{
+        kind: 'chat_error', time: Date.now(), recoverable: false, blocking: true, retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }] } });
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await sweepStaleSwarm(Date.now());
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(60_001);
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+      expect(await recoveryBrowserWake.mock.calls[0]?.[3]?.current()).toBe(true);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('cold-starts again after Retry-After when an unclaimed Goal handout lost its browser', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const chat = 'cafe0176-0000-4000-8000-000000000176';
+      await request('POST', '/events', { body: { conversationId: chat, events: [
+        { kind: 'user_message', time: Date.now(), text: 'keep going', messageId: 'm-handed-limit' },
+        { kind: 'turn_start', time: Date.now(), turnId: 'g-handed-limit' },
+        { kind: 'turn_end', time: Date.now(), turnId: 'g-handed-limit', outcome: 'completed' },
+        { kind: 'assistant_message', time: Date.now(), turnId: 'g-handed-limit', messageId: 'a-handed-limit', text: 'First part done.',
+          state: 'final', final: true, goalEligible: true, activeNow: true }
+      ] } });
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await sweepStaleSwarm(Date.now());
+      const handout = (await request('GET', '/status')).body.repairs?.[0];
+      expect(handout).toMatchObject({ conversationId: chat, reason: 'goal' });
+      recoveryBrowserWake.mockClear();
+      const retryAt = Date.now() + 31_000;
+      await request('POST', '/events', { body: { conversationId: chat, events: [{
+        kind: 'chat_error', time: Date.now(), recoverable: false, blocking: true, retryAt, text: 'ChatGPT temporarily rate-limited loading this conversation history.'
+      }] } });
+      expect((await request('POST', '/repairs/claim', { body: { token: handout!.token } })).body.allowed).toBe(false);
+      expect(recoveryBrowserWake).not.toHaveBeenCalled();
+      // The handed token stays unclaimed while the browser is absent; the app-side deadline owns
+      // one cold start when Retry-After expires.
+      await vi.advanceTimersByTimeAsync(31_001);
+      expect(recoveryBrowserWake).toHaveBeenCalledTimes(1);
+      expect(await recoveryBrowserWake.mock.calls[0]?.[3]?.current()).toBe(true);
     } finally { vi.useRealTimers(); }
   });
 

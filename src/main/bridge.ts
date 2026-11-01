@@ -1350,6 +1350,9 @@ function parseObservations(input: unknown): ChatObservation[] {
     if (typeof item['detail'] === 'string') observation.detail = item['detail'].slice(0, 500);
     if (typeof item['recoverable'] === 'boolean') observation.recoverable = item['recoverable'];
     if (item['blocking'] === true) observation.blocking = true;
+    if (kind === 'chat_error' && item['blocking'] === true && typeof item['retryAt'] === 'number' &&
+        Number.isFinite(item['retryAt']) && item['retryAt'] > observation.time &&
+        item['retryAt'] - observation.time <= 24 * 60 * 60_000) observation.retryAt = Math.floor(item['retryAt']);
     if (Array.isArray(item['calls'])) {
       // An over-size batch carries no usable evidence at all: the observation keeps its transcript
       // and loses only the attribution claim, rather than being attributed on a trimmed prefix.
@@ -2723,6 +2726,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const [conversationId, repair] = found;
     const session = await getSession(repair.sessionId);
     const current = session?.conversationId === conversationId && departureAllowsRepair(session) &&
+      providerHistoryBackoff(conversationId) === null &&
       !(repair.reason !== 'compaction' && !session.activeTurnId && session.lastTurnOutcome === 'stopped') && !isChatBlocked(conversationId) &&
       !stopRequestedFor(conversationId) && await attributionRepairAllowed(repair, session) &&
       await assistantRepairCurrent(conversationId, repair) && await silenceRepairCurrent(conversationId, repair) &&
@@ -6719,6 +6723,17 @@ function forgetActivity(conversationId: string): void {
 function armSilenceSweep(now = Date.now()): void {
   let earliest = Number.POSITIVE_INFINITY;
   for (const grant of activeUntil.values()) if (grant.until > now) earliest = Math.min(earliest, grant.until);
+  // Only a repair explicitly deferred by a history Retry-After joins this timer. Ordinary
+  // Goal/compaction cold starts keep their queue-time authority path.
+  for (const [conversationId, deferred] of providerDeferredColdStarts) {
+    const repair = repairsInFlight.get(conversationId);
+    if (repair !== deferred.repair || repair.state === 'done' ||
+        (repair.state !== 'queued' && !(repair.state === 'handed' && !repair.claimed))) {
+      providerDeferredColdStarts.delete(conversationId);
+      continue;
+    }
+    if (repair.notBefore > now) earliest = Math.min(earliest, repair.notBefore);
+  }
   if (!Number.isFinite(earliest)) {
     if (silenceTimer) clearTimeout(silenceTimer);
     silenceTimer = null;
@@ -6739,6 +6754,7 @@ function armSilenceSweep(now = Date.now()): void {
       // lose. The ledger reads exact recorded model identity before changing a grant; whatever
       // the resulting queue implies for a worker's slot remains the full sweep's business.
       void inspectSilentChats(Date.now()).then((pass) => {
+      wakeDueProviderDeferredRecovery(Date.now());
       // A chat whose one repair was already carried out is the sweep's to retire, because letting
       // go of it can free a worker slot. Hand that half back rather than doing it from here.
       if (pass.spent.length > 0) {
@@ -6814,6 +6830,10 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
     if (pendingRepair.reason === 'no-tab' || pendingRepair.reason === 'stalled')
       return [{ kind: 'tab-recovery', deadline: pendingRepair.notBefore }];
   }
+  // A handed repair keeps precedence. A history limit replaces only future recovery notices;
+  // its deadline still fences claims and pickups.
+  const providerLimit = providerHistoryBackoff(conversationId);
+  if (providerLimit) return [{ kind: 'provider-limit', deadline: providerLimit }];
   const recovery = rows.find(row => row.sessionId === sessionId && row.recovery &&
     (row.state === 'queued' || row.state === 'browser') && row.silenceBoundary);
   if (recovery?.silenceBoundary && recoveryInputAllowed(sessionId, conversationId)) {
@@ -6946,6 +6966,105 @@ interface Repair {
 const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattributed', 'assistant-error']);
 
 const repairsInFlight = new Map<string, Repair>();
+/** Provider Retry-After deadline for conversation-history reads. It delays browser recovery; it never creates one. */
+const providerHistoryBackoffUntil = new Map<string, number>();
+type ProviderDeferredColdStart = {
+  repair: Repair;
+  pickup: { replyId: string; dueAt: number; attempts: number; expiresAt: number } | null;
+  ticketToken: string | null;
+};
+/** Queue-time authority snapshots only for Goal/compaction work actually deferred by Retry-After. */
+const providerDeferredColdStarts = new Map<string, ProviderDeferredColdStart>();
+
+function providerHistoryBackoff(conversationId: string, now = Date.now()): number | null {
+  const until = providerHistoryBackoffUntil.get(conversationId);
+  if (!until) return null;
+  if (until <= now) {
+    providerHistoryBackoffUntil.delete(conversationId);
+    return null;
+  }
+  return until;
+}
+
+function noteProviderHistoryBackoff(conversationId: string, observations: readonly ChatObservation[]): void {
+  const now = Date.now();
+  for (const [id, deadline] of providerHistoryBackoffUntil) if (deadline <= now) providerHistoryBackoffUntil.delete(id);
+  let until = providerHistoryBackoff(conversationId, now) ?? 0;
+  for (const item of observations) {
+    if (item.kind !== 'chat_error' || item.blocking !== true || !Number.isFinite(item.retryAt) ||
+        item.retryAt! <= now || item.retryAt! - item.time > 24 * 60 * 60_000) continue;
+    until = Math.max(until, item.retryAt!);
+  }
+  if (!until) return;
+  // Expired entries are purged above. A live rate-limit fence is never evicted.
+  providerHistoryBackoffUntil.set(conversationId, until);
+  const repair = repairsInFlight.get(conversationId);
+  if (repair && repair.state !== 'done') {
+    repair.notBefore = Math.max(repair.notBefore, until);
+    if ((repair.reason === 'goal' || repair.reason === 'compaction') &&
+        (repair.state === 'queued' || (repair.state === 'handed' && !repair.claimed))) {
+      rememberProviderDeferredColdStart(conversationId, repair);
+    }
+  }
+  armSilenceSweep(now);
+}
+
+function rememberProviderDeferredColdStart(conversationId: string, repair: Repair): void {
+  if (repair.reason !== 'goal' && repair.reason !== 'compaction') return;
+  providerDeferredColdStarts.set(conversationId, {
+    repair,
+    pickup: pickupWatch.get(conversationId) ?? null,
+    ticketToken: continuationForSession(repair.sessionId)?.token ?? null
+  });
+}
+
+/** Retry-After expiry may need to restart a browser that disappeared after the original handout. */
+function wakeProviderDeferredColdStart(conversationId: string, deferred: ProviderDeferredColdStart): void {
+  const { repair, pickup, ticketToken } = deferred;
+  if (getConfig().ui.browserOnly === true) return;
+  if (repairsInFlight.get(conversationId) !== repair ||
+      (repair.state !== 'queued' && !(repair.state === 'handed' && !repair.claimed))) return;
+  if (Date.now() < repair.notBefore || providerHistoryBackoff(conversationId) !== null) return;
+  const lifecycle = bridgeLifecycleEpoch;
+  void getSession(repair.sessionId).then(session => {
+    if (session?.conversationId !== conversationId || !departureAllowsRepair(session)) return;
+    const current = () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested &&
+      getConfig().ui.browserOnly !== true &&
+      repairsInFlight.get(conversationId) === repair &&
+      (repair.state === 'queued' || (repair.state === 'handed' && !repair.claimed)) &&
+      Date.now() >= repair.notBefore && providerHistoryBackoff(conversationId) === null &&
+      !isChatBlocked(conversationId) && !stopRequestedFor(conversationId) &&
+      !supersededSourceConversations().includes(conversationId);
+    return wakeBrowserUrl(chatUrl(conversationId), true, getConfig().ui.backgroundChats === true, {
+      current: () => {
+        if (!current()) return false;
+        if (repair.reason === 'compaction') {
+          const ticket = continuationForSession(repair.sessionId);
+          return !!ticketToken && !!ticket && ticket.from === conversationId &&
+            ticket.token === ticketToken && ticket.state === 'awaiting-summary';
+        }
+        return owedPickups(Date.now()).then(owed => current() && !!pickup && !continuationForSession(repair.sessionId) &&
+          pickupWatch.get(conversationId) === pickup &&
+          owed.get(conversationId)?.sessionId === repair.sessionId &&
+          owed.get(conversationId)?.replyId === pickup.replyId);
+      }
+    });
+  }).catch((error: Error) => logWarn(`bridge: could not start browser for ${repair.reason} recovery: ${error.message}`));
+}
+
+function wakeDueProviderDeferredRecovery(now = Date.now()): void {
+  for (const [conversationId, deferred] of providerDeferredColdStarts) {
+    const repair = repairsInFlight.get(conversationId);
+    if (repair !== deferred.repair || repair.state === 'done' ||
+        (repair.state !== 'queued' && !(repair.state === 'handed' && !repair.claimed))) {
+      providerDeferredColdStarts.delete(conversationId);
+      continue;
+    }
+    if (repair.notBefore > now || providerHistoryBackoff(conversationId, now) !== null) continue;
+    providerDeferredColdStarts.delete(conversationId);
+    wakeProviderDeferredColdStart(conversationId, deferred);
+  }
+}
 
 /** Replayed transcript markers are diagnostics, not new continuation attempts. */
 const markedReplacementNotices = new Set<string>();
@@ -7148,10 +7267,12 @@ function queueBrowserRecovery(
   // closed tab has no page to protect: on 2026-09-03 a worker the user closed sat under the
   // floor for two and a half minutes because a silence reopen had landed moments earlier. One
   // close is one reopen, and it is immediate.
-  const notBefore =
+  const policyNotBefore =
     reason === 'silence' || reason === 'goal' || reason === 'compaction' || reason === 'no-tab' || reason === 'unattributed'
       ? now
       : Math.max(now, (lastBrowserRecoveryAt.get(conversationId) ?? 0) + BROWSER_RECOVERY_COOLDOWN_MS);
+  const providerUntil = providerHistoryBackoff(conversationId, now);
+  const notBefore = Math.max(policyNotBefore, providerUntil ?? 0);
   const repair: Repair = {
     ...(reason === 'silence' ? { silenceGrant: activeUntil.get(conversationId) } : {}),
     ...(assistantSource ? { assistantSource } : {}),
@@ -7172,7 +7293,10 @@ function queueBrowserRecovery(
   // A queued durable pickup used to wait forever when Chrome itself had exited:
   // nobody remained to collect /status. This same accepted repair owns one cold
   // start through the existing startup owner; no new timer or opening retry exists.
-  if ((reason === 'goal' || reason === 'compaction') && getConfig().ui.browserOnly !== true) {
+  if ((reason === 'goal' || reason === 'compaction') && providerUntil !== null && notBefore > now) {
+    rememberProviderDeferredColdStart(conversationId, repair);
+    armSilenceSweep(now);
+  } else if ((reason === 'goal' || reason === 'compaction') && getConfig().ui.browserOnly !== true) {
     const pickup = pickupWatch.get(conversationId);
     const ticket = continuationForSession(sessionId);
     const lifecycle = bridgeLifecycleEpoch;
@@ -7229,6 +7353,7 @@ async function noteRecoveryObservations(
   const accessLimit = (item: ChatObservation): boolean => item.kind === 'chat_error' &&
     (item.blocking === true ||
       /^too many requests\b.*temporarily limited.*access.*few minutes/i.test((item.text ?? '').replace(/\s+/g, ' ')));
+  noteProviderHistoryBackoff(conversationId, observations);
   // The recorder owns idempotency. Raw batches may contain a historical user row or turn_start
   // beside a newly accepted title, so inferring activity from `stored > 0` re-armed completed
   // chats on every recovery reload. Only the recorder's per-event acceptance verdict may move
@@ -9747,6 +9872,8 @@ export function resetBridgeForTests(): void {
   bridgeRecovering = false;
   bridgeShutdownRequested = false;
   clearUnattributedIncident();
+  providerHistoryBackoffUntil.clear();
+  providerDeferredColdStarts.clear();
   activeUntil.clear();
   awaitingReturn.clear();
   lastAttributedCallAt.clear();

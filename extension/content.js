@@ -2339,6 +2339,7 @@
         }
       }
     }
+    publishHistoryRateLimit();
     flushStreamRequestOrigins();
     // Route assignment and authored text can arrive in either order. This receipt is
     // evaluated on the existing observer, rather than only on the one route-change edge.
@@ -10882,6 +10883,37 @@
     const encoded = JSON.stringify({ rows, observedAt });
     if (encoded.length > 24000 || encoded === lastUsageProjection) return;
     void ask({ type: 'usage_observation', rows, observedAt }).then((reply) => { if (reply?.ok) lastUsageProjection = encoded; });
+  });
+  // A history 429 seen by the MAIN-world fetch observer, held until this exact route can
+  // carry it: the limit usually arrives before the conversation DOM exists.
+  let pendingHistoryRateLimit = null;
+  function publishHistoryRateLimit() {
+    const limit = pendingHistoryRateLimit;
+    if (!limit || limit.retryAt <= Date.now() || limit.published === limit.retryAt) return;
+    if (conversationId !== limit.conversationId || CLF_DOM.conversationId() !== limit.conversationId) return;
+    limit.published = limit.retryAt;
+    emit({
+      kind: 'chat_error',
+      text: 'ChatGPT temporarily rate-limited loading this conversation history. Web GPT Agent is pausing automatic recovery until the retry wait ends.',
+      recoverable: false,
+      blocking: true,
+      retryAt: limit.retryAt
+    });
+    void flush();
+  }
+  window.addEventListener('message', (event) => {
+    if (!alive || event.source !== window || event.origin !== location.origin || event.data?.type !== 'cos-history-rate-limit') return;
+    const claimed = typeof event.data.conversationId === 'string' ? event.data.conversationId : '';
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(claimed) ||
+        CLF_DOM.conversationId() !== claimed) return;
+    const retryAt = Number(event.data.retryAt), observedAt = Number(event.data.observedAt);
+    if (!Number.isFinite(retryAt) || !Number.isFinite(observedAt) || retryAt <= observedAt ||
+        retryAt - observedAt > 24 * 60 * 60_000 || retryAt <= Date.now()) return;
+    if (!pendingHistoryRateLimit || pendingHistoryRateLimit.conversationId !== claimed ||
+        retryAt > pendingHistoryRateLimit.retryAt) {
+      pendingHistoryRateLimit = { conversationId: claimed, retryAt, observedAt, published: 0 };
+    }
+    publishHistoryRateLimit();
   });
   function flushStreamRequestOrigins() {
     const route = CLF_DOM.conversationId();

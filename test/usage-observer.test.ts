@@ -38,20 +38,25 @@ function harness() {
   runInNewContext(script, { window, document, location: { origin: 'https://chatgpt.com' }, URL, Date: Clock, TextDecoder,
     setTimeout: (run: () => void, ms: number) => { timers.set(++timerId, { at: now + ms, run }); return timerId; },
     clearTimeout: (id: number) => timers.delete(id) });
-  async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {}) {
+  async function feed(data: unknown, url = 'https://chatgpt.com/backend-api/wham/usage', init: Record<string, unknown> = {},
+                      responseInit: { status?: number; headers?: Record<string, string> } = {}) {
     let done: () => void = () => {};
     const inspected = new Promise<void>(resolve => { done = resolve; });
     let read = false;
     const bodyGate = nextBodyGate; nextBodyGate = null;
     const body = new TextEncoder().encode(JSON.stringify(data));
-    response = { url, ok: true, headers: { get: () => 'application/json' }, clone: () => ({ body: { getReader: () => ({
+    const status = responseInit.status ?? 200;
+    const headers = new Map(Object.entries({ 'content-type': 'application/json', ...(responseInit.headers ?? {}) })
+      .map(([key, value]) => [key.toLowerCase(), value]));
+    response = { url, status, ok: status >= 200 && status < 300, headers: { get: (name: string) => headers.get(name.toLowerCase()) ?? null }, clone: () => ({ body: { getReader: () => ({
       read: async () => { await bodyGate; return read ? { done: true } : (read = true, { done: false, value: body }); },
       cancel: async () => { done(); }
     }) } }) };
     const expectedResponse = response;
     const returned = await window.fetch('/endpoint', { headers: { Authorization: 'private-test-value' }, ...init });
     expect(returned).toBe(expectedResponse);
-    if (new URL(url).origin === 'https://chatgpt.com' && /^\/backend-api\/(wham\/usage|conversation\/init|conversation\/prepare|models)$/.test(new URL(url).pathname)) await inspected;
+    if (new URL(url).origin === 'https://chatgpt.com' && status >= 200 && status < 300 &&
+        /^\/backend-api\/(wham\/usage|conversation\/init|conversation\/prepare|models)$/.test(new URL(url).pathname)) await inspected;
     else await new Promise(resolve => setTimeout(resolve, 0));
   }
   async function feedSse(chunks: string[], init: Record<string, unknown> = { method: 'POST' }, url = 'https://chatgpt.com/backend-api/conversation') {
@@ -282,6 +287,55 @@ describe('MAIN-world usage projection', () => {
       expect.objectContaining({ model: 'deep-research', scope: 'feature', remaining: 5 }),
       expect.objectContaining({ model: 'gpt-example', scope: 'model', remaining: 2 })
     ]);
+  });
+
+  // Upstream d1170dfb/db04ea9e: a conversation-history 429 projects only its id and bounded retry deadline.
+  it('projects a conversation-history 429 with Retry-After and replays only the bounded deadline', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feed({ private: 'NEVER_PROJECT_THIS_BODY' },
+      `https://chatgpt.com/backend-api/conversations/${id}?num_turns=10`, {},
+      { status: 429, headers: { 'Retry-After': '24' } });
+    const projected = h.posts.filter(row => row.type === 'cos-history-rate-limit');
+    expect(projected).toEqual([{
+      type: 'cos-history-rate-limit', conversationId: id,
+      observedAt: Date.parse('2026-09-05T12:00:00Z'),
+      retryAt: Date.parse('2026-09-05T12:00:24Z')
+    }]);
+    expect(JSON.stringify(h.posts)).not.toContain('NEVER_PROJECT_THIS_BODY');
+    h.request();
+    expect(h.posts.filter(row => row.type === 'cos-history-rate-limit')).toEqual([projected[0], projected[0]]);
+    h.advance(24_001);
+    h.request();
+    expect(h.posts.filter(row => row.type === 'cos-history-rate-limit')).toHaveLength(2);
+  });
+
+  it('covers the singular history endpoint with a local cooldown when the 429 has no Retry-After', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    await h.feed({ detail: 'Too many requests' }, `https://chatgpt.com/backend-api/conversation/${id}`, {}, { status: 429 });
+    expect(h.posts.filter(row => row.type === 'cos-history-rate-limit')).toEqual([{
+      type: 'cos-history-rate-limit', conversationId: id,
+      observedAt: Date.parse('2026-09-05T12:00:00Z'),
+      retryAt: Date.parse('2026-09-05T12:01:00Z')
+    }]);
+  });
+
+  it('uses the history-specific header fallback, bounds unusable values and ignores unrelated or non-GET 429s', async () => {
+    const h = harness();
+    const id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+    const limits = () => h.posts.filter(row => row.type === 'cos-history-rate-limit');
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {},
+      { status: 429, headers: { 'Retry-After': 'invalid', 'X-OAI-History-Initial-Retry-After': '31' } });
+    expect(limits().at(-1)?.retryAt).toBe(Date.parse('2026-09-05T12:00:31Z'));
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {}, { status: 429, headers: { 'Retry-After': '999999' } });
+    expect(limits().at(-1)?.retryAt).toBe(Date.parse('2026-09-05T12:01:00Z'));
+    const count = limits().length;
+    await h.feed({}, 'https://chatgpt.com/backend-api/conversations', {}, { status: 429, headers: { 'Retry-After': '30' } });
+    await h.feed({}, `https://example.test/backend-api/conversations/${id}`, {}, { status: 429, headers: { 'Retry-After': '30' } });
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, { method: 'POST' }, { status: 429, headers: { 'Retry-After': '30' } });
+    await h.feed({}, `https://chatgpt.com/backend-api/conversations/${id}`, {}, { status: 200 });
+    expect(limits()).toHaveLength(count);
   });
 
   it('ignores foreign and unrelated responses, invalid counts and oversized payloads', async () => {

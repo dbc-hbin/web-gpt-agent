@@ -10361,6 +10361,37 @@ describe('evidence from the page context', () => {
     expect(live.sent.filter((message) => message.type === 'correlate')).toEqual([]);
   });
 
+  // Upstream d1170dfb: the MAIN-world history 429 projection becomes one blocking notice per deadline.
+  it('turns an exact history Retry-After projection into one blocking non-recoverable chat error', async () => {
+    live = await harness();
+    const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';
+    const observedAt = live.window.Date.now();
+    const publish = (retryAt: number, id = conversationId) => live!.window.dispatchEvent(new live!.window.MessageEvent('message', {
+      source: live!.window as unknown as Window,
+      origin: 'https://chatgpt.com',
+      data: { type: 'cos-history-rate-limit', conversationId: id, observedAt, retryAt }
+    }));
+
+    publish(observedAt + 24_000);
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toEqual([
+      expect.objectContaining({
+        conversationId,
+        event: expect.objectContaining({ blocking: true, recoverable: false, retryAt: observedAt + 24_000 })
+      })
+    ]);
+
+    publish(observedAt + 20_000);
+    publish(observedAt + 30_000, '11111111-2222-3333-4444-555555555555');
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toHaveLength(1);
+
+    publish(observedAt + 31_000);
+    await settle();
+    expect(emitted(live.sent, 'chat_error')).toHaveLength(2);
+    expect(emitted(live.sent, 'chat_error').at(-1)?.event.retryAt).toBe(observedAt + 31_000);
+  });
+
   it('does not let a stale owned Fiber turn bypass a rejected live ownership handshake', async () => {
     live = await harness();
     const conversationId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee';

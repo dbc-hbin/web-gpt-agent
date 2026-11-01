@@ -1759,6 +1759,8 @@ export interface ChatObservation {
   recoverable?: boolean;
   /** chat_error only: the DOM classifier identified a provider access limit, in any language. */
   blocking?: boolean;
+  /** chat_error only: provider Retry-After deadline for loading this exact conversation history. */
+  retryAt?: number;
   /** tool_evidence only: the connector requests this turn's message model holds. */
   calls?: PageCallEvidence[];
 }
@@ -2312,6 +2314,15 @@ async function recordChatObservationsNow(
         const text = chatErrorMessageKey(item.text ?? '', item.recoverable === true);
         const question = item.recoverable === true ? await readLatestUserMessage(sessionId) : undefined;
         const recent = await readRecentEvents(sessionId, 32, { kinds: ['chat_error'], maxBytes: 256 * 1024 });
+        // A history limit that keeps answering the same way is one notice, not one per retry. It is
+        // recorded again only after another blocking error came in between, or after half an hour.
+        // Only the history limit (it carries its Retry-After): the provider access dialog keeps
+        // being recorded again after 30 s, as before.
+        const newestBlocking = recent.reduce<SessionEvent | undefined>((latest, event) =>
+          event.kind === 'chat_error' && event.blocking === true && (!latest || event.seq > latest.seq) ? event : latest, undefined);
+        if (item.blocking === true && Number.isFinite(item.retryAt) && newestBlocking?.kind === 'chat_error' &&
+            item.time - newestBlocking.time <= 30 * 60_000 &&
+            chatErrorMessageKey(newestBlocking.message.text, newestBlocking.recoverable === true) === text) continue;
         if (recent.some(event => event.kind === 'chat_error' &&
             ((question && event.recoverable === true && event.seq > (question.origin ?? question.seq)) ||
             ((Math.abs(item.time - event.time) <= 30_000 ||
@@ -2325,6 +2336,9 @@ async function recordChatObservationsNow(
           ...((item.reason === 'thinking_failed' || item.reason === 'thinking_stopped') ? { reason: item.reason } : {}),
           ...(typeof item.recoverable === 'boolean' ? { recoverable: item.recoverable } : {}),
           ...(typeof item.blocking === 'boolean' ? { blocking: item.blocking } : {}),
+          // The same bounds the bridge applies before it honors a Retry-After.
+          ...(item.blocking === true && Number.isFinite(item.retryAt) && item.retryAt! > item.time &&
+            item.retryAt! - item.time <= 24 * 60 * 60_000 ? { retryAt: item.retryAt } : {}),
           message: await storeText(sessionId, item.text ?? '', 2000)
         });
         activity.meaningful = true;
