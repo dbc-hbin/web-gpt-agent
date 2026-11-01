@@ -708,7 +708,7 @@ export function registerIpc(
         roots: config.roots.filter((r) => r.name !== name)
       };
     });
-    projectFileWatches.close();
+    closeProjectWatches();
     logInfo(`removed folder /${name}`);
     return buildState();
   });
@@ -1412,7 +1412,7 @@ export function registerIpc(
   onSwarmChange(() => push('swarm:changed', swarmState()));
   return {
     disposeClient: () => {
-      projectFileWatches.close();
+      closeProjectWatches();
       disposeWorkspaceTerminals();
     }
   };
