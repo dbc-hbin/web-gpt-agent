@@ -437,11 +437,23 @@ async function persistJournalNow() {
   }
 }
 
+/** The write queued behind the one in flight; it has not taken its snapshot yet. */
+let queuedJournalWrite = null;
+
 function persistJournal() {
   // storage.session.set is asynchronous and whole-snapshot writes may complete out of order.
   // Serialize them so an older snapshot can never land after a newer one while both callers
   // were already told their observations were durable.
-  const write = journalWriteQueue.then(() => persistJournalNow());
+  //
+  // Each write stores the whole journal (up to 4 MiB) and takes its snapshot when it starts, so
+  // callers arriving while one write is in flight share the next one: it holds all of their
+  // observations, and each caller's reply still waits for a write containing its own.
+  if (queuedJournalWrite) return queuedJournalWrite;
+  const write = journalWriteQueue.then(() => {
+    queuedJournalWrite = null;
+    return persistJournalNow();
+  });
+  queuedJournalWrite = write;
   journalWriteQueue = write.then(
     () => undefined,
     () => undefined

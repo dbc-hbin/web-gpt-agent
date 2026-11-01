@@ -3219,6 +3219,43 @@ describe('extension observation journal', () => {
     expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B']);
   });
 
+  // Upstream #1666: every events message rewrote the whole journal (up to 4 MiB), one write after
+  // another. Messages that arrive while a write is in flight share the next write: it takes its
+  // snapshot when it starts, so it holds all of them, and each reply still waits for it.
+  it('stores observations that arrive during a slow journal write together in one following write', async () => {
+    const local = new FakeStorageArea();
+    const session = new FakeStorageArea();
+    const journalWrites: string[][] = [];
+    const firstWriteStarted = Promise.withResolvers<void>();
+    const releaseFirstWrite = Promise.withResolvers<void>();
+    const set = session.set.bind(session);
+    session.set = async (values: Record<string, unknown>) => {
+      if (Array.isArray(values.journal)) {
+        journalWrites.push((values.journal as Array<{ event: { text: string } }>).map((entry) => entry.event.text));
+        if (journalWrites.length === 1) {
+          firstWriteStarted.resolve();
+          await releaseFirstWrite.promise;
+        }
+      }
+      return set(values);
+    };
+    const worker = loadWorker({ local, session });
+    const send = (text: string, time: number) => worker.send(
+      { type: 'events', entries: [{ conversationId: null, event: { kind: 'user_message', time, text } }] }, time);
+    const first = send('A', 1);
+    await firstWriteStarted.promise;
+    const later = ['B', 'C', 'D', 'E'].map((text, index) => send(text, index + 2));
+    // The later handlers only await already-settled storage reads, so one macrotask turn lets each
+    // reach persistJournal while the first write is still held.
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseFirstWrite.resolve();
+    const replies = await Promise.all([first, ...later]);
+
+    for (const reply of replies) expect(reply).toMatchObject({ ok: true, durable: true });
+    expect(journalOf(session).map((entry) => entry.event.text)).toEqual(['A', 'B', 'C', 'D', 'E']);
+    expect(journalWrites).toEqual([['A'], ['A', 'B', 'C', 'D', 'E']]);
+  });
+
   it('serializes live tab snapshots so a slow older write cannot forget a newer tab owner', async () => {
     const local = new FakeStorageArea();
     const session = new FakeStorageArea();

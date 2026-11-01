@@ -1744,6 +1744,9 @@ messages. Two transport slots, one batch per conversation and fair batch electio
 hot/stalled chat blocking another. Command ACK custody precedes later observations from that
 route. Reconnection restores eligible documents before creating new work; browser restart is
 a different lifetime from MV3 suspension (§2).
+Journal writes are serialized whole snapshots taken when each write starts; observations that
+arrive while one write is in flight share the single next write, and each reply waits for a
+write containing its own observations.
 `deliverJournalBatch` gives both the initial `/events` request and its 413 split retry sixty
 seconds for durable acceptance. Timeout preserves the observations for later retry; it does
 not acknowledge them or change the ordinary ten-second request budget. The HTTP server's
