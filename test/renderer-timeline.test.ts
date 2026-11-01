@@ -161,7 +161,7 @@ async function settleHistoryFrame(w: Pick<Window, 'requestAnimationFrame'>): Pro
   await settle();
 }
 
-async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null } = {}) {
+async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers: Array<{ id: string; sourceSessionId: string }> = [], projects: LocalProject[] = [], options: { origin?: SessionSummary["origin"]; developerMode?: boolean; sessions?: SessionSummary[]; pro?: boolean; reserveOpenings?: boolean; handoff?: Handoff | null; summary?: Partial<SessionSummary> } = {}) {
   const html = await fs.readFile(path.join(process.cwd(), 'src', 'renderer', 'index.html'), 'utf8');
   dom = new JSDOM(html, { url: 'https://local.test/', pretendToBeVisual: true });
   const w = dom.window;
@@ -238,7 +238,7 @@ async function boot(events: SessionEvent[], selectExisting = true, pausedHelpers
         return () => undefined;
       },
       listSessions: () => {
-        const sessions = options.sessions ?? [{ ...summary(live.events), ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
+        const sessions = options.sessions ?? [{ ...summary(live.events), ...options.summary, ...(options.origin ? { origin: options.origin } : {}), ...(projects[0] ? { projectId: projects[0].id } : {}) }];
         const known = new Set(sessions.map(row => row.id));
         const openings = live.inputs.filter(row => row.opening && row.sessionId && !known.has(row.sessionId)).map(row => ({
           ...summary(live.events), id: row.sessionId!, title: row.text, conversationId: null, chatIds: []
@@ -3671,6 +3671,77 @@ describe('edit and resubmit', () => {
       q(7, 'q-1c', 'Ask a third time', 't3', { replaces: 'q-1b' }), a(8, 'a-3', 'Answer three', 't3'), end(9, 't3')];
     const { w } = await boot(events, true);
     expect(said(w)).toEqual([expect.stringContaining('Ask a third time'), 'earlier:Earlier versions · 4 messages', expect.stringContaining('Answer three')]);
+  });
+
+  const chat = '6ad337fe-47a4-83ed-a21f-c2e24d5829a4';
+  const Q1 = '6ad3a59b-0001-83eb-8bc4-8c84e68dd911', Q2 = '6ad3a59b-0002-83eb-8bc4-8c84e68dd911';
+  const A1 = '6ad3a59b-00a1-83eb-8bc4-8c84e68dd911', A2 = '6ad3a59b-00a2-83eb-8bc4-8c84e68dd911';
+  const exchange = () => [q(1, Q1, 'First question', 't1'), a(2, A1, 'First answer', 't1'), end(3, 't1'),
+    q(4, Q2, 'Fix the logn bug', 't2'), a(5, A2, 'Which bug?', 't2'), end(6, 't2')];
+  const submit = async (w: Window & typeof globalThis, value?: string) => {
+    if (value !== undefined) (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = value;
+    w.document.getElementById('composer')!.dispatchEvent(new w.Event('submit', { bubbles: true, cancelable: true }));
+    await settle();
+  };
+  const editButton = (w: { document: Document }, text: string) => [...w.document.querySelectorAll('#timeline > .ev-user_message')]
+    .find(row => row.textContent!.includes(text))?.querySelector<HTMLButtonElement>('.question-edit') ?? null;
+
+  it('edits one of your questions from the composer and sends it as ChatGPT\'s edit of that question', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    (w.document.getElementById('chatInput') as HTMLTextAreaElement).value = 'A draft I was writing';
+    editButton(w, 'First question')!.click(); await settle();
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    expect(input.value).toBe('First question');
+    const notice = w.document.getElementById('editDraft')!;
+    expect(notice.hidden).toBe(false);
+    expect(notice.textContent).toContain('Editing your message · replaces 3 later messages');
+    await submit(w as any, 'First question, edited');
+    expect(live.sent.at(-1)).toMatchObject({ sessionId: summary([]).id, text: 'First question, edited', mode: 'auto', edit: { messageId: Q1 } });
+    expect(notice.hidden).toBe(true);
+    // The draft that was there before the edit comes back.
+    expect(input.value).toBe('A draft I was writing');
+  });
+
+  it('says so when the latest question is edited, and gives the draft back when the edit is cancelled', async () => {
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat } });
+    const input = w.document.getElementById('chatInput') as HTMLTextAreaElement;
+    input.value = 'Unfinished';
+    editButton(w, 'Fix the logn bug')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.textContent).toContain('Editing your message · replaces 1 later message');
+    w.document.querySelector<HTMLButtonElement>('#editDraft .edit-draft-cancel')!.click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    expect(input.value).toBe('Unfinished');
+    await submit(w as any, 'Just a follow-up');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
+  });
+
+  it('offers no Edit in a worker chat', async () => {
+    const { w } = await boot(exchange(), true, [], [], { summary: { conversationId: chat, origin: { kind: 'worker', fromSessionId: null, agentId: 'worker-1', task: 'x' } } });
+    expect(editButton(w, 'First question')).toBeNull();
+  });
+
+  it('offers no Edit for a question without a native id', async () => {
+    const { w } = await boot([q(1, 'user:local:1', 'Local question', 't1'), a(2, A1, 'Answer', 't1'), end(3, 't1')], true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Local question')).toBeNull();
+  });
+
+  it('offers Edit on the newest version only, never inside the earlier versions it folded', async () => {
+    const { w } = await boot([...exchange(), q(7, '6ad3a59b-0003-83eb-8bc4-8c84e68dd911', 'Fix the login bug', 't3', { replaces: Q2 }), a(8, '6ad3a59b-00a3-83eb-8bc4-8c84e68dd911', 'Fixed.', 't3'), end(9, 't3')],
+      true, [], [], { summary: { conversationId: chat } });
+    expect(editButton(w, 'Fix the login bug')).not.toBeNull();
+    const fold = w.document.querySelector<HTMLDetailsElement>('#timeline > .earlier-version')!;
+    fold.open = true; fold.dispatchEvent(new w.Event('toggle')); await settle();
+    expect(fold.querySelector('.question-edit')).toBeNull();
+  });
+
+  it('leaves edit mode when another chat is opened', async () => {
+    const other = { ...summary([]), id: '2026-10-17-other001', title: 'Other chat', conversationId: '6ad388c2-faf8-83ed-bb4f-9efff4ad92de' };
+    const { w, live } = await boot(exchange(), true, [], [], { summary: { conversationId: chat }, sessions: [{ ...summary([]), conversationId: chat }, other] });
+    editButton(w, 'First question')!.click(); await settle();
+    (w.document.querySelector(`#sessionList [data-id="${other.id}"]`) as HTMLElement).click(); await settle();
+    expect(w.document.getElementById('editDraft')!.hidden).toBe(true);
+    await submit(w as any, 'Hello there');
+    expect(live.sent.at(-1)).not.toHaveProperty('edit');
   });
 
   it('shows an edit whose replaced version is not in the loaded history as edited, without a fold', async () => {

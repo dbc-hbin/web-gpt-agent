@@ -2987,6 +2987,12 @@ nav button:hover, nav button.is-sel { background: var(--hover); color: var(--ink
    it reads as a side branch: indented on a guide line, like routine activity, and a little quieter. */
 .earlier-version > .tool-group-body { padding: 4px 0 4px 18px; margin-left: 7px; border-left: 1px solid var(--line); }
 .earlier-version > .tool-group-body > .ev { opacity: .82; }
+/* Edit under one of your questions, right-aligned with its bubble and quiet until the row is hovered. */
+.question-actions { display: flex; justify-content: flex-end; gap: 2px; margin: 4px -6px 0 0; opacity: 0; transition: opacity 120ms ease; }
+.question-actions .dock-action { display: inline-flex; align-items: center; justify-content: center; width: 24px; height: 24px; padding: 4px; border: 0; border-radius: 7px; background: transparent; color: var(--soft); cursor: pointer; }
+.question-actions .dock-action:hover { color: var(--ink); background: var(--hover); }
+.ev-user_message:hover .question-actions, .question-actions:focus-within { opacity: 1; }
+@media (hover: none) { .question-actions { opacity: 1; } }
 .said.is-user .message-edited { display: block; margin-top: 6px; color: var(--faint); font-size: calc(11.5px * var(--text-scale, 1)); line-height: 1.3; }
 .tool-group-body .ev { margin: 0; }
 .tool-group-body .tool > summary, .tool-group-body .agent-communication > summary { min-height: 24px; }
@@ -3535,7 +3541,8 @@ select option::checkmark { order: 1; margin-inline-start: auto; color: var(--ink
 
 .composer-dock { --edge: var(--composer-edge); width: min(836px, calc(100% - 72px)); margin: 10px auto -15px; border: 1px solid var(--edge); border-bottom: 0; border-radius: 16px 16px 0 0; background: var(--card); overflow: hidden; }
 .composer-dock[hidden], .app[data-screen='settings'] .composer-dock, .composer-dock:not(:has(> :not([hidden]))) { display: none; }
-.composer-dock .queued-input, #activeGoalRow, .recovery-notice { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 7px 12px; margin: 0; border: 0; border-bottom: 1px solid var(--edge); font-size: calc(13px * var(--text-scale, 1)); color: var(--soft); }
+.edit-draft[hidden] { display: none; }
+.composer-dock .queued-input, #activeGoalRow, .recovery-notice, .edit-draft { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 7px 12px; margin: 0; border: 0; border-bottom: 1px solid var(--edge); font-size: calc(13px * var(--text-scale, 1)); color: var(--soft); }
 .recovery-countdown { flex-shrink: 0; font-variant-numeric: tabular-nums; color: var(--ink); white-space: nowrap; }
 .composer-dock > :nth-last-child(1 of :not([hidden])) { border-bottom: 0; }
 .composer-dock > :nth-last-child(1 of :not([hidden])) > .queued-input:last-child { border-bottom: 0; }

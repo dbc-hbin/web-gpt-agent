@@ -1486,5 +1486,11 @@
   "Cleaned up": "Limpiado",
   "Edited version": "Versión editada",
   "Earlier version · {0} messages": "Versión anterior · {0} mensajes",
-  "Earlier versions · {0} messages": "Versiones anteriores · {0} mensajes"
+  "Earlier versions · {0} messages": "Versiones anteriores · {0} mensajes",
+  "Edit message": "Editar mensaje",
+  "Cancel edit": "Cancelar edición",
+  "Editing your message": "Editando tu mensaje",
+  "An edit changes only the text. Send files in a new message.": "Una edición cambia solo el texto. Envía los archivos en un mensaje nuevo.",
+  "An edit is sent as one message, not as a plan.": "Una edición se envía como un solo mensaje, no como un plan.",
+  "Editing your message · replaces {0} later messages": "Editando tu mensaje · reemplaza {0} mensajes posteriores"
 }
