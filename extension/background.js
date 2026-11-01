@@ -2080,7 +2080,9 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     offerDesktopInput(tab.id, { type: 'clf-desktop-input', id: input.id, conversationId: target,
       ...(input.recovery ? { recovery: input.recovery } : {}),
       ...(input.silenceTurnId ? { silenceTurnId: input.silenceTurnId } : {}),
-      ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}) });
+      ...(input.directTurn ? { directTurn: input.directTurn } : {}), ...(input.lifetime ? { lifetime: input.lifetime } : {}),
+      // Edit & resubmit: the question in this chat that ChatGPT's own edit replaces.
+      ...(target && input.edit && /^[0-9a-f-]{36}$/i.test(input.edit.messageId) ? { edit: { messageId: input.edit.messageId } } : {}) });
   }
 }
 
