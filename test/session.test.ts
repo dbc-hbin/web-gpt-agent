@@ -148,6 +148,10 @@ describe('session store', () => {
     expect(await readToolEditReview(sessionId!, first!.callId, 0)).toMatchObject({ baseText: 'one\n', currentText: 'two\n' });
     expect(await readToolEditReview(sessionId!, second!.callId, 0)).toMatchObject({ baseText: 'two\n', currentText: 'three\n' });
     expect(await readToolEditReview(sessionId!, first!.callId, 1)).toBeNull();
+    // A damaged record reads as missing and says so once in the log, like the turn's file view.
+    await fs.writeFile(path.join(sessionsRoot(), sessionId!, 'assets', first!.changes![0]!.reviewAssetId!), '{torn');
+    expect(await readToolEditReview(sessionId!, first!.callId, 0)).toBeNull();
+    expect(getLog().some(entry => entry.message.includes(`recorded edit ${first!.changes![0]!.reviewAssetId!.slice(0, 12)} is damaged`))).toBe(true);
     const failed = await recordToolCall({ tool: 'apply_patch', args: { patch: 'failed' },
       content: [{ type: 'text', text: 'failed' }], outcome: 'tool_execution_error', durationMs: 1, startedAt: Date.now() + 2,
       conversationId, sessionId, evidence: changed });

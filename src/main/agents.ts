@@ -1253,15 +1253,6 @@ export function retiredWorkerForConversation(conversationId: string | null | und
   return worker ? { ...worker } : null;
 }
 
-export function hasRetiredWorkerLeases(): boolean {
-  pruneRetiredWorkers();
-  return retiredWorkers.size > 0;
-}
-
-export function forgetRetiredWorker(conversationId: string): void {
-  if (retiredWorkers.delete(conversationId)) retiredPersist?.();
-}
-
 // -------------------------------------------------------------------- spawn
 
 export interface SpawnInput {
@@ -2725,20 +2716,6 @@ function sleepAgent(agent: Agent, reason: string): FinishResult | null {
   logInfo(`multi-agent: ${agent.info.id} ${terminal ? 'finished for good' : 'is sleeping'} — ${reason}`);
   changed();
   return { info: { ...agent.info }, report: { ...report }, repeat: false };
-}
-
-/**
- * Sleeps a worker the browser proved has stopped, addressed by its own chat.
- *
- * The counterpart of {@link finishWorkerConversation} for the paths that have an observation
- * but no result text of the worker's own.
- */
-export function sleepWorkerConversation(conversationId: string, reason: string): FinishResult | null {
-  const run = runForConversation(conversationId);
-  if (!run || !conversationId) return null;
-  const agent = agentForConversationId(conversationId);
-  if (!agent || agent.info.role !== 'worker') return null;
-  return sleepAgent(agent, reason);
 }
 
 /** Sleeps a worker by slot id. Used by sweeps that already know which row they proved quiet. */

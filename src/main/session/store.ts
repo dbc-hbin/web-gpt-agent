@@ -2084,13 +2084,14 @@ export async function readToolEditReview(sessionId: string, callId: string, chan
   const change = event.call.changes?.[changeIndex];
   if (!change?.reviewAssetId) return null;
   const data = await readAsset(sessionId, change.reviewAssetId, 512 * 1024);
-  if (!data) return null;
+  if (!data) { noteUnreadableEdit(change.reviewAssetId, 'is missing or too large'); return null; }
   try {
     const parsed = JSON.parse(data.toString('utf8')) as { before?: unknown; after?: unknown };
-    if (typeof parsed.before !== 'string' || typeof parsed.after !== 'string') return null;
-    return { callId, changeIndex, path: change.path, added: change.added, removed: change.removed,
-      baseText: parsed.before, currentText: parsed.after };
-  } catch { return null; }
+    if (typeof parsed.before === 'string' && typeof parsed.after === 'string') return { callId, changeIndex, path: change.path,
+      added: change.added, removed: change.removed, baseText: parsed.before, currentText: parsed.after };
+  } catch { /* said below */ }
+  noteUnreadableEdit(change.reviewAssetId, 'is damaged');
+  return null;
 }
 
 /**

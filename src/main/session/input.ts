@@ -11,7 +11,7 @@ import { randomUUID } from 'node:crypto';
 import { userTitle } from './title.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from '../durable.js';
 import { getSession, findSessionByConversation, createSession, deleteSession, rebindSession, conversationWasSuperseded, readRecentEvents, listUsageSessions, turnHasMcpCall, turnHasRecoveryEvidence, sessionDirectoryMissing, readCompletedFinal, readLatestUserMessage, readEvents } from './store.js';
-import { noteEditReplacement } from './edits.js';
+import { noteEditReplacement, resetEditsForTests } from './edits.js';
 import type { SessionEvent } from '../../shared/session.js';
 import { assignSessionProject, projectWorkspace, getSessionProject } from '../projects.js';
 import { isChatBlocked } from './blocked-chats.js';
@@ -1865,7 +1865,7 @@ export function offerToolInput(sessionId: string | null | undefined, conversatio
   });
 }
 
-export function resetInputForTests(): void { declinedRotations.clear(); entries = null; chain = Promise.resolve(); initialRestored = false; restorePromise = null; initialLoadPromise = null; offered.clear(); decisionWaiters.clear(); }
+export function resetInputForTests(): void { resetEditsForTests(); declinedRotations.clear(); entries = null; chain = Promise.resolve(); initialRestored = false; restorePromise = null; initialLoadPromise = null; offered.clear(); decisionWaiters.clear(); }
 
 export async function pausedBrowserHelpers(): Promise<Array<{ id: string; sourceSessionId: string }>> {
   return (await listInputs()).filter(row => row.purpose === 'decision' && row.state === 'cancelled' && !row.conversationId && row.decisionSourceSessionId)
