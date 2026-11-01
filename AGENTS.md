@@ -2354,8 +2354,18 @@ source/session/stop/block/continuation and listening checks apply again at repai
 A queued input the app itself does not offer to pages (`input.ts::queuedInputOfferBlocker`
 names the first gate, in `pendingBrowserInputs` order) spends no pickup reload: the bridge logs
 `next automation/input step in <chat> is not offered to the page — <gate>; no reload is spent on it`
-once per chat/input/gate/minute (upstream #1960). Upstream's conversion of an untaken automatic
-Continue into an ordinary message is not ported. A retried pickup that reaches its twelve-hour
+once per chat/input/gate/minute (upstream #1960). An automatic Continue (`recovery`) still queued
+10 minutes after its own boundary (`RECOVERY_ORDINARY_AFTER_MS`, from `silenceBoundary.acceptedAt`,
+not a pickup it shares) with a pickup reload spent or an offer gate becomes an ordinary message once
+(`input.ts::continueAsOrdinaryMessage`: `recovery` and `silenceBoundary` removed, mode `auto`,
+`continuedFrom: 'recovery'`, `continuesQuestionId` keeps its question), only while the chat's latest
+recorded question is still the one it continues, no turn is open, no tool call runs, the chat is not
+blocked and its tab was not manually closed; a row with `sendAuthorizedAt` is never converted. It is
+logged `input <id>: no page took the automatic Continue (<why>); sending it as an ordinary message …`;
+a refusal is logged once per chat, input and reason. Until Send, claim, Send authorization and the
+expiry sweep withdraw the converted row as "Automatic Continue cancelled: …" once another user
+message or the complete answer arrives, and authored input replaces it before delivery like any
+automatic Continue (§11 priority). A retried pickup that reaches its twelve-hour
 lifetime logs one warning and writes one timeline progress row saying recovery ended and the
 step stays saved. Compaction `writing`/`opening` tickets past their quick pickups keep one pickup
 every 15 minutes within the ticket's own lifetime (the pickup is idempotent: stable marker or the

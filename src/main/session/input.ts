@@ -57,6 +57,10 @@ const entrySchema = inputArgs.extend({
   toolImages: inputArgs.shape.images,
   /** One after-turn pickup earned by confirmed silence or settled Thinking failed. */
   silenceBoundary: z.object({ turnId: z.string().min(1).max(256), conversationId: z.string().min(1).max(256), workSeq: z.number().int().nonnegative(), acceptedAt: z.number().nonnegative().optional(), listenUntil: z.number().nonnegative().optional(), nativeBusy: z.boolean().optional() }).optional(),
+  /** An automatic Continue the app sent on as an ordinary message (`continueAsOrdinaryMessage`). */
+  continuedFrom: z.literal('recovery').optional(),
+  /** The question that Continue continues, still checked until it is sent (upstream #1960). */
+  continuesQuestionId: z.string().max(200).optional(),
   /** Shared unfinished-response fallback belongs to this question in every mode. */
   recovery: z.object({ questionId: z.string(), episode: z.string().max(200).optional(), pro: z.boolean(), busyUntil: z.number(), phase: z.enum(['ready', 'stopping', 'reloading', 'resumed']), reloadOwner: z.string().optional() }).optional(),
   /** Exact tool-free turn this explicit browser correction may interrupt. */
@@ -465,6 +469,10 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
       const reason = await recoveryInvalidReason(row);
       if (reason) return { ...row, state: 'cancelled', error: `Automatic Continue cancelled: ${reason}.` };
     }
+    if (row.continuesQuestionId && !terminal(row) && row.sendAuthorizedAt === undefined) {
+      const reason = await continuedInvalidReason(row);
+      if (reason) return { ...row, state: 'cancelled', error: `Automatic Continue cancelled: ${reason}.` };
+    }
     if (row.finishOwner && !terminal(row) && !(await finishInputCurrent(row)))
       return { ...row, state: 'cancelled', error: 'Automatic follow-up cancelled because its active turn or setting changed.' };
     // A generated result is addressed to one exact conversation. When that binding has moved on,
@@ -522,7 +530,7 @@ async function expireQueued(current: InputEntry[]): Promise<InputEntry[]> {
   }
   if (next.some((row, index) => row !== current[index])) {
     await commit(next);
-    for (const [index, row] of next.entries()) if (row.recovery && row.state === 'cancelled' &&
+    for (const [index, row] of next.entries()) if ((row.recovery || row.continuedFrom) && row.state === 'cancelled' &&
       current[index]?.state !== 'cancelled')
       logInfo(`input ${row.id}: ${row.error ?? 'Automatic Continue wait retired after its session left the chat.'} conversation=${row.conversationId} turn=${row.silenceBoundary?.turnId}`);
   }
@@ -748,7 +756,7 @@ export function enqueueInput(raw: InputArgs, finishOwner?: InputEntry['finishOwn
     // User input supersedes only automatic work that has never been handed out.
     // Offered tool receipts retain their identity until a later request proves receipt.
     const prioritized = !finishOwner ? current.map(row => row.sessionId === entry.sessionId &&
-      ((row.finishOwner && row.state === 'queued') || (row.recovery && !terminal(row) && row.sendAuthorizedAt === undefined))
+      ((row.finishOwner && row.state === 'queued') || ((row.recovery || row.continuedFrom) && !terminal(row) && row.sendAuthorizedAt === undefined))
       ? { ...row, state: 'cancelled' as const, error: 'Replaced by your new instruction before delivery.' } : row) : current;
     let next = append(prioritized, entry, input.mode === 'auto' && !finishOwner && policy?.canInject === true);
     // A finish plan belongs to an existing session now. Publish every editable
@@ -976,6 +984,7 @@ export function authorizeBrowserInput(id: string, owner: string, conversationId:
     const row = current.find(row => row.id === id && row.owner === owner && row.state === 'browser' && row.conversationId === conversationId);
     if (!row || row.sendAuthorizedAt !== undefined || companionOf(current, row)) return false;
     if (!(await browserInputAllowed(row)) || await target(row) !== conversationId) return false;
+    if (await continuedInvalidReason(row)) return false;
     if (row.companionInputId) {
       const companion = current.find(other => other.id === row.companionInputId && other.state === 'browser' && other.owner === owner && other.sessionId === row.sessionId);
       const session = row.sessionId ? await getSession(row.sessionId) : null;
@@ -1409,6 +1418,49 @@ async function notOfferedReason(entry: InputEntry): Promise<string> {
   return 'ChatGPT or a running tool call still shows work in its chat';
 }
 
+/**
+ * An automatic Continue no page took becomes an ordinary message, once: the chat must not stop
+ * while it is unfinished (upstream #1960, 2026-10-31). Only while the app's own record shows
+ * nothing newer: the chat's latest question is still the one the Continue answers, no turn is open
+ * and no tool call runs. A row whose Send was already authorized is never converted.
+ */
+export function continueAsOrdinaryMessage(id: string, why: string, minAgeMs = 0): Promise<{ row: InputEntry } | { refused: string }> {
+  return serial(async () => {
+    const current = await load();
+    const row = current.find(entry => entry.id === id);
+    if (!row?.recovery || row.state !== 'queued' || row.sendAuthorizedAt !== undefined || !row.sessionId) return { refused: 'it is no longer a queued automatic Continue' };
+    // Its own age, not a pickup it shares with an older Goal step.
+    const since = row.silenceBoundary?.acceptedAt ?? row.createdAt;
+    if (Date.now() - since < minAgeMs) return { refused: 'it is not old enough yet' };
+    const session = await getSession(row.sessionId);
+    if (!session?.conversationId) return { refused: 'its chat has no ChatGPT conversation' };
+    if (session.activeTurnId) return { refused: 'its turn is still open in the record' };
+    if (isChatBlocked(session.conversationId)) return { refused: 'its chat is blocked' };
+    if (session.browserRecoveryDismissedAt !== undefined) return { refused: "its chat's tab was closed" };
+    if (inFlightToolCalls(session.conversationId) > 0) return { refused: 'a tool call of its chat is still running' };
+    const question = await readLatestUserMessage(row.sessionId);
+    if (question?.messageId !== row.recovery.questionId) return { refused: 'a newer question arrived in its chat' };
+    const { recovery: _recovery, silenceBoundary: _boundary, requestedMode: _requested, offeredAt: _offered, completedTurnId: _completed, ...rest } = row;
+    const ordinary: InputEntry = { ...rest, mode: 'auto', dueAt: Date.now(), continuedFrom: 'recovery', continuesQuestionId: row.recovery.questionId };
+    await commit(current.map(entry => entry === row ? ordinary : entry));
+    logInfo(`input ${id}: no page took the automatic Continue (${why}); sending it as an ordinary message — the chat's latest question is still the one it continues and nothing runs`);
+    return { row: ordinary };
+  });
+}
+
+/**
+ * Why an automatic Continue sent on as an ordinary message no longer applies, or null: a newer
+ * question in its chat, or the complete answer arrived after all. Checked until Send.
+ */
+async function continuedInvalidReason(row: InputEntry): Promise<string | null> {
+  if (!row.continuesQuestionId || !row.sessionId) return null;
+  const question = await readLatestUserMessage(row.sessionId);
+  if (question?.messageId !== row.continuesQuestionId) return 'another user message arrived';
+  const session = await getSession(row.sessionId);
+  if (session?.conversationId && await readCompletedFinal(row.sessionId, session.conversationId)) return 'the complete answer arrived';
+  return null;
+}
+
 export function claimBrowserInput(id: string, owner: string, conversationId: string | null, requiresAuthorization = false): Promise<InputEntry | null> {
   return serial(async () => {
     const current = await load();
@@ -1417,6 +1469,7 @@ export function claimBrowserInput(id: string, owner: string, conversationId: str
     if (entry.recovery && entry.state === 'browser' && entry.owner !== owner) return null;
     if (entry.recovery?.reloadOwner === owner) return null;
     if (companionOf(current, entry)) return null;
+    if (await continuedInvalidReason(entry)) return null;
     const completedTurnId = entry.state === 'browser' ? entry.completedTurnId : queuedFollowup(entry)
       ? await completedStageBoundary(entry, current) : manualInput(entry) ? await eligibleStageEnd(entry) : undefined;
     if (queuedFollowup(entry) && !completedTurnId) return null;
