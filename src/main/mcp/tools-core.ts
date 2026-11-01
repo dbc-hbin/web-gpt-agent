@@ -137,6 +137,7 @@ import {
   recordAgentMessage
 } from '../session/recorder.js';
 import { findSessionByConversation } from '../session/store.js';
+import { checkpointBeforePatch } from '../checkpoints/index.js';
 import { requestCorrelation } from '../session/correlation.js';
 import {
   adoptAgent,
@@ -1758,6 +1759,7 @@ async function runParsedPatch(
   } catch (error) {
     return { result: fail(friendlyError(error)), content: null, exitCode: null };
   }
+  await checkpointBeforePatch([...resolution.virtualPaths.keys()]);
   const execution = await executeApplyPatch({
     patch: effectiveArgs.patch,
     cwd: effectiveBase.real,

@@ -223,7 +223,8 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | Projects/cwd | `src/main/projects.ts`, `src/shared/projects.ts`: local folder catalog and session binding; `mcp/tools-core.ts` resolves ordinary tool paths independently from conversations. |
 | Project Files UI | `src/main/project-files.ts`, `project-file-watcher.ts`, `src/shared/project-files.ts`, `src/renderer/{file-panel,file-code-editor,file-pdf-viewer,work-panel-resize}.ts`: bounded project views, revision-checked saves and renderer-owned drafts. |
-| Project Git Review | `src/main/project-git.ts`, `src/shared/project-git.ts`; renderer Review is `file-panel.ts` with `reviewOnly`: read-only Git status, diffs, branch comparison and recorded `apply_patch` edit reviews. |
+| Project Git Review | `src/main/project-git.ts`, `src/shared/project-git.ts`; renderer Review is `file-panel.ts` with `reviewOnly`: read-only Git status, diffs, branch and checkpoint comparison and recorded `apply_patch` edit reviews. |
+| Code checkpoints | `src/main/checkpoints/{index,store}.ts`: per-turn Git tree snapshots taken before a turn's first patch, their ledger, and confirmed per-file restore. `project-git.ts` projects the comparison. |
 | Durable history | `src/main/session/{store,recorder,correlation,retention,summarize,progress}.ts`, `src/shared/{session,chronology}.ts`: canonical messages, tool truth, chronology and indexes. |
 | Input | `src/main/session/{input,start-input,input-history,input-attachments,input-images,prompt}.ts`, `src/shared/{input,user-prompt}.ts`: outbox, native files, prompt frame and receipts. |
 | Finish/planning | `src/main/session/finish.ts`, `task-request.ts`, `goal.ts`, `src/shared/{finish,task-progress}.ts`: held turn, decision/plan invocation and cancellation. |
@@ -253,6 +254,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Agent progress plan | `request-plans.ts` → `store.ts::updateSessionPlan` / `sessions/<id>/plan.json` | Request-scoped storage before proof; exact session and invocation ordering on attachment; atomically replace the whole plan. |
 | Input and checkpoints | `input.ts` / `state/session-input.json` | Serialized acceptance, frozen payload, exclusive claim and receipt; stages belong here. |
 | Native upload originals | `input-attachments.ts` / `input-attachments/` | Immutable bytes, opaque ids; outbox owns membership and retention. |
+| Code checkpoints | `checkpoints/store.ts` / `state/code-checkpoints.json`; tree objects in the project's own Git object store | Entry written only after `write-tree` returned its tree. Bounded per project (20); a restore's "Before restore" entry never evicts the checkpoint being restored. An evicted or pruned tree reads as unavailable, never as an empty comparison. |
 | Project catalog | `projects.ts` / `state/projects.json` | Serialized catalog mutation; session metadata owns association. |
 | Browser commands/results | `bridge.ts` / `state/bridge-commands.json`; extension ACK outbox | Intent and exact lease before text; receipt durable before ACK custody is retired. |
 | Direct browser tool calls | `browser-control.ts` process epoch/pending claims; extension `storage.session.cosBrowserControl` | One claim per command; browser incarnation plus local-session tab lease. MV3 retains custody/receipt, never replays input. App restart invalidates outstanding claims. |
@@ -857,6 +859,24 @@ A successful exact patch also hands each changed file's exact before/after text 
 through the call context; the recorder stores a bounded immutable review asset per change
 (`FileChange.reviewAssetId`) for the Review panel's recorded-edit view (§18). Failed, inexact or
 oversized edits record no asset.
+
+**Code checkpoints.** With `projects.codeCheckpoints` On (default Off; Settings → Workspace,
+Folders: "Save a checkpoint before each turn's first edit"), after a patch has verified and before
+it executes, the first patch of a turn (standalone or intercepted from `exec_command`) in a
+session's own Local Project Git repository takes one checkpoint (`checkpointBeforePatch` in
+`runParsedPatch`): a temporary index outside the repository, seeded as a copy of the repository's
+own index (`rev-parse --git-path index`) so its stat data lets `add -A` hash only what changed,
+then `add -A` of the project folder and `write-tree`. With no index to copy, or when the seeded
+index cannot be written as a tree, it starts again from `read-tree` of HEAD. It writes Git objects
+only: no ref, branch, HEAD, user index or working file changes, and every checkpoint Git command
+passes `--no-replace-objects`. The key is the exact proven session plus
+`responseTurnId(activeTurnId)`; with no active turn it is that request id. An unproven session, a
+session without a project, a non-Git project or a patch whose files lie outside the project takes
+none. Concurrent patches of one turn share one capture. Capture is bounded (10 s); a failure or
+timeout is logged and the turn takes no checkpoint, not even from a later patch, and the patch
+result, permissions and rollback stay exactly as without checkpoints. Shell edits are not
+checkpointed by themselves. The setting is read in main at capture time; Off takes none and runs
+no Git command for it. Listing, comparing and `restoreCheckpoint` do not read the setting.
 
 ### Terminal execution and custody
 
@@ -3065,12 +3085,24 @@ resolved. Review also projects ancestor-folder markers in the Files tree and bou
 instance in the same right work slot as Files, Sub-agents and Work, with its own header toggle
 (`reviewPanelToggle`); opening one pane hides the others. The Files toolbar's Changes button opens
 Review. Review adds no second file watcher (it follows `projectGit:changed`) and exposes no
-file-write actions. It names the checked-out branch and offers a searchable, read-only comparison
+Files write actions. It names the checked-out branch and offers a searchable, read-only comparison
 against locally known branch refs. Selecting a ref never switches branches or fetches remote
 data. The comparison shows committed changes from the selected ref's merge base to current HEAD,
 scoped to the Local Project; Working tree separately includes uncommitted and untracked changes.
 Its list, line counts and file preview share one comparison identity, and a changed ref/HEAD
-cannot publish an old diff as current. A non-repository, binary file, oversized diff or truncated
+cannot publish an old diff as current. The same picker lists the project's code checkpoints
+(§10), newest first, as `checkpoint:<id>` choices. A checkpoint comparison reads the checkpoint
+tree into a temporary index and reports working-tree changes against it, untracked files included,
+without writing objects. Restore (one file from its diff, or all listed files, via
+`checkpoints:restore`) sends the checkpoint id, the paths and that comparison revision, which also
+covers each listed file's identity (inode, size, mtime). Main recomputes the comparison and refuses
+a changed revision, asks for confirmation in its own native dialog (default Keep), checks the
+revision again after the dialog, then takes a "Before restore" checkpoint of the current state, so
+a restore can itself be undone. Each file is rewritten (through `cat-file --filters`, temp file and
+rename) or removed only if its content still hashes to what that new checkpoint captured; a file
+edited in between is skipped and reported. Symlinks, submodules and paths outside the project are
+never written; HEAD, branches and the user's index are untouched. Checkpoint Restore is the only
+file write Review requests. A non-repository, binary file, oversized diff or truncated
 change set is an explicit state rather than a reason to invent content or mutate the worktree.
 
 An exact successful `apply_patch` may also retain a bounded immutable before/after review asset
@@ -3270,7 +3302,7 @@ the whole run replaying one long workflow; avoid optimizing speculative edge cas
 | Unexpected tab/reload/model/refresh | operation owner → browser election → native observation | `bridge*`, `browser*`, `extension`, `content-script`, `model-*`, `plugin-refresh*` |
 | Lost compaction or Goal debt | continuation/goal → store → bridge | `continuation`, `resume`, `goal*`, `session-finish` |
 | Transcript order, UI clobber, usage | store/chronology → IPC → renderer | `session`, `chronology`, `renderer-*`, `timeline-scroll`, `session-usage`, `usage-observer` |
-| Files/patch/output/code-mode | concrete tool owner → kernel serialization | `codex-*`, `exec-*`, `code-mode-*`, `mcp-tool-declarations` |
+| Files/patch/output/code-mode | concrete tool owner → kernel serialization | `codex-*`, `exec-*`, `code-mode-*`, `mcp-tool-declarations`, `code-checkpoints` |
 | Plugins/auth/native Desktop | manager/exposure/OAuth or CUA Desktop registrar | `plugins-*`, `cua-*`, `mcp-desktop-*`, `tools-browser` |
 | Startup/connection/shipping | lifecycle/config/connection or packaging script | `config`, `window-*`, `shutdown`, `tunnel*`, `packaging`, `update`, `third-party-notices` |
 

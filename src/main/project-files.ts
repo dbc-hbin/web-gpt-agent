@@ -33,6 +33,24 @@ async function recheckTarget(target: Omit<ProjectFileTarget, 'kind'>): Promise<v
   }
 }
 
+/**
+ * Re-resolve the owning directory immediately before a pathname mutation. Pathname syscalls cannot
+ * make this an OS-wide lock, but a stale project/link resolution is caught before the mutation.
+ */
+async function recheckMutationParent(target: Omit<ProjectFileTarget, 'kind'>): Promise<void> {
+  const current = await projectFileTarget(target.projectId, parentPath(target.path), { allowRoot: true });
+  if (current.kind !== 'directory' || !sameRealPath(current.projectReal, target.projectReal) ||
+      !sameRealPath(current.real, path.dirname(target.real))) {
+    throw new Error('The project folder changed location. Reload it before continuing.');
+  }
+}
+
+/** Revalidate an already-resolved Files target at the last practical pathname boundary. */
+export async function revalidateProjectFileTarget(target: ProjectFileTarget): Promise<void> {
+  await recheckTarget(target);
+  await recheckMutationParent(target);
+}
+
 /** Exact bytes and identity from one bounded open file, including BOM and final line endings. */
 async function textSnapshot(target: Omit<ProjectFileTarget, 'kind'>) {
   const before = await fs.lstat(target.real);
@@ -132,7 +150,7 @@ async function context(projectId: string): Promise<{
  * already prevents escapes from the approved root; this extra walk keeps Files scoped to the
  * explicit LocalProject even when a symlink/junction points to another approved sibling.
  */
-async function assertNoLinkTraversal(projectReal: string, relative: string, allowMissingLeaf: boolean): Promise<void> {
+async function assertNoLinkTraversal(projectReal: string, relative: string, allowMissing: 'none' | 'leaf' | 'suffix'): Promise<void> {
   if (!relative) return;
   let current = projectReal;
   const parts = relative.split('/');
@@ -143,7 +161,8 @@ async function assertNoLinkTraversal(projectReal: string, relative: string, allo
       if (stat.isSymbolicLink()) throw new Error('Files does not follow symbolic links or junctions');
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (allowMissingLeaf && index === parts.length - 1 && code === 'ENOENT') return;
+      // Below a missing segment nothing exists, so no link can be followed either.
+      if (code === 'ENOENT' && (allowMissing === 'suffix' || (allowMissing === 'leaf' && index === parts.length - 1))) return;
       throw error;
     }
   }
@@ -152,7 +171,7 @@ async function assertNoLinkTraversal(projectReal: string, relative: string, allo
 async function resolveTarget(
   projectId: string,
   relativeInput: string,
-  options: { allowMissing?: boolean; allowRoot?: boolean } = {}
+  options: { allowMissing?: boolean; allowMissingParents?: boolean; allowRoot?: boolean } = {}
 ): Promise<Omit<ProjectFileTarget, 'kind'>> {
   const relative = normaliseRelative(relativeInput);
   if (!relative && options.allowRoot === false) throw new Error('The project root cannot be changed');
@@ -167,7 +186,8 @@ async function resolveTarget(
       real: project.real
     };
   }
-  await assertNoLinkTraversal(project.real, relative, options.allowMissing === true);
+  await assertNoLinkTraversal(project.real, relative,
+    options.allowMissing !== true ? 'none' : options.allowMissingParents === true ? 'suffix' : 'leaf');
   const resolved = await resolvePath(getConfig().roots, relative, {
     base: project.virtual,
     allowMissing: options.allowMissing === true,
@@ -200,6 +220,16 @@ export async function projectFileTarget(
   const kind = await kindOf(target.real);
   if (options.fileOnly && kind !== 'file') throw new Error('Choose a regular file');
   return { ...target, kind };
+}
+
+/** Like projectFileTarget, but a missing leaf (or missing parents) is allowed and reads as null. */
+export async function projectRestoreTarget(projectId: string, relativePath: string): Promise<Omit<ProjectFileTarget, 'kind'> & { kind: ProjectFileKind | null }> {
+  const target = await resolveTarget(projectId, relativePath, { allowRoot: false, allowMissing: true, allowMissingParents: true });
+  try { return { ...target, kind: await kindOf(target.real) }; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return { ...target, kind: null };
+    throw error;
+  }
 }
 
 export async function listProjectDirectory(projectId: string, relativeDirectory = ''): Promise<ProjectDirectoryListing> {

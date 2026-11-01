@@ -66,6 +66,7 @@ import { addProject, getSessionProject, listProjects, projectWorkspace, removePr
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, saveProjectTextFile } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
+import { restoreCheckpoint } from './checkpoints/index.js';
 import { hasSecret, isEncryptionAvailable, secureStorageStatus, setSecret } from './secrets.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { addSetupProfile, removeSetupProfile, switchSetupProfile } from './setup-profiles.js';
@@ -189,6 +190,7 @@ const settingsPatch = z.object({
     recoverAgentTabs: z.boolean()
   }),
   mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS) }).strict().optional(),
+  projects: z.object({ codeCheckpoints: z.boolean() }).strict().optional(),
   goal: z.object({
     impulseMinutes: z.number().int().min(0).max(60).optional(),
     includeToolCalls: z.boolean().optional(),
@@ -244,7 +246,7 @@ type SettingsSnapshot = z.infer<typeof settingsPatch>;
  * unchanged between `base` and `wanted` was not edited by this renderer save and therefore keeps
  * the current main-process value. A field that differs was deliberately edited here and wins.
  */
-function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): SettingsSnapshot {
+function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): Omit<SettingsSnapshot, 'projects'> & { projects: Config['projects'] } {
   const tunnelEdited = (['tunnelId', 'desktopTunnelId', 'pluginsTunnelId'] as const)
     .some(key => (base.tunnel[key] ?? '') !== (wanted.tunnel[key] ?? ''));
   if (tunnelEdited && ((base.tunnel.profileId ?? 'default') !== (current.tunnel.profileId ?? 'default') ||
@@ -258,8 +260,13 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       pick(current.capabilities[capability], base.capabilities[capability], wanted.capabilities[capability])
     ])
   ) as Config['capabilities'];
+  // A form that omits the section leaves the live value alone.
+  const projects: Config['projects'] = wanted.projects
+    ? { codeCheckpoints: pick(current.projects.codeCheckpoints, base.projects?.codeCheckpoints ?? false, wanted.projects.codeCheckpoints) }
+    : current.projects;
   return {
     mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions) } : current.mcp,
+    projects,
     capabilities,
     fileAccessMode: pick(current.fileAccessMode, base.fileAccessMode, wanted.fileAccessMode),
     readOnly: pick(current.readOnly, base.readOnly, wanted.readOnly),
@@ -592,6 +599,9 @@ export function registerIpc(
     // the card still saying "not published" and nothing explaining why.
     await applySettings();
     if (before.ui.autoRefreshPlugins !== next.ui.autoRefreshPlugins) wakeBrowserWork();
+    if (before.projects.codeCheckpoints !== next.projects.codeCheckpoints) {
+      logInfo('code checkpoints: ' + (next.projects.codeCheckpoints ? 'on' : 'off'));
+    }
     logInfo('settings updated');
     // The config and runtime side effects above still complete so the app does not stay half-on,
     // but the UI must not be told the pause was safely accepted when its retained authority
@@ -747,6 +757,29 @@ export function registerIpc(
     const { projectId, path, baseRef, expectedRevision } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1),
       baseRef: z.string().min(1).max(256).optional(), expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/).optional() }).strict().parse(payload);
     return readProjectGitDiff(projectId, path, baseRef, expectedRevision);
+  });
+  handle('checkpoints:restore', async payload => {
+    const { projectId, checkpointId, paths, expectedRevision } = z.object({ projectId: projectFileId,
+      checkpointId: z.string().regex(/^[0-9a-f]{32}$/), paths: z.array(projectRelativePath.min(1)).min(1).max(256).nullable(),
+      expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/) }).strict().parse(payload);
+    // Approval comes from this trusted dialog, never from a renderer boolean; the default keeps the files.
+    return restoreCheckpoint(projectId, checkpointId, paths, expectedRevision, async selected => {
+      const shown = selected.slice(0, 25).map(name => `  - ${name.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 180)}`);
+      const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        title: 'Restore files from this checkpoint?',
+        message: 'Restore files from this checkpoint?',
+        detail: [
+          'Files return to their checkpoint version; files added since are removed. Current files are saved first, so you can undo this in Review.',
+          '', ...shown, ...(selected.length > shown.length ? ['More files are not shown.'] : [])
+        ].join('\n'),
+        buttons: ['Keep current files', 'Restore files'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true
+      });
+      return response === 1;
+    });
   });
   handle('sessions:toolEditReview', async payload => {
     const { sessionId, callId, changeIndex } = z.object({

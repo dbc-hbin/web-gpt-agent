@@ -322,6 +322,16 @@ export interface McpSettings {
 
 export type FileAccessMode = 'approved-roots' | 'all-files';
 
+/** How chats treat their Local Project's files. */
+export interface ProjectsSettings {
+  /**
+   * Take a Git tree checkpoint before each turn's first patch (`src/main/checkpoints`). Off by
+   * default. Turning it off stops new checkpoints only: existing ones stay listed in Review and
+   * Restore keeps working.
+   */
+  codeCheckpoints: boolean;
+}
+
 export interface Config {
   /** Inactive setups only. Keys remain in encrypted secret slots addressed by profile ID. */
   setupProfiles?: Array<{ id: string; name: string; tunnelId: string; desktopTunnelId: string; pluginsTunnelId: string }>;
@@ -337,6 +347,7 @@ export interface Config {
   multiAgent: MultiAgentSettings;
   goal: GoalSettings;
   mcp: McpSettings;
+  projects: ProjectsSettings;
 }
 
 export type ConnectionState =

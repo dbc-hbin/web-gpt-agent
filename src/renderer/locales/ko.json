@@ -1606,5 +1606,22 @@
   "Common base": "공통 기준",
   "Theirs (incoming)": "상대 쪽 (들어오는 쪽)",
   "Not in this version": "이 버전에는 없음",
-  "Start or cancel the prepared plan first, then ask again.": "먼저 준비된 계획을 시작하거나 취소한 다음 다시 요청하세요."
+  "Start or cancel the prepared plan first, then ask again.": "먼저 준비된 계획을 시작하거나 취소한 다음 다시 요청하세요.",
+  "Checkpoints": "체크포인트",
+  "Before turn · {0}": "턴 이전 · {0}",
+  "Before restore · {0}": "복원 이전 · {0}",
+  "No changes since this checkpoint": "이 체크포인트 이후 변경 사항 없음",
+  "Changes since this checkpoint, local work included": "이 체크포인트 이후 변경 사항(로컬 작업 포함)",
+  "Restore all": "모두 복원",
+  "Restore file": "파일 복원",
+  "Restored {0} of {1} files": "파일 {1}개 중 {0}개를 복원했습니다",
+  "Skipped {0} paths because files and folders share a name": "??? ??? ??? ?? ?? {0}?? ???????",
+  "This checkpoint is no longer available": "이 체크포인트는 더 이상 사용할 수 없습니다",
+  "The comparison changed. Refresh Review and try again.": "비교 내용이 바뀌었습니다. 리뷰를 새로고침한 뒤 다시 시도하세요.",
+  "These files no longer differ from the checkpoint": "이 파일들은 더 이상 체크포인트와 다르지 않습니다",
+  "Too many changes to restore at once. Restore files one by one.": "한 번에 복원하기에는 변경 사항이 너무 많습니다. 파일을 하나씩 복원하세요.",
+  "Save a checkpoint before each turn's first edit": "각 턴의 첫 편집 전에 체크포인트 저장",
+  "This checkpoint is no longer available. Git has cleaned it up.": "이 체크포인트는 더 이상 사용할 수 없습니다. Git이 정리했습니다.",
+  "Checkpoints are temporary: Git may clean up old ones. Off: no new ones are taken.": "체크포인트는 임시입니다. 오래된 것은 Git이 정리할 수 있습니다. 끔: 새 체크포인트를 만들지 않습니다.",
+  "Cleaned up": "정리됨"
 }
