@@ -822,6 +822,21 @@ it('saves a custom deployment id and returns to the known OpenRouter model', asy
   expect(mounted.calls[2].goal).toMatchObject({ provider: { kind: 'openrouter' }, model: 'deepseek/deepseek-v4-flash' });
 });
 
+it('saves and restores the Code checkpoints switch on the Workspace page', async () => {
+  const mounted = await mountChat();
+  const w = mounted.window;
+  const doc = w.document;
+  const toggle = doc.getElementById('codeCheckpoints') as HTMLInputElement;
+  expect(doc.querySelector('[data-panel="home"]')!.contains(toggle)).toBe(true);
+  expect(toggle.checked).toBe(false);
+  toggle.checked = true;
+  toggle.dispatchEvent(new w.Event('change', { bubbles: true }));
+  await vi.waitFor(() => expect(mounted.calls).toHaveLength(1));
+  expect(mounted.calls[0].projects).toEqual({ codeCheckpoints: true });
+  mounted.push({ ...mounted.state, config: { ...mounted.state.config, projects: { codeCheckpoints: false } } });
+  expect(toggle.checked).toBe(false);
+});
+
 it('saves the ChatGPT browser choice from its settings control and restores it on state push', async () => {
   const mounted = await mountChat();
   const w = mounted.window;

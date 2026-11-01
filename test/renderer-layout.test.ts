@@ -74,6 +74,11 @@ it('keeps the context circle in the gear group rather than an auto-placed compos
   expect(document.getElementById('contextMeterInfo')!.parentElement?.id).toBe('contextMeter');
 });
 
+it('defines the back-arrow glyph used by Review navigation', () => {
+  const back = document.getElementById('i-back');
+  expect(back?.querySelector('path')?.getAttribute('d')).toBeTruthy();
+});
+
 it('does not expose a periodic Astra continuation outside session_finish', () => {
   expect(document.getElementById('goalImpulseMinutes')).toBeNull();
   expect(chatSource).not.toContain("number('goalImpulseMinutes'");
@@ -517,10 +522,11 @@ describe('the window as a whole', () => {
   });
 
   it('never scrolls sideways', () => {
-    // Wide authored tables/code may scroll locally; the surrounding app must not.
+    // Wide authored content and the compact Review header may scroll locally; the app must not.
     const horizontal = [...css.matchAll(/([^{}]+)\{[^{}]*overflow-x:\s*(?:auto|scroll)[^{}]*\}/g)];
     expect(horizontal.map(match => match[1]!.trim())).toEqual([
       '.msg.rich .markdown-table',
+      '.review-panel .file-changes-header-content',
       '.file-preview-markdown pre',
       '.file-preview-markdown-table',
       '.file-pdf-viewport',

@@ -170,6 +170,7 @@ function replaceComposerDraft(): void { composerDraftGeneration++; skillPicker?.
 let pendingNewInput: { id: string; generation: number } | null = null;
 let agentPanel: ReturnType<typeof createAgentPanel> | null = null;
 let filePanel: ReturnType<typeof createFilePanel> | null = null;
+let reviewPanel: ReturnType<typeof createFilePanel> | null = null;
 let workPanel: ReturnType<typeof createWorkPanel> | null = null;
 const workPanelVisibility = new Set<(open: boolean) => void>();
 const expandedWorkers = new Set<string>();
@@ -802,6 +803,7 @@ function paintSessions(): void {
     ?.querySelector<HTMLElement>('.project-heading')?.focus({ preventScroll: true });
   agentPanel?.update(selectedId, sessions.filter(entry => entry.origin?.kind === 'worker' && entry.origin.fromSessionId === selectedId && selectedId !== null));
   filePanel?.update(selectedLocalProject());
+  reviewPanel?.update(selectedLocalProject());
   // The work pane's connection section is about the chat this window displays, and only this
   // screen knows which one that is. The pane skips the read when the pair is unchanged.
   workPanel?.sync();
@@ -1681,6 +1683,26 @@ function toolBody(event: Extract<SessionEvent, { kind: 'tool_call' }>, context?:
   head.append(el('b', '', call.summary.title));
   if (call.summary.detail) head.append(el('em', '', call.summary.detail));
   if (summary.metric) head.append(el('span', 'metric', summary.metric));
+  const project = context ? null : selectedLocalProject();
+  const sessionId = context ? null : selectedId;
+  const reviewIndices = call.outcome === 'ok' ? (call.changes ?? []).flatMap((change, index) =>
+    change.reviewAssetId ? [index] : []).slice(0, 8) : [];
+  if (project && sessionId && reviewIndices.length) {
+    const review = el('button', 'tool-open-diff') as HTMLButtonElement;
+    review.type = 'button';
+    review.append(icon('i-git-diff'));
+    ui(review, 'title', () => t('Review this edit'));
+    ui(review, 'aria-label', () => t('Review this edit'));
+    review.addEventListener('click', click => {
+      click.preventDefault();
+      click.stopPropagation();
+      if (selectedId !== sessionId || selectedLocalProject()?.id !== project.id) return;
+      void reviewPanel?.openReview(project.id, sessionId, call.callId, reviewIndices).then(opened => {
+        if (!opened) toast(t('Recorded edit is unavailable.'));
+      });
+    });
+    head.append(review);
+  }
   box.append(head);
 
   // Collapsed calls only need their headline. Large recorded results must not
@@ -4014,6 +4036,10 @@ export function initChat(next: Deps): void {
   fileToggle.id = 'filePanelToggle'; fileToggle.type = 'button'; fileToggle.hidden = true;
   fileToggle.append(icon('i-folder'));
   ui(fileToggle, 'aria-label', () => t('Toggle Files side panel')); fileToggle.setAttribute('aria-expanded', 'false');
+  const reviewToggle = el('button', 'btn file-panel-toggle') as HTMLButtonElement;
+  reviewToggle.id = 'reviewPanelToggle'; reviewToggle.type = 'button'; reviewToggle.hidden = true;
+  reviewToggle.append(icon('i-git-diff'));
+  ui(reviewToggle, 'aria-label', () => t('Toggle Review side panel')); reviewToggle.setAttribute('aria-expanded', 'false');
   const agentToggle = el('button', 'btn btn-icon', '◫') as HTMLButtonElement;
   agentToggle.id = 'agentPanelToggle'; agentToggle.type = 'button'; agentToggle.hidden = true;
   ui(agentToggle, 'aria-label', () => t("Toggle sub-agent side panel")); agentToggle.setAttribute('aria-expanded', 'false');
@@ -4021,11 +4047,11 @@ export function initChat(next: Deps): void {
   workToggle.id = 'workPanelToggle'; workToggle.type = 'button';
   workToggle.append(icon('i-steps'));
   ui(workToggle, 'aria-label', () => t('Toggle work side panel')); workToggle.setAttribute('aria-expanded', 'false');
-  $('headerConnect').after(fileToggle, agentToggle, workToggle);
+  $('headerConnect').after(fileToggle, reviewToggle, agentToggle, workToggle);
   const agentToolGroups = new Map<string, HTMLDetailsElement>();
   agentPanel = createAgentPanel({
     host: document.querySelector<HTMLElement>('[data-panel="chat"]')!, toggle: agentToggle,
-    onShow: () => { filePanel?.hide(); workPanel?.hide(); },
+    onShow: () => { filePanel?.hide(); reviewPanel?.hide(); workPanel?.hide(); },
     load: id => run(api.getSession(id, { limit: 160 })), openMain: selectSession, working: sessionWorking,
     render: (source, id, current) => {
       let boundary = '';
@@ -4200,7 +4226,8 @@ export function initChat(next: Deps): void {
   };
   filePanel = createFilePanel({
     host: document.querySelector<HTMLElement>('[data-panel="chat"]')!, toggle: fileToggle,
-    onShow: () => { agentPanel?.hide(); workPanel?.hide(); },
+    onShow: () => { reviewPanel?.hide(); agentPanel?.hide(); workPanel?.hide(); },
+    onOpenChanges: () => void reviewPanel?.show(),
     captureAttachment: () => {
       const owner = composerDraftOwner();
       return attachment => appendImages(owner, [attachment]);
@@ -4208,14 +4235,32 @@ export function initChat(next: Deps): void {
   });
   workPanel = createWorkPanel({
     host: document.querySelector<HTMLElement>('[data-panel="chat"]')!, toggle: workToggle,
-    onShow: () => { filePanel?.hide(); agentPanel?.hide(); },
+    onShow: () => { filePanel?.hide(); reviewPanel?.hide(); agentPanel?.hide(); },
     onVisibility: open => { for (const listener of workPanelVisibility) listener(open); },
     openChat: selectSession,
     // The pane's connection section is about the chat this window is showing, so it reads the
     // chat screen's own selection rather than the selected work's prime agent.
     currentSession: () => selectedId
   });
+  reviewPanel = createFilePanel({
+    host: document.querySelector<HTMLElement>('[data-panel="chat"]')!, toggle: reviewToggle, reviewOnly: true,
+    onShow: () => { filePanel?.hide(); agentPanel?.hide(); workPanel?.hide(); },
+    // A new message for the person to read and send; the request never sends itself.
+    onAskChat: request => {
+      // Send submits a prepared plan, not what the composer shows, so the request would sit there unsent.
+      if (currentPreparedPlan()) { toast(t("Start or cancel the prepared plan first, then ask again.")); return; }
+      // A narrow window shows the pane instead of the chat; it closes so the composer is in view.
+      if (window.matchMedia?.('(max-width: 850px)').matches) reviewPanel?.hide();
+      const input = $<HTMLTextAreaElement>('chatInput');
+      const rest = input.value.trim();
+      input.value = rest ? `${request}\n\n${rest}` : request;
+      input.setSelectionRange(input.value.length, input.value.length);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      input.focus();
+    }
+  });
   filePanel.update(selectedLocalProject());
+  reviewPanel.update(selectedLocalProject());
   workspaceTerminal = createWorkspaceTerminal();
   workspaceTerminal.update(selectedLocalProject());
   $('attachImages').addEventListener('click', async () => {
