@@ -9,6 +9,7 @@
  */
 
 import { defaultUserShell, isWindowsPowerShell5 } from './shell.js';
+import { MAX_COMPLETED_EXEC_RESULTS } from './unified-exec.js';
 
 const IS_WINDOWS = process.platform === 'win32';
 
@@ -38,9 +39,12 @@ export const WINDOWS_SHELL_GUIDANCE = `Windows safety rules:
 export const BROWSER_LAUNCH_GUIDANCE =
   'Browsers: do not spawn a new browser/profile/debug port per attempt; reuse the open window.';
 
+const TERMINAL_RESULT_GUIDANCE =
+  `You MUST read every returned session_id with write_stdin({session_id, chars:""}) through completion to collect its output and release unread state. Do not abandon finished sessions. Only the latest ${MAX_COMPLETED_EXEC_RESULTS} completed results are retained, including unread results; older output expires.`;
+
 export const EXEC_COMMAND_DESCRIPTION = IS_WINDOWS
-  ? `Runs a command; returns output or a session ID.\n\n${WINDOWS_SHELL_GUIDANCE}\n\n${BROWSER_LAUNCH_GUIDANCE}`
-  : `Runs a command; returns output or a session ID.\n\n${BROWSER_LAUNCH_GUIDANCE}`;
+  ? `Runs a command; returns output or a session ID. ${TERMINAL_RESULT_GUIDANCE}\n\n${WINDOWS_SHELL_GUIDANCE}\n\n${BROWSER_LAUNCH_GUIDANCE}`
+  : `Runs a command; returns output or a session ID. ${TERMINAL_RESULT_GUIDANCE}\n\n${BROWSER_LAUNCH_GUIDANCE}`;
 
 /**
  * Codex's text is 'Shell command to execute.'; two measured additions.
@@ -77,7 +81,7 @@ export const EXEC_COMMAND_LOGIN_DESCRIPTION =
     : 'True runs the shell with -l/-i. Defaults to true.';
 
 export const WRITE_STDIN_DESCRIPTION =
-  'Polls or writes to a session ID. Empty chars reread retained output; never reruns work.';
+  `Polls or writes to a session ID. Empty chars read pending output or reread retained history; never reruns work. ${TERMINAL_RESULT_GUIDANCE}`;
 
 export const WRITE_STDIN_SESSION_ID_DESCRIPTION = 'Session ID, running or completed.';
 

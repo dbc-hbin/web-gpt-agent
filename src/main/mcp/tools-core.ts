@@ -54,15 +54,14 @@ import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.
 import { policyByteBudget, policyTokenBudget, type TruncationPolicy } from '../codex/truncate.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
-  backgroundExecObligations,
   execOwnershipFailure,
   executionPrincipal,
   forgetExecOwner,
-  MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecOwner
 } from '../codex/ownership.js';
 import {
   UnifiedExecError,
+  MAX_COMPLETED_EXEC_RESULTS,
   applyUnifiedExecEnv,
   execCommandResponseText,
   execCommandStructuredOutput,
@@ -764,15 +763,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
             }
 
             const owner = execPrincipal();
-            const unread = backgroundExecObligations(owner).exitedUnread;
-            if (unread.length >= MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION) {
-              const sessionIds = unread.map((session) => session.processId).join(', ');
-              return fail(
-                  `EXEC_RESULTS_UNREAD: ${unread.length} completed background results are still waiting for this session. ` +
-                  `Their output follows in tool responses; read it before retrying. Explicit write_stdin is also available for IDs ${sessionIds}. No child was spawned.`
-              );
-            }
-
             const processId = unifiedExecManager.allocateProcessId();
             // Process ids are deliberately small/reusable, while chat ownership lives in a
             // separate registry. Clear any stale row at the allocation boundary so a recycled
@@ -917,7 +907,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
           const denied = execOwnershipFailure(input.session_id, asking);
           if (denied) {
             const reason = {
-              unavailable: 'EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.',
+              unavailable: `EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Completed output expires after the latest ${MAX_COMPLETED_EXEC_RESULTS} results, including unread results. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.`,
               anonymous: 'EXEC_SESSION_ANONYMOUS: This process was launched without proven chat identity. An identified chat cannot adopt it. Check the original command and its saved output; retrying from this identified chat cannot change its ownership.',
               unidentified: 'EXEC_CALLER_UNIDENTIFIED: The current request has not been proven to own this process, so it cannot access it yet. After exact identity recovers, retry this same session_id once; do not launch a replacement command.',
               'different-owner': 'EXEC_SESSION_OWNER_MISMATCH: This process belongs to a different local session. Only its owning session can poll it or send input; use a process id returned to this session.'

@@ -53,7 +53,6 @@ import {
 import {
   backgroundExecObligations,
   execOwner,
-  MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION,
   noteExecOwner,
   forgetExecOwner,
   resetExecOwnershipForTests,
@@ -2928,11 +2927,12 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(directRead)).toContain('direct-result');
   });
 
-  it('refuses new commands at the unread-result bound until each one is polled', async () => {
+  it('admits new commands with unread completed results and still lets their owner collect them', async () => {
     const conversationId = 'conv-background-admission';
     const sessionIds: number[] = [];
 
-    for (let index = 0; index < MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION; index++) {
+    // Exceed the former four-unread-results admission threshold.
+    for (let index = 0; index < 5; index++) {
       const requestId = `wfr_background_admission_${index}`;
       expect(prove(requestId, conversationId)).toBe('stored');
       const started = await asChat(requestId, 'exec_command', {
@@ -2955,26 +2955,26 @@ describe('exec sessions belong to the chat that opened them', () => {
       { timeout: 8_000, interval: 25 }
     );
 
-    // The bound is a refusal at the next launch, never automatic output on some unrelated
-    // response: nothing is delivered until the owner polls the exact process ids it was given.
-    const blockedRequest = 'wfr_background_admission_blocked';
-    expect(prove(blockedRequest, conversationId)).toBe('stored');
-    const blocked = await asChat(blockedRequest, 'exec_command', {
-      cmd: IS_WINDOWS ? "Write-Output 'must-not-run'" : "printf '%s\\n' must-not-run",
-      workdir: '/workspace'
+    // Unread output stays private to its exact owner, but no longer blocks another launch.
+    const nextRequest = 'wfr_background_admission_next';
+    expect(prove(nextRequest, conversationId)).toBe('stored');
+    const next = await asChat(nextRequest, 'exec_command', {
+      cmd: IS_WINDOWS ? "Write-Output 'admitted-with-unread'" : "printf '%s\\n' admitted-with-unread",
+      workdir: '/workspace',
+      yield_time_ms: 5_000
     });
-    expect(failed(blocked)).toBe(true);
-    expect(textOf(blocked)).toContain('EXEC_RESULTS_UNREAD');
-    for (const sessionId of sessionIds) expect(textOf(blocked)).toContain(String(sessionId));
+    expect(failed(next), textOf(next)).toBe(false);
+    expect(textOf(next)).toContain('admitted-with-unread');
+    expect(textOf(next)).not.toContain('owed-');
 
-    // Polling each one is the lookup path, and it is also what releases the budget.
+    // Explicit polling still delivers each result and clears its unread state.
     for (const sessionId of sessionIds) {
-      const polled = await asChat(blockedRequest, 'write_stdin', { session_id: sessionId, chars: '' });
+      const polled = await asChat(nextRequest, 'write_stdin', { session_id: sessionId, chars: '' });
       expect(failed(polled), textOf(polled)).toBe(false);
       expect(textOf(polled)).toContain('owed-');
     }
 
-    const admitted = await asChat(blockedRequest, 'exec_command', {
+    const admitted = await asChat(nextRequest, 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'admitted-after-drain'" : "printf '%s\\n' admitted-after-drain",
       workdir: '/workspace',
       yield_time_ms: 5_000

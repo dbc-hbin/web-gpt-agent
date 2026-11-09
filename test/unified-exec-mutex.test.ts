@@ -56,7 +56,7 @@ it('does not let a lock attempt barge ahead of an already queued waiter', async 
   }
 });
 
-it('refuses new capacity without evicting a completed unread result', async () => {
+it('releases completed unread capacity while preserving output and the live reservation limit', async () => {
   const manager = new UnifiedExecProcessManager(DEFAULT_MAX_BACKGROUND_TERMINAL_TIMEOUT_MS);
   const unreadId = manager.allocateProcessId();
   const request = (processId: number, command: string, yieldTimeMs: number) => ({
@@ -84,9 +84,15 @@ it('refuses new capacity without evicting a completed unread result', async () =
     ]);
 
     while (fillerIds.length < MAX_UNIFIED_EXEC_PROCESSES - 1) fillerIds.push(manager.allocateProcessId());
+    const admitted = await manager.execCommand(
+      request(manager.allocateProcessId(), "console.log('admitted-with-unread-output')", 1000)
+    );
+    expect(admitted.rawOutput.toString()).toContain('admitted-with-unread-output');
+
+    fillerIds.push(manager.allocateProcessId());
     const refusedId = manager.allocateProcessId();
     await expect(manager.execCommand(request(refusedId, "console.log('must-not-run')", 100))).rejects.toThrow(
-      `too many retained terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
+      `too many live or spawning terminal sessions (limit ${MAX_UNIFIED_EXEC_PROCESSES})`
     );
 
     expect(manager.backgroundState(new Set([unreadId])).exitedUnread).toEqual([

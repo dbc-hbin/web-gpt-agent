@@ -18,16 +18,6 @@ import { requestCorrelation } from '../session/correlation.js';
 import { unifiedExecManager } from './manager.js';
 import type { BackgroundExecState } from './unified-exec.js';
 
-/**
- * Prevent one caller from indefinitely postponing already-completed command results.
- *
- * A completed result is bounded work — one `write_stdin` poll and it is gone — so a caller that
- * keeps launching commands instead of reading what they printed is refused until it drains them.
- * The budget is a refusal at the *next* launch, never automatic output appended to an unrelated
- * response: retained terminal text is read where it belongs, by polling that exact process id.
- */
-export const MAX_UNREAD_EXEC_RESULTS_PER_CONVERSATION = 4;
-
 /** Owners, keyed by the process id `exec_command` handed back as `session_id`. */
 const owners = new Map<number, string | null>();
 const REQUEST_PRINCIPAL_PREFIX = 'request:';
@@ -103,6 +93,8 @@ export function forgetExecOwner(processId: number | null): void {
   if (processId === null) return;
   owners.delete(processId);
 }
+
+unifiedExecManager.setProcessReleaseListener(forgetExecOwner);
 
 /** The exact session or temporary request principal that opened this process. */
 export function execOwner(processId: number): string | null {

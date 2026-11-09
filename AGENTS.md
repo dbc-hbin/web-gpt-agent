@@ -899,16 +899,22 @@ returns output and a process id; `write_stdin` continues that same process, send
 or drains output. Caller isolation is in `ownership.ts`, not separate managers per request.
 
 Every successful launch also returns a session id when it finishes immediately. Empty
-`write_stdin` calls can reread completed output after direct polling or automatic delivery;
+`write_stdin` calls can reread completed output after direct polling;
 structured results keep `session_id` for running work and use `completed_session_id` for
 finished work, so existing polling loops still stop. Either id is the `write_stdin` input.
 On every OS, structured `output_replayed` marks a retained reread and `benign_exit` marks a
 proven expected non-zero result; raw exit codes remain intact.
 nonempty input to a completed process is refused and never restarts work. The same manager
-retains the latest 64 completed results for this app lifetime, with 256 KiB of raw head/tail
-output each (and delimiter-free batch presentation). Completed rereads have no unread debt,
-live-process capacity charge or automatic reoffer. Eviction/shutdown drops their existing
-custody entries; retained ids cannot be reallocated. Unread results keep their separate bounds.
+retains the latest 256 completed results for this app lifetime, including unread results, with
+256 KiB of raw head/tail replay history each (and delimiter-free batch presentation). A finished
+background command also retains its unread suffix under the existing 1 MiB collection bound until
+its first poll. Once the process exits and its output streams close, it automatically leaves the
+live-process slots, independently of caller attribution or polling. The interaction lock and exact
+process instance fence this transition against explicit readers and shutdown. The live/spawning
+limit remains 64. Completed output cannot block another launch.
+Eviction/shutdown drops output and its custody entry, even when unread; this is the user's explicit
+finite-retention policy of 2026-11-09. Unavailable-id guidance names possible retention expiry and
+forbids replaying work solely because its output expired. Retained ids cannot be reallocated.
 
 The owner is the **durable local session principal**, or `request:<id>` while permitted work
 awaits correlation. Only that request can initially continue its process. Exact proof makes
@@ -960,19 +966,13 @@ The outer code-mode preview is an independent limit; increasing it cannot restor
 result that was already clipped.
 Never solve a display overflow by silently discarding durable/owed data.
 
-Completed background output is still owned data. The manager does not evict exited unread
-sessions to free capacity. Four unread completed results block another spawn for that owner
-with `EXEC_RESULTS_UNREAD` before a process starts. Running servers/tails do not consume that
-completed-result limit and are not auto-killed or polled.
-
-Completed results can follow automatically in later exact-owner **outer** tool responses,
-one bounded UTF-8-safe page within remaining response space. An offer does not drain bytes.
-Successful local publication followed by a later exact-owner invocation acknowledges the page,
-even if both calls share a generation request id; older concurrent calls cannot. Failed
-publication reoffers it. Explicit `write_stdin` can drain the remaining unacknowledged suffix.
-After 120 seconds without attendance, a running process can contribute one owner-scoped
-reminder; reading diagnostic state does not consume it. Blocked/compacting/superseded sources
-and nested code-mode calls do not receive or acknowledge these automatic pages.
+Completed background output remains owner-scoped within the finite cache. An empty `write_stdin`
+poll collects its unread suffix once, then explicitly labelled rereads return retained history.
+There is no four-unread-result spawn refusal or automatic output handout on another tool response.
+Both terminal tool descriptions require reading every returned running session through completion
+and collecting its output to clear unread state before it expires. Running servers/tails are not
+automatically killed or polled. Caller ownership, late exact attribution and Compact & Resume
+custody remain unchanged.
 
 ### Human workspace terminal
 

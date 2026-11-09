@@ -4,6 +4,7 @@ import { UnifiedExecProcessManager, MAX_COMPLETED_EXEC_RESULTS, COMPLETED_EXEC_O
 import { summarizeToolCall } from '../src/main/session/summarize.js';
 import { emptyEvidence, noteExec, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
 import { nonZeroExitIsBenign } from '../src/main/exec-hints.js';
+import { UNIFIED_EXEC_OUTPUT_MAX_BYTES } from '../src/main/codex/unified-exec-constants.js';
 
 const managers: UnifiedExecProcessManager[] = [];
 const policy = { kind: 'tokens' as const, tokens: 10_000 };
@@ -43,12 +44,10 @@ it('rereads all retained output from one explicit poll, and nothing is pushed el
   const first = await start(m, "console.log('early'); setTimeout(()=>console.log('late'), 700)", 250);
   const id = first.processId!;
   expect(id).not.toBeNull();
-  // The first poll collects the whole retained history — the readable lookup path — and the row
-  // is retired by that poll rather than by some later response acknowledging a pushed page.
+  // The first poll collects pending output; completed history remains available for rereading.
   expect(first.rawOutput.toString()).toBe('early\n');
   await expect.poll(() => m.exitedUnread(new Set([id])).length).toBe(1);
-  // The poll reads what the child produced after the initial response, and it is that poll —
-  // not some later acknowledgement of a pushed page — that retires the row.
+  // Automatic retirement frees the live slot; the poll consumes only the unread suffix.
   const polled = await poll(m, id);
   expect(polled.rawOutput.toString()).toBe('late\n');
   expect(m.backgroundState(new Set([id]))).toEqual({ running: [], exitedUnread: [] });
@@ -56,7 +55,18 @@ it('rereads all retained output from one explicit poll, and nothing is pushed el
   expect((await poll(m, id)).rawOutput.toString()).toBe('early\nlate\n');
 });
 
-it('bounds reread output, releases oldest completed custody, and keeps unread results separate', async () => {
+it('preserves unread output omission metadata after automatic retirement', async () => {
+  const m = manager();
+  const started = await start(m,
+    `setTimeout(()=>process.stdout.write('x'.repeat(${UNIFIED_EXEC_OUTPUT_MAX_BYTES * 2})), 700)`, 250);
+  const id = started.processId;
+  if (id === null) throw new Error('Expected the fixture to yield a running process');
+  await started.completion;
+  const result = await poll(m, id);
+  expect(result.outputOmittedBytes).toBe(UNIFIED_EXEC_OUTPUT_MAX_BYTES);
+});
+
+it('bounds completed output and expires old read and unread results without blocking launches', async () => {
   const m = manager();
   const released = vi.fn(); m.setProcessReleaseListener(released);
   const first = await start(m, `process.stdout.write('a'.repeat(${COMPLETED_EXEC_OUTPUT_BYTES * 2})+'TAIL')`);
@@ -64,11 +74,25 @@ it('bounds reread output, releases oldest completed custody, and keeps unread re
   const output = (await poll(m, id)).rawOutput.toString();
   expect(Buffer.byteLength(output)).toBeLessThan(COMPLETED_EXEC_OUTPUT_BYTES + 200);
   expect(output).toContain('omitted'); expect(output.endsWith('TAIL')).toBe(true);
-  // Real fast children exercise admission beyond the old active-process cap.
-  for (let i = 0; i < MAX_COMPLETED_EXEC_RESULTS; i++) await start(m, '');
+  const unread = await start(m, "setTimeout(()=>console.log('unread-result'), 700)", 250);
+  const unreadId = unread.processId;
+  expect(unreadId).not.toBeNull();
+  if (unreadId === null) throw new Error('Expected the fixture to yield a running process');
+  await unread.completion;
+  // Fill the cache exactly; neither read nor unread results may expire early.
+  for (let i = 0; i < MAX_COMPLETED_EXEC_RESULTS - 2; i++) await start(m, '');
+  expect(released).not.toHaveBeenCalled();
+  expect((await poll(m, id)).rawOutput.toString()).toBe(output);
+  expect(m.exitedUnread(new Set([unreadId]))).toEqual([{ processId: unreadId, exitCode: 0 }]);
+  // Only results beyond the bound evict the two oldest entries.
+  await start(m, '');
+  await start(m, '');
   expect(released).toHaveBeenCalledWith(id);
+  expect(released).toHaveBeenCalledWith(unreadId);
   await expect(poll(m, id)).rejects.toThrow('Unknown process id');
-}, 30000);
+  await expect(poll(m, unreadId)).rejects.toThrow('Unknown process id');
+  expect(m.backgroundState(new Set([unreadId]))).toEqual({ running: [], exitedUnread: [] });
+}, 120000);
 
 it('keeps benign exit classification, batch labels and numeric wait ids consistent', () => {
   const context: CallContext = { startedAt: 0, transportKey: null, agent: null, outcome: null,
