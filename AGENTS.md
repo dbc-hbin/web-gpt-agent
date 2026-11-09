@@ -21,8 +21,8 @@ changed lines before applying an older patch. Document the work and its actual v
 the code currently does it. Known implementation gaps are collected in §21 instead of being
 mixed into the happy path as features.
 
-Source alignment: **2026-11-01** (upstream port through `2fdc777d`, see
-`docs/worklog-2026-11-01-upstream-port.md`). App/extension **2.3.0**,
+Source alignment: **2026-11-09** (upstream port through `2fdc777d`, see
+`docs/worklog-2026-11-01-upstream-port.md`). App/extension **2.3.1**,
 bridge protocol **16** in the checked declarations (`package.json`, `src/main/version.ts`,
 `extension/manifest.json`). This does not prove release, installation or live Chrome behavior.
 

@@ -9,6 +9,13 @@ The app and the `extension/` companion are versioned together. **Reload the
 extension after replacing the app bundle**. If their bridge protocols are incompatible,
 the app refuses the extension and asks you to reload the matching copy.
 
+## [2.3.1] — Web GPT Agent fork
+
+- Release terminal execution slots automatically after commands exit and their output streams close, so unread completed results cannot exhaust the 64 live-command limit.
+- Retain the latest 256 completed results, including unread output, in a bounded cache. Older results expire; preserve output omission metadata and chat ownership through collection and replay.
+- Remove the four-unread-results launch refusal and require collecting every returned running session through completion with `write_stdin`.
+- Update the bundled OpenAI tunnel client to v0.0.20 with verified checksums for all six targets.
+
 ## [2.3.0] — Web GPT Agent fork
 
 - Add Git Review, local branch comparisons, three-way conflict views, per-answer changed-file summaries, and optional per-turn code checkpoints with confirmed restore.
