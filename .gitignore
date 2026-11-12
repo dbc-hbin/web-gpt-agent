@@ -30,6 +30,8 @@ TOOL_USABILITY_AUDIT.md
 bughunt-*/
 docs/evidence/
 docs/android-mcp-brainstorm/
+/docs/chatgpt-turn-signals.md
+/docs/images/openai-chatgpt-warning-2026-09.png
 
 # Smoke-test scratch fixtures.
 smoke/

@@ -165,8 +165,6 @@ refreh your extension and all CoS plugins in chatgpt
 
 ![OpenAI email](docs/images/openai-account-warning-2026-09.png)
 
-![OpenAI email](docs/images/openai-chatgpt-warning-2026-09.png)
-
 ![Anthropic support reply](docs/images/anthropic-support-reply-2026-09.png)
 
 ## [2.1.11] — 2 weeks 6 sol
