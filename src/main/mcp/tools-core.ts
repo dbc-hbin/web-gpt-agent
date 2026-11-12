@@ -54,12 +54,6 @@ import { formatExecOutputForModel, newStreamOutput } from '../codex/exec-output.
 import { policyByteBudget, policyTokenBudget, type TruncationPolicy } from '../codex/truncate.js';
 import { DEFAULT_TRUNCATION_POLICY, EXEC_OUTPUT_CEILING_POLICY, unifiedExecManager } from '../codex/manager.js';
 import {
-  execOwnershipFailure,
-  executionPrincipal,
-  forgetExecOwner,
-  noteExecOwner
-} from '../codex/ownership.js';
-import {
   UnifiedExecError,
   MAX_COMPLETED_EXEC_RESULTS,
   applyUnifiedExecEnv,
@@ -233,16 +227,6 @@ function execChildEnvironment(): NodeJS.ProcessEnv {
     logInfo(`exec_command: filled in unset toolchain variables (${added.join(', ')})`);
   }
   return applyUnifiedExecEnv(env);
-}
-
-/** One stable owner for the running model turn, upgraded lazily when page proof arrives. */
-function execPrincipal(): string | null {
-  const caller = currentCaller();
-  return executionPrincipal(
-    caller.requestId,
-    caller.sessionId ?? null,
-    currentCall()?.allowUnattributed ?? getConfig().multiAgent.allowUnattributedCalls
-  );
 }
 
 export function registerCoreTools(reg: SurfaceRegistrar): void {
@@ -762,13 +746,7 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               }
             }
 
-            const owner = execPrincipal();
             const processId = unifiedExecManager.allocateProcessId();
-            // Process ids are deliberately small/reusable, while chat ownership lives in a
-            // separate registry. Clear any stale row at the allocation boundary so a recycled
-            // id cannot briefly authorize its previous chat before this call publishes the new owner.
-            forgetExecOwner(processId);
-
             const output = await unifiedExecManager.execCommand({
               classifyExit: (exitCode, rawOutput) => {
                 if (!batch) return nonZeroExitIsBenign(boundCommand, exitCode, rawOutput);
@@ -790,9 +768,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               env: execChildEnvironment(),
               tty: input.tty ?? DEFAULT_TTY
             });
-            // Which exact session or temporary request principal may later write to this
-            // process id. Request custody upgrades lazily when exact correlation arrives.
-            noteExecOwner(output.processId ?? output.completedSessionId ?? null, owner);
             const responseText = execCommandResponseText(output);
             // A search that found nothing exits 1 and has not failed. Recording it as an
             // error made a session's error count meaningless; see exec-hints.ts for why this
@@ -900,21 +875,6 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
       })),
       async (input) =>
         reg.guarded('command', 'write_stdin', async () => {
-          // The ownership registry decides both admission and the reason for refusal.
-          // A request-scoped caller can continue a process it opened before proof. Another
-          // request must wait for exact correlation; a numeric process id is not custody.
-          const asking = execPrincipal();
-          const denied = execOwnershipFailure(input.session_id, asking);
-          if (denied) {
-            const reason = {
-              unavailable: `EXEC_SESSION_UNAVAILABLE: This process id is not available to this call in the running app. Completed output expires after the latest ${MAX_COMPLETED_EXEC_RESULTS} results, including unread results. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable.`,
-              anonymous: 'EXEC_SESSION_ANONYMOUS: This process was launched without proven chat identity. An identified chat cannot adopt it. Check the original command and its saved output; retrying from this identified chat cannot change its ownership.',
-              unidentified: 'EXEC_CALLER_UNIDENTIFIED: The current request has not been proven to own this process, so it cannot access it yet. After exact identity recovers, retry this same session_id once; do not launch a replacement command.',
-              'different-owner': 'EXEC_SESSION_OWNER_MISMATCH: This process belongs to a different local session. Only its owning session can poll it or send input; use a process id returned to this session.'
-            }[denied];
-            const message = `write_stdin failed for session ${input.session_id}: ${reason} No input was sent and no output was read. This refusal concerns this process id, not Read-only mode or permission to edit files or launch other authorized work.`;
-            return denied === 'unidentified' ? failIdentity(message) : fail(message);
-          }
           try {
             const output = await unifiedExecManager.writeStdin({
               processId: input.session_id,
@@ -937,6 +897,9 @@ export function registerCoreTools(reg: SurfaceRegistrar): void {
               structuredContent: execCommandStructuredOutput(output)
             };
           } catch (error) {
+            if (error instanceof UnifiedExecError && error.kind === 'unknown_process_id') {
+              return fail(`write_stdin failed for session ${input.session_id}: EXEC_SESSION_UNAVAILABLE: This process id is not retained in the running app. Completed output expires after the latest ${MAX_COMPLETED_EXEC_RESULTS} results, including unread results. Check the original exec_command response and earlier results for its exit/output before deciding what remains; do not rerun the command solely because its id is unavailable. No input was sent and no output was read.`);
+            }
             const message = error instanceof Error ? error.message : String(error);
             const retry =
               error instanceof UnifiedExecError && error.kind === 'write_to_stdin'

@@ -68,7 +68,6 @@ it('preserves unread output omission metadata after automatic retirement', async
 
 it('bounds completed output and expires old read and unread results without blocking launches', async () => {
   const m = manager();
-  const released = vi.fn(); m.setProcessReleaseListener(released);
   const first = await start(m, `process.stdout.write('a'.repeat(${COMPLETED_EXEC_OUTPUT_BYTES * 2})+'TAIL')`);
   const id = first.completedSessionId!;
   const output = (await poll(m, id)).rawOutput.toString();
@@ -81,14 +80,11 @@ it('bounds completed output and expires old read and unread results without bloc
   await unread.completion;
   // Fill the cache exactly; neither read nor unread results may expire early.
   for (let i = 0; i < MAX_COMPLETED_EXEC_RESULTS - 2; i++) await start(m, '');
-  expect(released).not.toHaveBeenCalled();
   expect((await poll(m, id)).rawOutput.toString()).toBe(output);
   expect(m.exitedUnread(new Set([unreadId]))).toEqual([{ processId: unreadId, exitCode: 0 }]);
   // Only results beyond the bound evict the two oldest entries.
   await start(m, '');
   await start(m, '');
-  expect(released).toHaveBeenCalledWith(id);
-  expect(released).toHaveBeenCalledWith(unreadId);
   await expect(poll(m, id)).rejects.toThrow('Unknown process id');
   await expect(poll(m, unreadId)).rejects.toThrow('Unknown process id');
   expect(m.backgroundState(new Set([unreadId]))).toEqual({ running: [], exitedUnread: [] });

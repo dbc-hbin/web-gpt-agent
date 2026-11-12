@@ -19,7 +19,6 @@ import { SearchEngineFailureError } from '../src/main/search.js';
 import { eventTokens } from '../src/shared/session.js';
 import * as backend from '../src/main/codex/read-backend.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
-import { noteExecOwner, forgetExecOwner } from '../src/main/codex/ownership.js';
 import type { ExecCommandToolOutput } from '../src/main/codex/unified-exec.js';
 import { makeTempDir, removeTempDir } from './helpers.js';
 
@@ -199,7 +198,6 @@ it('records full explicitly emitted text without duplicating it onto an explicit
 it.each(['exec_command', 'write_stdin'] as const)('delivers terminal corrections through the actual %s structured wire without changing process output', async name => {
   const who = await identity();
   const processId = 739100;
-  noteExecOwner(processId, who.session.id);
   const output: ExecCommandToolOutput = { chunkId: '623c3d', wallTimeMs: 30011.45, rawOutput: Buffer.from(''),
     truncationPolicy: { kind: 'tokens', tokens: 1000 }, maxOutputTokens: undefined, processId, exitCode: null,
     originalTokenCount: 0, outputOmittedBytes: null };
@@ -231,7 +229,6 @@ it.each(['exec_command', 'write_stdin'] as const)('delivers terminal corrections
   } finally {
     await send(); // Settle any offered correction even when a regression assertion fails.
     for (const entry of await listInputs()) if (entry.sessionId === who.session.id) await cancelInput(entry.id);
-    forgetExecOwner(processId);
   }
 });
 
@@ -688,17 +685,19 @@ it('keeps simultaneous chats separate and delivers queued input once outside scr
   expect((await listInputs()).find(row => row.id === input.id)?.state).toBe('sent');
 });
 
-it('uses existing process custody for nested exec and write_stdin across a conversation rebind', async () => {
+it('shares nested terminal IDs across chats and a conversation rebind', async () => {
   const a = await identity(), stranger = await identity();
   await fs.writeFile(path.join(directory, 'owned.cjs'), 'process.stdin.once("data",()=>{console.log("OWNED_RESULT");process.exit(0)});');
   const started = await call(a.requestId, 'text(await tools.exec_command({cmd:"node owned.cjs",workdir:"/workspace",tty:true,yield_time_ms:25}));');
   const processId = Number(text(started).match(/"session_id":(\d+)/)?.[1]);
   expect(Number.isInteger(processId), text(started)).toBe(true);
-  const denied = await call(stranger.requestId, `text(await tools.write_stdin({session_id:${processId},chars:"stolen\\r",yield_time_ms:50}));`);
-  expect(text(denied)).toContain('EXEC_SESSION_OWNER_MISMATCH');
+  const shared = await call(stranger.requestId, `text(await tools.write_stdin({session_id:${processId},chars:"shared\\r",yield_time_ms:1000}));`);
+  expect(shared.result.isError, text(shared)).not.toBe(true);
+  expect(text(shared)).toContain('OWNED_RESULT');
   const replacement = randomUUID(), requestId = `wfr_${randomUUID().replaceAll('-', '')}`;
   expect(await rebindSession(a.session.id, a.conversationId, replacement)).toBe(true);
   observeRequestCorrelation({ requestId, conversationId: replacement, sessionId: a.session.id, messageId: randomUUID(), tool: 'exec', observedAt: Date.now() });
-  const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"owner\\r",yield_time_ms:1000}));`);
+  const continued = await call(requestId, `text(await tools.write_stdin({session_id:${processId},chars:"",yield_time_ms:1000}));`);
+  expect(continued.result.isError, text(continued)).not.toBe(true);
   expect(text(continued)).toContain('OWNED_RESULT');
 });

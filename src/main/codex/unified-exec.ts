@@ -715,17 +715,11 @@ export class UnifiedExecProcessManager {
     identity: object;
     unreadOutput?: Pick<ExecCommandToolOutput, 'rawOutput' | 'displayOutput' | 'originalTokenCount' | 'outputOmittedBytes'>;
   }>();
-  private releaseListener?: (processId: number) => void;
   private readonly reservedProcessIds = new Set<number>();
   private readonly maxWriteStdinYieldTimeMs: number;
 
   constructor(maxWriteStdinYieldTimeMs: number) {
     this.maxWriteStdinYieldTimeMs = Math.max(maxWriteStdinYieldTimeMs, MIN_EMPTY_YIELD_TIME_MS);
-  }
-
-  /** The custody registry drops ownership only when this manager really discards an id. */
-  setProcessReleaseListener(listener: (processId: number) => void): void {
-    this.releaseListener = listener;
   }
 
   /** `rand::rng().random_range(1_000..100_000)`, retried against the reservations. */
@@ -742,7 +736,6 @@ export class UnifiedExecProcessManager {
     this.reservedProcessIds.delete(processId);
     this.processes.delete(processId);
     this.completed.delete(processId);
-    this.releaseListener?.(processId);
   }
 
   private retainCompleted(entry: ProcessEntry, unread = false): void {
@@ -1086,7 +1079,6 @@ export class UnifiedExecProcessManager {
 
   async terminateAllProcesses(): Promise<void> {
     const entries = [...this.processes.values()];
-    for (const id of new Set([...this.reservedProcessIds, ...this.completed.keys()])) this.releaseListener?.(id);
     this.completed.clear();
     this.processes.clear();
     this.reservedProcessIds.clear();

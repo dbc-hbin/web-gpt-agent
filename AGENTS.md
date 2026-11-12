@@ -147,7 +147,7 @@ The renderer has no direct filesystem, command, secret or generic main-process a
 | Input | Outbox UUID + local session + elected browser owner or exact tool recipient. |
 | Agent routing | Exact prime family/run incarnation + worker conversation; `worker-1` alone is ambiguous. |
 | Workspace | Proven session/project or caller/agent key + cwd. |
-| Terminal | Durable local session principal → process session id. |
+| Terminal | App-lifetime process session id; ordinary MCP terminals are shared across chats. |
 | Renderer | Selected session/draft key + load generation. |
 | Connection | Endpoint/tunnel generation. |
 | Desktop input | Capture frame/accessibility ref + target geometry + helper generation. |
@@ -223,7 +223,7 @@ Paths in this section are repository-relative. Most mechanisms have `main`, `sha
 | Code composition | `src/main/mcp/code-mode-{tool,runtime,worker}.ts`: surface-scoped `exec`, QuickJS admission, limits and explicit emissions. |
 | Instructions/plan | `src/main/mcp/{instructions,coding-instructions,plan-tool}.ts`, `src/shared/agent-plan.ts`, `src/renderer/agent-plan.ts`: executor contract and displayed progress plan. |
 | Local files/processes | `src/main/{rawfs,fsops,search,ripgrep,env,toolchain,exec,exec-hints,text-match,diffstat}.ts`, `src/main/codex/*`: bounded filesystem/shell implementation. |
-| Terminal custody | `src/main/codex/{manager,ownership,unified-exec,unified-exec-constants,shell,command-batch,head-tail-buffer,truncate,exec-output}.ts`. |
+| Terminal execution | `src/main/codex/{manager,unified-exec,unified-exec-constants,shell,command-batch,head-tail-buffer,truncate,exec-output}.ts`; `ownership.ts` resolves principals for code-mode stores and search cursors only. |
 | Patching/images | `src/main/codex/apply-patch/*`, `codex/{filesystem,read-backend,view-image}.ts`. |
 | Projects/cwd | `src/main/projects.ts`, `src/shared/projects.ts`: local folder catalog and session binding; `mcp/tools-core.ts` resolves ordinary tool paths independently from conversations. |
 | Project Files UI | `src/main/project-files.ts`, `project-file-watcher.ts`, `src/shared/project-files.ts`, `src/renderer/{file-panel,file-code-editor,file-pdf-viewer,work-panel-resize}.ts`: bounded project views, revision-checked saves and renderer-owned drafts. |
@@ -892,11 +892,12 @@ result, permissions and rollback stay exactly as without checkpoints. Shell edit
 checkpointed by themselves. The setting is read in main at capture time; Off takes none and runs
 no Git command for it. Listing, comparing and `restoreCheckpoint` do not read the setting.
 
-### Terminal execution and custody
+### Terminal execution and retained output
 
 One app-lifetime `codex/manager.ts` owns `UnifiedExecProcessManager`. `exec_command` runs a shell,
 returns output and a process id; `write_stdin` continues that same process, sends input
-or drains output. Caller isolation is in `ownership.ts`, not separate managers per request.
+or drains output. Ordinary MCP terminal IDs are shared across chats: the ID selects the process
+without requiring request correlation or a matching local session.
 
 Every successful launch also returns a session id when it finishes immediately. Empty
 `write_stdin` calls can reread completed output after direct polling;
@@ -912,19 +913,18 @@ its first poll. Once the process exits and its output streams close, it automati
 live-process slots, independently of caller attribution or polling. The interaction lock and exact
 process instance fence this transition against explicit readers and shutdown. The live/spawning
 limit remains 64. Completed output cannot block another launch.
-Eviction/shutdown drops output and its custody entry, even when unread; this is the user's explicit
+Eviction/shutdown drops output, even when unread; this is the user's explicit
 finite-retention policy of 2026-11-09. Unavailable-id guidance names possible retention expiry and
 forbids replaying work solely because its output expired. Retained ids cannot be reallocated.
 
-The owner is the **durable local session principal**, or `request:<id>` while permitted work
-awaits correlation. Only that request can initially continue its process. Exact proof makes
-the request principal equivalent to its durable session, so A→B compaction lets B continue
-A's live terminal and receive its retained output without rerunning a command.
-Another session/worker cannot poll or write it. Anonymous process custody is non-adoptable.
-Refusals distinguish unavailable ids, anonymous launch custody, missing caller proof and a
-different owning session. Only missing caller proof invites retry after identity recovery and
-participates in the existing recovered-identity notice. No refusal proves a command should be
-replayed or implies Read-only mode; unavailable ids require checking original launch/output.
+**User decision, 2026-11-12:** remove ordinary terminal session binding, including for stdin.
+An unresolved request, a headerless call or another chat/worker can poll or write any retained
+process ID. A→B compaction needs no terminal migration or adoption. Exact caller identity still
+attributes tool history, code-mode stores and search cursors; it does not authorize terminal
+access. The existing authenticated MCP boundary, live Command/Read-only policy and known
+blocked, retired, superseded or compacting caller restrictions remain enforced. Missing process
+IDs report unavailable output; they do not request identity recovery or imply permission to
+replay a command. No automatic output push or additional result ledger is involved.
 
 A yielded command records a launch acknowledgement, not a permanent claim that the child is
 running. For an exactly attributed launch, the process instance's exit promise revises that
@@ -2640,7 +2640,7 @@ awaiting-summary -> awaiting-chat -> claimed -> committing -> committed
    **Durable metadata rebind is the point of no return.** Before it, failure leaves A current;
    after it, repair B's projections idempotently, never roll S back to A.
 5. **Publish the same work.** Preserve project/cwd, broker role/family, history and queued
-   input. Terminal custody already uses S, so no process-owner migration or adoption is
+   input. Terminal IDs remain available across chats, so no process-owner migration or adoption is
    needed. Move the objective and chat switch, retire A's execution authority, then retire
    its browser document only with fresh safe-close proof. B's first answer belongs to the
    exact resumed input, not to an old final from A.
@@ -2877,8 +2877,8 @@ quiet minutes and page closure after five (§14), while remaining available for 
 exact conversation id. Compact & Resume transfers every active and parked fleet of that prime
 in the same transaction. A newly attributed fleet joins an already-open handoff, including the
 commit publication gap. Old source requests retain their historical proof and cannot reacquire
-prime authority in the successor. Distinct fleets remain distinct; process custody stays with
-the same durable session.
+prime authority in the successor. Distinct fleets remain distinct; ordinary terminal IDs stay
+available in the same app-lifetime manager.
 
 The Goal step reviewer (§17) is an ordinary worker in the Goal chat's own family, marked
 `reviewer` on its `AgentInfo` (`reviewAskedAt` is when it was last asked). Only the app sets the

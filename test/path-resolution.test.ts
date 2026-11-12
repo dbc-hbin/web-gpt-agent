@@ -1,5 +1,5 @@
 /**
- * Where a relative path points, and who owns a live process.
+ * Where a relative path points, and how scoped execution identity is resolved.
  *
  * Two things are defended here. A relative path is shorthand for a path *inside a folder the user
  * approved* — or inside a base the calling tool explicitly named — and never for a folder this
@@ -7,22 +7,15 @@
  * independent of which chat happened to run something before it, and it is why the sandbox below
  * is the only thing deciding what may be reached.
  *
- * The process-ownership cases live here too because they answer the same question one layer down:
- * a live terminal belongs to the durable session (or request) that opened it, not to whichever
- * frontend currently claims that session.
+ * Code-mode stores and search cursors retain their request/session principals. Ordinary terminal
+ * process IDs are shared across chats and do not use those principals for access.
  */
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { emptyEvidence, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
-import {
-  executionPrincipal,
-  execOwner,
-  execOwnershipFailure,
-  noteExecOwner,
-  resetExecOwnershipForTests
-} from '../src/main/codex/ownership.js';
+import { executionPrincipal } from '../src/main/codex/ownership.js';
 import { observeRequestCorrelation, resetCorrelationRegistryForTests } from '../src/main/session/correlation.js';
 import { resetRequestPlansForTests } from '../src/main/session/request-plans.js';
 import { resolveCwd, resolveIn } from '../src/main/mcp/kernel.js';
@@ -74,53 +67,19 @@ afterAll(async () => {
 });
 
 beforeEach(() => {
-  resetExecOwnershipForTests();
   resetCorrelationRegistryForTests();
   resetRequestPlansForTests();
 });
 
-describe('live process ownership across chat replacement', () => {
-  it('stays with the durable session while its frontend changes from A to B', () => {
-    noteExecOwner(101, 'session-a-b');
-    noteExecOwner(102, null);
-    noteExecOwner(103, 'session-other');
-
-    expect(execOwner(101)).toBe('session-a-b');
-    expect(execOwnershipFailure(101, 'session-a-b')).toBeNull();
-    expect(execOwnershipFailure(101, 'session-other')).toBe('different-owner');
-    expect(execOwnershipFailure(101, null)).toBe('unidentified');
-
-    expect(execOwner(102)).toBeNull();
-    expect(execOwnershipFailure(102, null)).toBeNull();
-    expect(execOwnershipFailure(102, 'session-a-b')).toBe('anonymous');
-    expect(execOwnershipFailure(999, 'session-a-b')).toBe('unavailable');
-    expect(execOwner(103)).toBe('session-other');
-    expect(execOwnershipFailure(103, 'session-other')).toBeNull();
-  });
-
-  it('lets one request continue its terminal and upgrades that owner to the proven session', () => {
+describe('scoped code-mode and search identity', () => {
+  it('upgrades a request principal to its proven session', () => {
     const temporary = executionPrincipal('wfr_exec_request', null, true);
     expect(temporary).toBe('request:wfr_exec_request');
-    noteExecOwner(104, temporary);
-    expect(execOwnershipFailure(104, executionPrincipal('wfr_exec_request', null, true))).toBeNull();
     expect(observeRequestCorrelation({
       requestId: 'wfr_exec_request', conversationId: 'conv-request', sessionId: 'session-request',
       messageId: 'msg-request', tool: 'write_stdin', observedAt: Date.now()
     })).toBe('stored');
     expect(executionPrincipal('wfr_exec_request', null, true)).toBe('session-request');
-    expect(execOwnershipFailure(104, 'session-request')).toBeNull();
-    expect(execOwnershipFailure(104, 'session-other')).toBe('different-owner');
-  });
-
-  it('keeps an unresolved request out of a process it did not open, then admits it after exact proof', () => {
-    noteExecOwner(105, 'session-owner');
-    expect(execOwnershipFailure(105, 'request:wfr_unknown')).toBe('unidentified');
-    expect(observeRequestCorrelation({
-      requestId: 'wfr_unknown', conversationId: 'conv-owner', sessionId: 'session-owner',
-      messageId: 'msg-owner', tool: 'write_stdin', observedAt: Date.now()
-    })).toBe('stored');
-    expect(execOwnershipFailure(105, 'request:wfr_unknown')).toBeNull();
-    expect(execOwnershipFailure(105, 'session-other')).toBe('different-owner');
   });
 });
 

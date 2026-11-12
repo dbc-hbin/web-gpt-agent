@@ -50,13 +50,6 @@ import {
   openContinuationNow,
   resetContinuationsForTests
 } from '../src/main/session/continuation.js';
-import {
-  backgroundExecObligations,
-  execOwner,
-  noteExecOwner,
-  forgetExecOwner,
-  resetExecOwnershipForTests,
-} from '../src/main/codex/ownership.js';
 import { unifiedExecManager } from '../src/main/codex/manager.js';
 import { locateRipgrep } from '../src/main/ripgrep.js';
 import { IS_WINDOWS, makeTempDir, removeTempDir, writeTree } from './helpers.js';
@@ -2592,16 +2585,11 @@ describe('conversation-independent working directory', () => {
   });
 });
 
-describe('exec sessions belong to the chat that opened them', () => {
+describe('exec sessions are shared by process ID', () => {
   beforeEach(() => {
     ctx.readOnly = false;
     ctx.caps = withCaps({ command: true });
-    // `session status` lists the running commands, which is the other place one chat could
-    // learn another's session ids.
     ctx.sessionTools = true;
-    // Ownership is process-global with no natural lifetime boundary, and clearing it can only
-    // make the guard more permissive — never the other way round.
-    resetExecOwnershipForTests();
   });
 
   /** What the page reports once it has seen this connector request leave a given chat. */
@@ -2626,9 +2614,16 @@ describe('exec sessions belong to the chat that opened them', () => {
       requestId ? { 'x-request-id': `${requestId}/att1` } : {}
     );
 
-  it('refuses write_stdin from a chat that does not own the session, and keeps serving the one that does', async () => {
-    expect(prove('wfr_execown_opener', 'conv-execown-opener')).toBe('stored');
-    expect(prove('wfr_execown_stranger', 'conv-execown-stranger')).toBe('stored');
+  it.each([
+    { launch: 'wfr_execown_opener', poll: 'wfr_execown_stranger', label: 'a different chat' },
+    { launch: 'wfr_execown_opener', poll: 'wfr_execown_unattributed', label: 'an unresolved request' },
+    { launch: 'wfr_execown_opener', poll: null, label: 'a headerless request' },
+    { launch: null, poll: 'wfr_execown_stranger', label: 'an identified chat after a headerless launch' },
+    { launch: 'wfr_execown_unattributed_launch', poll: 'wfr_execown_unattributed_poll', label: 'a different unresolved request' }
+  ])('continues a process by ID from $label', async ({ launch, poll }) => {
+    const suffix = randomBytes(6).toString('hex');
+    expect(prove(`wfr_execown_opener_${suffix}`, `conv-execown-opener-${suffix}`)).toBe('stored');
+    expect(prove(`wfr_execown_stranger_${suffix}`, `conv-execown-stranger-${suffix}`)).toBe('stored');
 
     await fs.writeFile(
       path.join(approved, 'owned-stdin.cjs'),
@@ -2636,7 +2631,7 @@ describe('exec sessions belong to the chat that opened them', () => {
       'utf8'
     );
 
-    const started = await asChat('wfr_execown_opener', 'exec_command', {
+    const started = await asChat(launch ? `${launch}_${suffix}` : null, 'exec_command', {
       cmd: 'node owned-stdin.cjs',
       workdir: '/workspace',
       tty: true,
@@ -2646,79 +2641,53 @@ describe('exec sessions belong to the chat that opened them', () => {
     const sessionId = Number(terminalOf(started).session_id);
     expect(Number.isInteger(sessionId)).toBe(true);
 
-    // The other chat can name that small integer just as easily as its owner can. Codex never
-    // has to think about this because its manager hangs off one conversation's services.
-    const stranger = await asChat('wfr_execown_stranger', 'write_stdin', {
-      session_id: sessionId,
-      chars: 'stolen\r',
-      yield_time_ms: 250
-    });
-    expect(stranger.body.result?.isError).toBe(true);
-    expect(textOf(stranger)).toContain(`write_stdin failed for session ${sessionId}`);
-    expect(textOf(stranger)).not.toContain('echo=stolen');
-    expect(textOf(stranger)).toContain('This refusal concerns this process id, not Read-only mode');
-    expect(textOf(stranger)).toContain('EXEC_SESSION_OWNER_MISMATCH');
-    expect(textOf(stranger)).not.toContain('may already have delivered');
-
-    // An unresolved request can continue processes it opened itself, but a bare numeric id
-    // does not grant custody over a process that belongs to another request/session.
-    const unproven = await asChat('wfr_execown_unattributed', 'write_stdin', {
-      session_id: sessionId,
-      chars: 'anon\r',
-      yield_time_ms: 1_000
-    });
-    expect(unproven.body.result?.isError).toBe(true);
-    expect(textOf(unproven)).not.toContain('echo=anon');
-    expect(textOf(unproven)).toContain('EXEC_CALLER_UNIDENTIFIED');
-    expect(textOf(unproven)).toContain('not Read-only mode');
-
-    expect(prove('wfr_execown_unattributed', 'conv-execown-opener')).toBe('stored');
-    const recovered = await asChat('wfr_execown_unattributed', 'write_stdin', {
-      session_id: sessionId,
-      chars: 'anon\r',
-      yield_time_ms: 1_000
-    });
-    expect(recovered.body.result?.isError).not.toBe(true);
-    expect(textOf(recovered)).toContain('echo=anon');
-
-
-    const owner = await asChat('wfr_execown_opener', 'write_stdin', {
+    const continued = await asChat(poll ? `${poll}_${suffix}` : null, 'write_stdin', {
       session_id: sessionId,
       chars: 'bye\r',
       yield_time_ms: 5_000
     });
-    expect(owner.body.result?.isError).not.toBe(true);
-    expect(textOf(owner)).toContain('echo=bye');
-    expect(terminalOf(owner).exit_code).toBe(0);
+    expect(failed(continued), textOf(continued)).toBe(false);
+    expect(textOf(continued)).toContain('echo=bye');
+    expect(terminalOf(continued).exit_code).toBe(0);
   });
 
-  it('distinguishes unresolved, anonymous and unavailable process custody and reports identity recovery', async () => {
-    const source = await createSession({ conversationId: 'exec-return-owner' });
-    expect(prove('wfr_exec_return_owner', 'exec-return-owner', source.id)).toBe('stored');
-    noteExecOwner(987001, source.id);
-    noteExecOwner(987002, null);
+  it.each(['command permission', 'Read-only'])('refuses stdin when %s disables commands', async control => {
+    await fs.writeFile(
+      path.join(approved, 'permission-stdin.cjs'),
+      "const readline=require('node:readline'); const rl=readline.createInterface({input:process.stdin,crlfDelay:Infinity}); rl.on('line',(line)=>{ console.log('echo='+line); if(line==='bye') rl.close(); });\n"
+    );
+    const started = await asChat(null, 'exec_command', {
+      cmd: 'node permission-stdin.cjs', workdir: '/workspace', tty: true, yield_time_ms: 250
+    });
+    const sessionId = Number(terminalOf(started).session_id);
+    expect(Number.isInteger(sessionId), textOf(started)).toBe(true);
     try {
-      const unknown = await asChat('wfr_exec_return_late', 'write_stdin', { session_id: 987001, chars: '' });
-      expect(unknown.body.result?.isError).toBe(true);
-      expect(textOf(unknown)).toContain('EXEC_CALLER_UNIDENTIFIED');
-      expect(prove('wfr_exec_return_late', 'exec-return-owner', source.id)).toBe('stored');
-      const recovered = await asChat('wfr_exec_return_owner', 'read', { paths: ['/workspace/src/app.ts'] });
-      expect(textOf(recovered)).toContain('Earlier write_stdin calls were refused');
-      expect(textOf(await asChat('wfr_exec_return_owner', 'read', { paths: ['/workspace/src/app.ts'] })))
-        .not.toContain('Identity recovered');
-      const anonymous = await asChat('wfr_exec_return_owner', 'write_stdin', { session_id: 987002, chars: '' });
-      expect(textOf(anonymous)).toContain('EXEC_SESSION_ANONYMOUS');
-      expect(textOf(anonymous)).toContain('cannot adopt');
-      expect(textOf(anonymous)).not.toContain('retry this same');
-      const absent = await asChat('wfr_exec_return_owner', 'write_stdin', { session_id: 987003, chars: '' });
-      expect(textOf(absent)).toContain('EXEC_SESSION_UNAVAILABLE');
-      expect(textOf(absent)).not.toContain('retry this same');
-      expect(textOf(await asChat('wfr_exec_return_owner', 'read', { paths: ['/workspace/src/app.ts'] })))
-        .not.toContain('Identity recovered');
+      ctx.readOnly = control === 'Read-only';
+      ctx.caps = effectiveCapabilities({
+        ...getConfig(), capabilities: withCaps({ command: control === 'Read-only' }), readOnly: ctx.readOnly
+      });
+      const denied = await asChat(null, 'write_stdin', { session_id: sessionId, chars: 'blocked\r' });
+      expect(failed(denied), textOf(denied)).toBe(true);
     } finally {
-      forgetExecOwner(987001);
-      forgetExecOwner(987002);
+      ctx.readOnly = false;
+      ctx.caps = withCaps({ command: true });
     }
+    const continued = await asChat(null, 'write_stdin', {
+      session_id: sessionId, chars: 'bye\r', yield_time_ms: 5_000
+    });
+    expect(failed(continued), textOf(continued)).toBe(false);
+    expect(textOf(continued)).toContain('echo=bye');
+    expect(textOf(continued)).not.toContain('echo=blocked');
+    expect(terminalOf(continued).exit_code).toBe(0);
+  });
+
+  it('reports an unavailable process without requiring identity recovery or replay', async () => {
+    const absent = await asChat(null, 'write_stdin', { session_id: 987003, chars: '' });
+    expect(failed(absent)).toBe(true);
+    expect(textOf(absent)).toContain('EXEC_SESSION_UNAVAILABLE');
+    expect(textOf(absent)).not.toContain('retry this same');
+    expect(textOf(await asChat(null, 'read', { paths: ['/workspace/src/app.ts'] })))
+      .not.toContain('Identity recovered');
   });
 
   it('keeps a live process with the durable session across Compact & Resume and retires A', async () => {
@@ -2740,7 +2709,6 @@ describe('exec sessions belong to the chat that opened them', () => {
     });
     const processId = Number(terminalOf(started).session_id);
     expect(Number.isInteger(processId), textOf(started)).toBe(true);
-    expect(execOwner(processId)).toBe(summary.id);
 
     expect(await rebindSession(summary.id, chatA, chatB)).toBe(true);
     expect(prove('wfr_exec_resume_b', chatB, summary.id)).toBe('stored');
@@ -2797,79 +2765,6 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(failed(fresh), textOf(fresh)).toBe(false);
   });
 
-  it('does not let a stale owner inherit a recycled process id during the new exec yield', async () => {
-    // Model the real lifetime split directly: the manager has released an exited process id,
-    // but the separate ownership registry still carries the chat that used to own it. Force
-    // the next allocator pick to reuse that number so the race is deterministic instead of a
-    // 1-in-99k lottery.
-    await unifiedExecManager.terminateAllProcesses();
-    const recycledId = 1_000;
-    noteExecOwner(recycledId, 'session-conv-execown-old');
-    expect(execOwner(recycledId)).toBe('session-conv-execown-old');
-    expect(prove('wfr_execown_old_recycled', 'conv-execown-old')).toBe('stored');
-    expect(prove('wfr_execown_new_recycled', 'conv-execown-new')).toBe('stored');
-
-    const random = vi.spyOn(Math, 'random').mockReturnValue(0);
-    try {
-      // Block in the shell process itself. Spawning a second cold `node` here made this
-      // ownership regression depend on hosted-runner process startup rather than on the
-      // authority window it is meant to test. The shell is already the exec process and can
-      // wait for one line of input without another child at all.
-      const holdOpen = IS_WINDOWS
-        ? "$line = [Console]::In.ReadLine(); Write-Output ('got=' + $line)"
-        : "IFS= read -r line; printf 'got=%s\\n' \"$line\"";
-
-      // Do not await. The process is registered while exec_command spends its initial yield
-      // collecting output, which is the exact old authority window.
-      const starting = asChat('wfr_execown_new_recycled', 'exec_command', {
-        cmd: holdOpen,
-        workdir: '/workspace',
-        tty: true,
-        yield_time_ms: 1_000
-      });
-      await vi.waitFor(
-        () => {
-          expect(unifiedExecManager.listProcesses().some((entry) => entry.processId === recycledId)).toBe(true);
-        },
-        { timeout: 5_000, interval: 10 }
-      );
-
-      // Allocation must have removed the stale principal before the new process became
-      // writable. The old chat knows this integer from its own previous session, but it no
-      // longer has authority over what now happens to occupy that slot.
-      expect(execOwner(recycledId)).toBeNull();
-      const stolen = await asChat('wfr_execown_old_recycled', 'write_stdin', {
-        session_id: recycledId,
-        chars: 'stolen\r',
-        yield_time_ms: 50
-      });
-      expect(stolen.body.result?.isError).toBe(true);
-      expect(textOf(stolen)).toContain('EXEC_SESSION_UNAVAILABLE');
-
-      const started = await starting;
-      expect(started.body.result?.isError, textOf(started)).not.toBe(true);
-      expect(Number(terminalOf(started).session_id)).toBe(recycledId);
-      expect(execOwner(recycledId)).toBe('session-conv-execown-new');
-      expect(textOf(started)).not.toContain('got=');
-
-      // Let the real owner release the shell normally. Besides proving the new principal did
-      // receive authority, this keeps cleanup deterministic instead of spending the process
-      // manager's kill grace period on an intentionally blocked test process.
-      const owner = await asChat('wfr_execown_new_recycled', 'write_stdin', {
-        session_id: recycledId,
-        chars: 'owner\r',
-        yield_time_ms: 5_000
-      });
-      expect(owner.body.result?.isError, textOf(owner)).not.toBe(true);
-      expect(textOf(owner)).toContain('got=owner');
-      expect(terminalOf(owner).exit_code).toBe(0);
-    } finally {
-      random.mockRestore();
-      await unifiedExecManager.terminateAllProcesses();
-      resetExecOwnershipForTests();
-    }
-  });
-
   it('keeps completed output out of unrelated results and serves it only by explicit poll', async () => {
     expect(prove('wfr_background_owner', 'conv-background-owner')).toBe('stored');
     expect(prove('wfr_background_other', 'conv-background-other')).toBe('stored');
@@ -2902,7 +2797,7 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(textOf(later)).not.toContain('background-e2e-once');
     expect(textOf(later)).not.toContain(`Background session ${sessionId}`);
     expect(unifiedExecManager.exitedUnread(owned)).toHaveLength(1);
-    const reread = await asChat('wfr_background_owner', 'write_stdin', { session_id: sessionId, chars: '' });
+    const reread = await asChat('wfr_background_other', 'write_stdin', { session_id: sessionId, chars: '' });
     expect(failed(reread), textOf(reread)).toBe(false);
     expect(textOf(reread)).toContain('background-e2e-once');
     expect(terminalOf(reread).exit_code).toBe(7);
@@ -2912,9 +2807,10 @@ describe('exec sessions belong to the chat that opened them', () => {
     expect(failed(replay), textOf(replay)).toBe(false);
     expect(terminalOf(replay).output_replayed).toBe(true);
     expect(textOf(replay)).toContain('background-e2e-once');
-    const forbidden = await asChat('wfr_background_other', 'write_stdin', { session_id: sessionId, chars: '' });
-    expect(failed(forbidden)).toBe(true);
-    expect(textOf(forbidden)).not.toContain('background-e2e-once');
+    const unidentified = await asChat('wfr_background_unresolved', 'write_stdin', { session_id: sessionId, chars: '' });
+    expect(failed(unidentified), textOf(unidentified)).toBe(false);
+    expect(textOf(unidentified)).toContain('background-e2e-once');
+    expect(terminalOf(unidentified).exit_code).toBe(7);
     const direct = await asChat('wfr_background_owner', 'exec_command', {
       cmd: IS_WINDOWS ? "Write-Output 'direct-result'; exit 0" : "printf '%s\\n' direct-result",
       workdir: '/workspace', yield_time_ms: 10000
@@ -2949,13 +2845,13 @@ describe('exec sessions belong to the chat that opened them', () => {
 
     await fs.writeFile(path.join(approved, 'delivery-release'), 'ready');
     await vi.waitFor(
-      () => expect(backgroundExecObligations(`session-${conversationId}`).exitedUnread.map((row) => row.processId)).toEqual(
+      () => expect(unifiedExecManager.exitedUnread(new Set(sessionIds)).map((row) => row.processId)).toEqual(
         [...sessionIds].sort((left, right) => left - right)
       ),
       { timeout: 8_000, interval: 25 }
     );
 
-    // Unread output stays private to its exact owner, but no longer blocks another launch.
+    // Unread output stays available by ID and does not block another launch.
     const nextRequest = 'wfr_background_admission_next';
     expect(prove(nextRequest, conversationId)).toBe('stored');
     const next = await asChat(nextRequest, 'exec_command', {
